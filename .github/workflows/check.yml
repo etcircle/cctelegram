@@ -1,0 +1,33 @@
+name: Check
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: "0000000000:ci-dummy-token"
+      ALLOWED_USERS: "12345"
+      CC_TELEGRAM_DIR: ${{ runner.temp }}/cc-telegram-config
+      PYTHON_DOTENV_DISABLED: "1"
+    strategy:
+      matrix:
+        python-version:
+          - "3.12"
+          - "3.13"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --all-extras
+      - name: Formatter
+        run: |
+          uv run ruff check src/ tests/
+          uv run ruff format --check src/ tests/
+      - name: Lint
+        run: uv run pyright src/cctelegram/
+      - name: Test
+        run: uv run pytest --tb=short -q
