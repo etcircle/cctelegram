@@ -23,4 +23,4 @@ def test_check_workflow_supplies_dummy_config_env():
 
     assert 'TELEGRAM_BOT_TOKEN: "0000000000:ci-dummy-token"' in workflow
     assert 'ALLOWED_USERS: "12345"' in workflow
-    assert "CC_TELEGRAM_DIR: ${{ runner.temp }}/cc-telegram-config" in workflow
+    assert 'CC_TELEGRAM_DIR=$RUNNER_TEMP/cc-telegram-config' in workflow
