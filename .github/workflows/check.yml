@@ -10,7 +10,6 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: "0000000000:ci-dummy-token"
       ALLOWED_USERS: "12345"
-      CC_TELEGRAM_DIR: ${{ runner.temp }}/cc-telegram-config
       PYTHON_DOTENV_DISABLED: "1"
     strategy:
       matrix:
@@ -22,6 +21,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Set CC_TELEGRAM_DIR
+        run: echo "CC_TELEGRAM_DIR=$RUNNER_TEMP/cc-telegram-config" >> "$GITHUB_ENV"
       - run: uv sync --all-extras
       - name: Formatter
         run: |
