@@ -18,7 +18,7 @@ jobs:
           - "3.13"
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v8
         with:
           python-version: ${{ matrix.python-version }}
       - name: Set CC_TELEGRAM_DIR
