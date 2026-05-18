@@ -116,6 +116,27 @@ def reset_idle_counter(user_id: int, thread_id: int | None) -> None:
     _idle_state.pop((user_id, thread_id or 0), None)
 
 
+async def _on_busy_activity(route: busy_indicator.Route) -> None:
+    """Re-arm the idle-clear state machine when real activity hits a route.
+
+    Wired to ``busy_indicator.register_activity_callback`` so transcript
+    events and inbound prompt deliveries drop ``_idle_state[key]`` directly
+    without waiting for the next ``WATCHDOG_INTERVAL`` pane scrape. Once a
+    route has been "cleared" (idle delay elapsed and ``mark_pane_idle``
+    fired), only ``is_running == True`` on a fresh pane scrape would
+    otherwise pop the entry — and sub-agent / quick tool turns routinely
+    finish between two 10s pane scrapes, leaving ``_idle_state[key] ==
+    "cleared"`` while ``busy_indicator`` accumulates open tools and the
+    typing indicator keeps refreshing. See
+    ``busy_indicator.register_activity_callback`` for the full rationale.
+    """
+    user_id, thread_id, _wid = route
+    _idle_state.pop((user_id, thread_id), None)
+
+
+busy_indicator.register_activity_callback(_on_busy_activity)
+
+
 async def update_status_message(
     bot: Bot,
     user_id: int,

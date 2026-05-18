@@ -587,3 +587,69 @@ class TestStatusPollLoopDoesNotProbeTelegram:
                     pass
 
         bot.unpin_all_forum_topic_messages.assert_not_called()
+
+
+class TestActivityCallbackReArmsIdleState:
+    """An activity event (transcript / inbound prompt delivery) for a route
+    sitting at ``_idle_state[key] == "cleared"`` must pop the entry directly,
+    without waiting for the next ``WATCHDOG_INTERVAL`` pane scrape.
+
+    Regression: ``busy_indicator.register_activity_callback`` had a producer
+    (``_fire_activity``) but no consumer, so the re-arm path documented in
+    its docstring was inert. Sub-agent / quick tool turns that finished
+    between two 10s pane scrapes left ``_idle_state[key] == "cleared"``
+    permanently — ``_open_tools`` kept accumulating in ``busy_indicator``,
+    state pinned at ``RUNNING_TOOL``, and ``typing_action_loop`` refreshed
+    the native Telegram typing indicator forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transcript_event_re_arms_cleared_idle_state(self):
+        from cctelegram.handlers import busy_indicator, status_polling
+        from cctelegram.session_monitor import TranscriptEvent
+
+        # Hermetic setup: reset clears _activity_callbacks, so re-register
+        # the consumer that's normally bound at module import time.
+        busy_indicator.reset_for_tests()
+        busy_indicator.register_activity_callback(status_polling._on_busy_activity)
+        status_polling._idle_state.clear()
+        status_polling._idle_state[(1, 42)] = "cleared"
+
+        event = TranscriptEvent(
+            session_id="sess-1",
+            role="assistant",
+            block_type="tool_use",
+            tool_use_id="t1",
+            tool_name="Bash",
+            stop_reason="tool_use",
+            timestamp=None,
+            text="",
+            image_data=None,
+        )
+        await busy_indicator.on_transcript_event(event, [(1, 42, "@7")])
+
+        assert (1, 42) not in status_polling._idle_state
+
+        busy_indicator.reset_for_tests()
+        status_polling._idle_state.clear()
+
+    @pytest.mark.asyncio
+    async def test_inbound_send_re_arms_cleared_idle_state(self):
+        """``mark_inbound_sent`` (Telegram-originated prompt delivered to the
+        tmux window) also fires the activity callback. Without this, /effort /
+        /clear / arbitrary slash commands — which often produce no JSONL
+        events at all — never get their cleared idle entry popped, so the
+        next idle observation can't start a fresh delay timer."""
+        from cctelegram.handlers import busy_indicator, status_polling
+
+        busy_indicator.reset_for_tests()
+        busy_indicator.register_activity_callback(status_polling._on_busy_activity)
+        status_polling._idle_state.clear()
+        status_polling._idle_state[(1, 42)] = "cleared"
+
+        await busy_indicator.mark_inbound_sent((1, 42, "@7"))
+
+        assert (1, 42) not in status_polling._idle_state
+
+        busy_indicator.reset_for_tests()
+        status_polling._idle_state.clear()
