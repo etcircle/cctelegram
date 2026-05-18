@@ -285,6 +285,11 @@ class SessionManager:
             live_ids.add(w.window_id)
 
         changed = False
+        # Stale display_names keys whose pop must wait until thread_bindings
+        # and user_window_offsets have finished their display-name lookups —
+        # otherwise their lookups by stale window_id miss and the bindings /
+        # offsets are silently dropped.
+        stale_display_name_keys: set[str] = set()
 
         # --- Migrate window_states ---
         new_window_states: dict[str, WindowState] = {}
@@ -306,7 +311,7 @@ class SessionManager:
                         new_window_states[new_id] = ws
                         ws.window_name = display
                         self.window_display_names[new_id] = display
-                        self.window_display_names.pop(key, None)
+                        stale_display_name_keys.add(key)
                         changed = True
                     else:
                         logger.info(
@@ -403,6 +408,11 @@ class SessionManager:
                     else:
                         changed = True
             self.user_window_offsets[uid] = new_offsets
+
+        # Drop the stale window_id keys from display_names now that every
+        # consumer has had a chance to look them up.
+        for key in stale_display_name_keys:
+            self.window_display_names.pop(key, None)
 
         if changed:
             self._save_state()

@@ -1,5 +1,853 @@
-"""Shared fixtures for the whole CC Telegram test suite.
+"""Shared fixtures for the whole CC Telegram test suite + Wave A scenario harness.
 
 The import-time environment bootstrap for ``cctelegram.config`` lives in the
-repository-root ``conftest.py`` so it runs before all test collection.
+repository-root ``conftest.py`` so it runs before any test collection.
+
+This file hosts the **scenario harness** used by ``tests/scenarios/*`` —
+black-box tests that drive the bot from the public Telegram seam through the
+real handler stack to ``tmux_manager`` / ``session_manager``, with no
+monkeypatch of handler internals in *test bodies*.
+
+Wave A note: a few handler modules don't yet expose a ``reset_for_tests()``
+seam (``message_queue``, ``inbound_aggregator``, ``status_polling``,
+``interactive_ui``). The fixtures below clear their module-level state
+directly. That fixture-side coupling is exactly the architecture smell Wave
+B is meant to fix; until then, keeping it in this file (not in test bodies)
+preserves the kill-criterion signal: scenarios fail the bar only when the
+*tests themselves* must reach into handler internals.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from cctelegram import bot as bot_module
+from cctelegram.session import session_manager as _real_sm
+from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
+from cctelegram.handlers import (
+    attention,
+    busy_indicator,
+    inbound_aggregator,
+    interactive_ui,
+    message_queue,
+    status_polling,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Fake tmux substrate
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _PaneWindow:
+    """In-memory representation of one fake tmux window."""
+
+    window_id: str
+    window_name: str
+    cwd: str = "/tmp/test"
+    pane_text: str = ""
+    pane_text_ansi: str = ""
+    pane_current_command: str = "claude"
+
+
+@dataclass
+class FakeTmux:
+    """Stand-in for ``tmux_manager`` used by scenario tests.
+
+    Fixture binds these methods onto the real ``tmux_manager`` singleton so
+    every consumer (``bot.py``, ``session_monitor``, ``handlers/*``) sees the
+    fake regardless of import order.
+    """
+
+    windows: dict[str, _PaneWindow] = field(default_factory=dict)
+    sent_keys: list[tuple[str, str, bool, bool]] = field(default_factory=list)
+    kill_calls: list[str] = field(default_factory=list)
+    rename_calls: list[tuple[str, str]] = field(default_factory=list)
+    create_calls: list[dict[str, Any]] = field(default_factory=list)
+    create_response: tuple[bool, str] | None = None  # override for failure injection
+    _next_id: int = 0
+
+    # ── seeding helpers ────────────────────────────────────────────────
+    def add_window(
+        self,
+        *,
+        window_id: str | None = None,
+        window_name: str,
+        cwd: str = "/tmp/test",
+        pane_text: str = "",
+        pane_text_ansi: str = "",
+    ) -> str:
+        if window_id is None:
+            window_id = f"@{self._next_id}"
+            self._next_id += 1
+        elif window_id.startswith("@"):
+            try:
+                self._next_id = max(self._next_id, int(window_id[1:]) + 1)
+            except ValueError:
+                pass
+        self.windows[window_id] = _PaneWindow(
+            window_id=window_id,
+            window_name=window_name,
+            cwd=cwd,
+            pane_text=pane_text,
+            pane_text_ansi=pane_text_ansi or pane_text,
+        )
+        return window_id
+
+    def set_pane(self, window_id: str, text: str, *, ansi: str | None = None) -> None:
+        w = self.windows.get(window_id)
+        if w:
+            w.pane_text = text
+            w.pane_text_ansi = ansi if ansi is not None else text
+
+    def _to_tmux_window(self, w: _PaneWindow) -> TmuxWindow:
+        return TmuxWindow(
+            window_id=w.window_id,
+            window_name=w.window_name,
+            cwd=w.cwd,
+            pane_current_command=w.pane_current_command,
+        )
+
+    # ── tmux_manager interface (async) ─────────────────────────────────
+    async def list_windows(self) -> list[TmuxWindow]:
+        return [self._to_tmux_window(w) for w in self.windows.values()]
+
+    async def find_window_by_id(self, window_id: str) -> TmuxWindow | None:
+        w = self.windows.get(window_id)
+        return self._to_tmux_window(w) if w else None
+
+    async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
+        for w in self.windows.values():
+            if w.window_name == window_name:
+                return self._to_tmux_window(w)
+        return None
+
+    async def kill_window(self, window_id: str) -> bool:
+        self.kill_calls.append(window_id)
+        return self.windows.pop(window_id, None) is not None
+
+    async def rename_window(self, window_id: str, new_name: str) -> bool:
+        self.rename_calls.append((window_id, new_name))
+        w = self.windows.get(window_id)
+        if w:
+            w.window_name = new_name
+            return True
+        return False
+
+    async def send_keys(
+        self,
+        window_id: str,
+        keys: str,
+        enter: bool = True,
+        literal: bool = True,
+    ) -> bool:
+        self.sent_keys.append((window_id, keys, enter, literal))
+        return window_id in self.windows
+
+    async def capture_pane(
+        self,
+        window_id: str,
+        with_ansi: bool = False,
+        scrollback_lines: int = 0,
+    ) -> str:
+        del scrollback_lines  # fake pane is whatever was set; no extra history
+        w = self.windows.get(window_id)
+        if not w:
+            return ""
+        return w.pane_text_ansi if with_ansi else w.pane_text
+
+    async def create_window(
+        self,
+        cwd: str,
+        window_name: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str, str, str]:
+        self.create_calls.append({"cwd": cwd, "window_name": window_name, **kwargs})
+        if self.create_response is not None:
+            ok, msg = self.create_response
+            if not ok:
+                return False, msg, "", ""
+        name = window_name or Path(cwd).name or "window"
+        wid = self.add_window(window_name=name, cwd=cwd)
+        return True, f"Created window '{name}' at {cwd}", name, wid
+
+    async def get_or_create_session(self) -> Any:
+        return MagicMock(name="fake-tmux-session")
+
+    async def session_exists(self) -> bool:
+        return True
+
+    # Sometimes called by older paths
+    async def get_session(self) -> Any:
+        return MagicMock(name="fake-tmux-session")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Fake Telegram Bot
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _SentMessage:
+    """Record of one outbound Telegram call."""
+
+    method: str  # "send_message", "edit_message_text", ...
+    kwargs: dict[str, Any]
+    message_id: int
+
+
+class FakeBot:
+    """Records all outbound Telegram calls; returns Message-shaped objects.
+
+    Behaves like an ``AsyncMock`` for the Bot methods bot.py uses, but with a
+    monotonic ``message_id`` counter and a structured ``sent`` log so scenario
+    tests can assert against the conversation transcript.
+    """
+
+    def __init__(self, *, bot_id: int = 555_000_001) -> None:
+        self.id = bot_id
+        self.sent: list[_SentMessage] = []
+        self._next_msg_id = 1000
+
+    # ── primary I/O ────────────────────────────────────────────────────
+    async def send_message(self, *, chat_id: int, **kwargs: Any) -> Any:
+        return self._record("send_message", {"chat_id": chat_id, **kwargs})
+
+    async def edit_message_text(
+        self, *, chat_id: int, message_id: int, **kwargs: Any
+    ) -> Any:
+        return self._record(
+            "edit_message_text",
+            {"chat_id": chat_id, "message_id": message_id, **kwargs},
+            message_id=message_id,
+        )
+
+    async def edit_message_caption(
+        self, *, chat_id: int, message_id: int, **kwargs: Any
+    ) -> Any:
+        return self._record(
+            "edit_message_caption",
+            {"chat_id": chat_id, "message_id": message_id, **kwargs},
+            message_id=message_id,
+        )
+
+    async def edit_message_reply_markup(
+        self, *, chat_id: int, message_id: int, **kwargs: Any
+    ) -> Any:
+        return self._record(
+            "edit_message_reply_markup",
+            {"chat_id": chat_id, "message_id": message_id, **kwargs},
+            message_id=message_id,
+        )
+
+    async def delete_message(self, *, chat_id: int, message_id: int) -> bool:
+        self._record("delete_message", {"chat_id": chat_id, "message_id": message_id})
+        return True
+
+    async def send_chat_action(
+        self, *, chat_id: int, action: str, **kwargs: Any
+    ) -> bool:
+        self._record(
+            "send_chat_action", {"chat_id": chat_id, "action": action, **kwargs}
+        )
+        return True
+
+    async def send_photo(self, *, chat_id: int, **kwargs: Any) -> Any:
+        return self._record("send_photo", {"chat_id": chat_id, **kwargs})
+
+    async def send_document(self, *, chat_id: int, **kwargs: Any) -> Any:
+        return self._record("send_document", {"chat_id": chat_id, **kwargs})
+
+    async def send_voice(self, *, chat_id: int, **kwargs: Any) -> Any:
+        return self._record("send_voice", {"chat_id": chat_id, **kwargs})
+
+    async def answer_callback_query(self, *args: Any, **kwargs: Any) -> bool:
+        if args and "callback_query_id" not in kwargs:
+            kwargs["callback_query_id"] = args[0]
+        self._record("answer_callback_query", kwargs)
+        return True
+
+    async def get_file(self, file_id: str) -> Any:
+        f = MagicMock()
+        f.file_id = file_id
+        f.file_path = f"voice/{file_id}.oga"
+
+        async def _download(out_path: Any) -> Any:
+            Path(out_path).write_bytes(b"\x00")
+            return out_path
+
+        f.download_to_drive = AsyncMock(side_effect=_download)
+        return f
+
+    async def get_me(self) -> Any:
+        return SimpleNamespace(id=self.id, username="cc_telegram_bot", is_bot=True)
+
+    async def set_my_commands(self, *args: Any, **kwargs: Any) -> bool:
+        return True
+
+    async def delete_my_commands(self, *args: Any, **kwargs: Any) -> bool:
+        return True
+
+    async def get_my_commands(self, *args: Any, **kwargs: Any) -> list[Any]:
+        return []
+
+    # ── helpers ────────────────────────────────────────────────────────
+    def _record(
+        self,
+        method: str,
+        kwargs: dict[str, Any],
+        *,
+        message_id: int | None = None,
+    ) -> Any:
+        if message_id is None:
+            mid = self._next_msg_id
+            self._next_msg_id += 1
+        else:
+            mid = message_id
+        self.sent.append(_SentMessage(method=method, kwargs=kwargs, message_id=mid))
+        # Return a Message-like object for handlers that capture the result.
+        return SimpleNamespace(
+            message_id=mid,
+            chat_id=kwargs.get("chat_id"),
+            text=kwargs.get("text"),
+            caption=kwargs.get("caption"),
+            reply_markup=kwargs.get("reply_markup"),
+        )
+
+    # Convenience filters for assertions.
+    def texts(self) -> list[str]:
+        return [
+            s.kwargs.get("text") or s.kwargs.get("caption") or ""
+            for s in self.sent
+            if s.method in ("send_message", "edit_message_text", "edit_message_caption")
+        ]
+
+    def methods(self) -> list[str]:
+        return [s.method for s in self.sent]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Update / CallbackQuery factories — public Telegram seam
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_DEFAULT_USER_ID = 12345
+_DEFAULT_CHAT_ID = -1001234567890
+
+
+def _make_chat(chat_id: int = _DEFAULT_CHAT_ID, chat_type: str = "supergroup") -> Any:
+    chat = MagicMock(name="Chat")
+    chat.id = chat_id
+    chat.type = chat_type
+    chat.is_forum = True
+    chat.send_action = AsyncMock(return_value=True)
+    chat.send_message = AsyncMock()
+    return chat
+
+
+def _make_user(user_id: int = _DEFAULT_USER_ID, *, is_bot: bool = False) -> Any:
+    user = MagicMock(name="User")
+    user.id = user_id
+    user.is_bot = is_bot
+    user.first_name = "Test"
+    user.username = "tester"
+    return user
+
+
+def _make_message(
+    *,
+    text: str | None = None,
+    caption: str | None = None,
+    thread_id: int | None = None,
+    chat_id: int = _DEFAULT_CHAT_ID,
+    user_id: int = _DEFAULT_USER_ID,
+    message_id: int = 100,
+    photo: Any = None,
+    voice: Any = None,
+    document: Any = None,
+    media_group_id: str | None = None,
+    forum_topic_edited: Any = None,
+    forum_topic_closed: Any = None,
+    forum_topic_created: Any = None,
+    reply_to_message: Any = None,
+) -> Any:
+    msg = MagicMock(name="Message")
+    msg.message_id = message_id
+    msg.text = text
+    msg.caption = caption
+    msg.message_thread_id = thread_id
+    msg.is_topic_message = thread_id is not None
+    msg.chat = _make_chat(chat_id=chat_id)
+    msg.chat_id = chat_id
+    msg.from_user = _make_user(user_id=user_id)
+    msg.photo = photo or []
+    msg.voice = voice
+    msg.document = document
+    msg.media_group_id = media_group_id
+    msg.forum_topic_edited = forum_topic_edited
+    msg.forum_topic_closed = forum_topic_closed
+    msg.forum_topic_created = forum_topic_created
+    msg.reply_to_message = reply_to_message
+    # Async I/O on the Message object — make these awaitable so safe_reply /
+    # safe_edit work against the real handler stack.
+    msg.reply_text = AsyncMock(
+        return_value=SimpleNamespace(
+            message_id=message_id + 1,
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=None,
+        )
+    )
+    msg.reply_html = AsyncMock(return_value=msg.reply_text.return_value)
+    msg.reply_photo = AsyncMock(return_value=msg.reply_text.return_value)
+    msg.reply_voice = AsyncMock(return_value=msg.reply_text.return_value)
+    msg.reply_document = AsyncMock(return_value=msg.reply_text.return_value)
+    msg.edit_text = AsyncMock(return_value=msg.reply_text.return_value)
+    msg.edit_caption = AsyncMock(return_value=msg.reply_text.return_value)
+    msg.delete = AsyncMock(return_value=True)
+    return msg
+
+
+def make_update_text(
+    text: str,
+    *,
+    thread_id: int | None = None,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+    message_id: int = 100,
+) -> Any:
+    msg = _make_message(
+        text=text,
+        thread_id=thread_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+    update = MagicMock(name="Update")
+    update.message = msg
+    update.callback_query = None
+    update.effective_user = _make_user(user_id=user_id)
+    update.effective_chat = msg.chat
+    update.effective_message = msg
+    return update
+
+
+def make_update_topic_closed(
+    *,
+    thread_id: int,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+) -> Any:
+    msg = _make_message(
+        thread_id=thread_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        forum_topic_closed=MagicMock(name="ForumTopicClosed"),
+    )
+    update = MagicMock(name="Update")
+    update.message = msg
+    update.callback_query = None
+    update.effective_user = _make_user(user_id=user_id)
+    update.effective_chat = msg.chat
+    update.effective_message = msg
+    return update
+
+
+def make_update_topic_renamed(
+    new_name: str,
+    *,
+    thread_id: int,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+) -> Any:
+    edited = MagicMock(name="ForumTopicEdited")
+    edited.name = new_name
+    msg = _make_message(
+        thread_id=thread_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        forum_topic_edited=edited,
+    )
+    update = MagicMock(name="Update")
+    update.message = msg
+    update.callback_query = None
+    update.effective_user = _make_user(user_id=user_id)
+    update.effective_chat = msg.chat
+    update.effective_message = msg
+    return update
+
+
+def make_update_callback(
+    data: str,
+    *,
+    thread_id: int | None = None,
+    message_id: int = 200,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+) -> Any:
+    query = MagicMock(name="CallbackQuery")
+    query.id = "cbq-1"
+    query.data = data
+    query.from_user = _make_user(user_id=user_id)
+    query.answer = AsyncMock(return_value=True)
+    query.edit_message_text = AsyncMock()
+    query.edit_message_caption = AsyncMock()
+    query.edit_message_reply_markup = AsyncMock()
+    query.delete_message = AsyncMock()
+    query.message = _make_message(
+        thread_id=thread_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+    update = MagicMock(name="Update")
+    update.message = None
+    update.callback_query = query
+    update.effective_user = _make_user(user_id=user_id)
+    update.effective_chat = query.message.chat
+    update.effective_message = query.message
+    return update
+
+
+def make_update_command(
+    command: str,
+    *,
+    args: str = "",
+    thread_id: int | None = None,
+    user_id: int = _DEFAULT_USER_ID,
+    chat_id: int = _DEFAULT_CHAT_ID,
+    message_id: int = 100,
+) -> Any:
+    text = f"/{command}" + (f" {args}" if args else "")
+    msg = _make_message(
+        text=text,
+        thread_id=thread_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+    msg.entities = [
+        SimpleNamespace(type="bot_command", offset=0, length=len(f"/{command}"))
+    ]
+    update = MagicMock(name="Update")
+    update.message = msg
+    update.callback_query = None
+    update.effective_user = _make_user(user_id=user_id)
+    update.effective_chat = msg.chat
+    update.effective_message = msg
+    return update
+
+
+def make_context(
+    *,
+    bot: Any,
+    user_data: dict[str, Any] | None = None,
+    user_id: int = _DEFAULT_USER_ID,
+) -> Any:
+    """Build a python-telegram-bot CallbackContext stand-in."""
+    ctx = MagicMock(name="CallbackContext")
+    ctx.bot = bot
+    ctx.user_data = user_data if user_data is not None else {}
+    ctx.chat_data = {}
+    ctx.bot_data = {}
+    ctx.application = MagicMock(name="Application")
+    ctx.application.bot = bot
+    ctx.application.user_data = {user_id: ctx.user_data}
+    ctx.args = []
+    return ctx
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# State reset — clears module-level singletons between scenario tests.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _reset_session_manager() -> None:
+    """Empty the session_manager singleton's persisted dicts.
+
+    SessionManager is a public dataclass; clearing its fields uses its public
+    surface, not internals.
+    """
+    _real_sm.window_states.clear()
+    _real_sm.user_window_offsets.clear()
+    _real_sm.thread_bindings.clear()
+    _real_sm.window_display_names.clear()
+    _real_sm.group_chat_ids.clear()
+
+
+def _reset_message_queue() -> None:
+    """Drain per-route queues, workers, ephemeral slots, msg_id maps.
+
+    No ``reset_for_tests()`` seam yet — this duplicates the pattern in
+    ``test_message_queue.py::_reset_state``. Wave B should pull this into a
+    real seam on ``RouteRuntime`` / ``message_queue`` itself.
+    """
+    mq = message_queue
+    for name in (
+        "_route_queues",
+        "_route_workers",
+        "_route_locks",
+        "_route_pending_ephemeral",
+        "_route_ephemeral_kick",
+        "_route_inflight",
+        "_route_tearing_down",
+        "_status_msg_info",
+        "_tool_msg_ids",
+        "_agent_tool_ids",
+        "_activity_msg_info",
+        "_tool_activity_indices",
+        "_activity_locks",
+        "_subagent_msg_info",
+        "_subagent_tool_indices",
+        "_subagent_locks",
+        "_todo_locks",
+        "_todo_msg_info",
+        "_todo_pending_snapshot",
+        "_todo_tool_ids",
+        "_flood_until",
+    ):
+        attr = getattr(mq, name, None)
+        if isinstance(attr, dict):
+            attr.clear()
+    # Set-typed module state needs separate clearance.
+    bad_topics = getattr(mq, "_bad_topic_threads", None)
+    if isinstance(bad_topics, set):
+        bad_topics.clear()
+    # Cancel any in-flight digest flush tasks before clearing their maps.
+    for task_map_name in (
+        "_activity_flush_tasks",
+        "_subagent_flush_tasks",
+        "_todo_flush_tasks",
+    ):
+        m = getattr(mq, task_map_name, None)
+        if isinstance(m, dict):
+            for task in list(m.values()):
+                if hasattr(task, "done") and not task.done():
+                    task.cancel()
+            m.clear()
+
+
+def _reset_aggregator() -> None:
+    agg = inbound_aggregator
+    for name in ("_bundles", "_locks"):
+        attr = getattr(agg, name, None)
+        if isinstance(attr, dict):
+            attr.clear()
+
+
+def _reset_status_polling() -> None:
+    sp = status_polling
+    for name in ("_idle_state", "_route_typing_eligible", "_pane_idle_observed_at"):
+        attr = getattr(sp, name, None)
+        if isinstance(attr, dict):
+            attr.clear()
+
+
+def _reset_interactive_ui() -> None:
+    iu = interactive_ui
+    for name in (
+        "_interactive_msg_ids",
+        "_interactive_multi_tab_msg_ids",
+        "_interactive_modes",
+        "_ask_tool_inputs",
+        "_aqp_tokens",
+        "_aqe_tokens",
+    ):
+        attr = getattr(iu, name, None)
+        if isinstance(attr, dict):
+            attr.clear()
+
+
+def _reset_all_handler_state() -> None:
+    busy_indicator.reset_for_tests()
+    attention.reset_for_tests()
+    _reset_message_queue()
+    _reset_aggregator()
+    _reset_status_polling()
+    _reset_interactive_ui()
+    _reset_session_manager()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pytest fixtures
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
+    """Replace ``tmux_manager`` singleton methods with a fresh in-memory fake.
+
+    Patches the bound methods on the real singleton so every module that
+    already cached ``from .tmux_manager import tmux_manager`` sees the fake.
+    """
+    fake = FakeTmux()
+    for name in (
+        "list_windows",
+        "find_window_by_id",
+        "find_window_by_name",
+        "kill_window",
+        "rename_window",
+        "send_keys",
+        "capture_pane",
+        "create_window",
+        "get_or_create_session",
+        "get_session",
+        "session_exists",
+    ):
+        if hasattr(fake, name):
+            monkeypatch.setattr(_real_tmux, name, getattr(fake, name), raising=False)
+    return fake
+
+
+@pytest.fixture
+def fake_bot() -> FakeBot:
+    return FakeBot()
+
+
+@pytest.fixture
+def fresh_handler_state() -> Any:
+    """Wipe all handler module state before AND after the test.
+
+    Scenario tests use this to start from a clean module surface without
+    monkeypatching internals in the test body.
+    """
+    _reset_all_handler_state()
+    yield
+    _reset_all_handler_state()
+
+
+@dataclass
+class ScenarioHarness:
+    """Driver object wiring together fake tmux, fake bot, and a fresh state.
+
+    Scenario tests typically:
+
+      1. ``h.add_window(...)`` to seed tmux.
+      2. ``h.bind_thread(thread_id, window_id)`` to set up an existing topic.
+      3. Build an Update via ``make_update_*`` helpers.
+      4. Call the real bot handler (``bot_module.text_handler`` etc.) with the
+         Update and ``h.context``.
+      5. Assert on ``h.bot.sent`` / ``h.tmux.sent_keys`` / state.
+    """
+
+    tmux: FakeTmux
+    bot: FakeBot
+    session_manager: Any
+    user_data: dict[str, Any]
+    context: Any
+    user_id: int = _DEFAULT_USER_ID
+    chat_id: int = _DEFAULT_CHAT_ID
+
+    def add_window(
+        self,
+        *,
+        window_id: str | None = None,
+        window_name: str,
+        cwd: str = "/tmp/test",
+        pane_text: str = "",
+        pane_text_ansi: str = "",
+    ) -> str:
+        return self.tmux.add_window(
+            window_id=window_id,
+            window_name=window_name,
+            cwd=cwd,
+            pane_text=pane_text,
+            pane_text_ansi=pane_text_ansi,
+        )
+
+    def bind_thread(
+        self,
+        thread_id: int,
+        window_id: str,
+        *,
+        display_name: str | None = None,
+        cwd: str = "/tmp/test",
+        session_id: str = "",
+    ) -> None:
+        self.session_manager.thread_bindings.setdefault(self.user_id, {})[thread_id] = (
+            window_id
+        )
+        if display_name is not None:
+            self.session_manager.window_display_names[window_id] = display_name
+        from cctelegram.session import WindowState
+
+        self.session_manager.window_states[window_id] = WindowState(
+            session_id=session_id,
+            cwd=cwd,
+            window_name=display_name
+            or self.tmux.windows.get(window_id, _PaneWindow(window_id, "")).window_name,
+        )
+        self.session_manager.group_chat_ids[f"{self.user_id}:{thread_id}"] = (
+            self.chat_id
+        )
+
+
+@pytest.fixture
+def scenario(
+    fake_tmux: FakeTmux,
+    fake_bot: FakeBot,
+    fresh_handler_state: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ScenarioHarness:
+    """The Wave A scenario harness.
+
+    Composes ``fake_tmux`` + ``fake_bot`` + a freshly-cleared session_manager
+    + handler module state, and provides Update construction helpers.
+
+    Also bypasses ``is_user_allowed`` so the default test user passes the
+    allowlist gate without env-var configuration, and stubs
+    ``resolve_session_for_window`` so JSONL-file-existence checks don't
+    nuke ``window_states[*].session_id`` mid-test (the real path opens an
+    on-disk transcript file we don't write in scenarios).
+    """
+    monkeypatch.setattr(bot_module, "is_user_allowed", lambda _uid: True)
+
+    from cctelegram.session import ClaudeSession
+
+    async def _resolve_session_stub(window_id: str) -> ClaudeSession | None:
+        state = _real_sm.window_states.get(window_id)
+        if not state or not state.session_id:
+            return None
+        return ClaudeSession(
+            session_id=state.session_id,
+            summary="scenario-harness",
+            message_count=0,
+            file_path="",
+        )
+
+    monkeypatch.setattr(_real_sm, "resolve_session_for_window", _resolve_session_stub)
+
+    user_data: dict[str, Any] = {}
+    context = make_context(bot=fake_bot, user_data=user_data)
+    return ScenarioHarness(
+        tmux=fake_tmux,
+        bot=fake_bot,
+        session_manager=_real_sm,
+        user_data=user_data,
+        context=context,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Re-exports so scenario tests can import factories from this conftest.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+__all__ = [
+    "FakeBot",
+    "FakeTmux",
+    "ScenarioHarness",
+    "make_context",
+    "make_update_callback",
+    "make_update_command",
+    "make_update_text",
+    "make_update_topic_closed",
+    "make_update_topic_renamed",
+]

@@ -46,6 +46,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: tests using real filesystem or external processes",
+    "scenario: black-box behavior tests at the public Telegram seam",
 ]
 
 [tool.coverage.run]

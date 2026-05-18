@@ -179,7 +179,14 @@ uv run ruff format src/ tests/
 uv run ruff check src/ tests/
 uv run pyright src/cctelegram/
 uv run pytest --tb=short -q
+uv run pytest -m scenario -q          # behavior floor (tests/scenarios/)
+bin/post-wave-check.sh                # repo health diff (LoC + brittleness signals)
 ```
+
+`tests/scenarios/` holds the black-box behavior floor: each file drives a
+single user-visible scenario through the real handler stack (no
+monkeypatch of handler internals in test bodies). See
+`tests/scenarios/README.md` for the scenario → behavior map.
 
 ## Repository layout
 
@@ -201,6 +208,8 @@ src/cctelegram/message_refs.py       SQLite provenance table
 src/cctelegram/session_monitor.py    JSONL tail + TranscriptEvent dispatch
 src/cctelegram/transcript_parser.py  JSONL → ParsedEntry / TranscriptEvent
 tests/                              pytest suite
+tests/scenarios/                    black-box behavior floor (@pytest.mark.scenario)
+bin/post-wave-check.sh              repo-health diff for the architecture campaign
 .claude/rules/                      architecture notes loaded by Claude Code
 ```
 

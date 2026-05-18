@@ -30,5 +30,7 @@ jobs:
           uv run ruff format --check src/ tests/
       - name: Lint
         run: uv run pyright src/cctelegram/
+      - name: Scenario tests
+        run: uv run pytest -m scenario --tb=short -q
       - name: Test
         run: uv run pytest --tb=short -q

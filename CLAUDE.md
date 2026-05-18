@@ -9,8 +9,10 @@ Tech stack: Python, python-telegram-bot, tmux, uv.
 ```bash
 uv run ruff check src/ tests/         # Lint — MUST pass before committing
 uv run ruff format src/ tests/        # Format — auto-fix, then verify with --check
-uv run pyright src/cctelegram/             # Type check — MUST be 0 errors before committing
-cc-telegram hook --install                  # Auto-install Claude Code SessionStart hook
+uv run pyright src/cctelegram/        # Type check — MUST be 0 errors before committing
+uv run pytest -m scenario -q          # Scenario floor — black-box behavior tests at the public Telegram seam
+bin/post-wave-check.sh                # Architecture deepening health diff (LoC, brittleness, tool status)
+cc-telegram hook --install            # Auto-install Claude Code SessionStart hook
 ```
 
 ## Core Design Constraints
@@ -22,6 +24,7 @@ cc-telegram hook --install                  # Auto-install Claude Code SessionSt
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
 - **Rate limiting** — `AIORateLimiter(max_retries=5)` on the Application (30/s global). On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
+- **Scenario test floor** — `tests/scenarios/*.py` are black-box behavior tests at the public Telegram seam (`@pytest.mark.scenario`). They drive `Update` → real handler stack → fake tmux / fake bot, with no monkeypatch of handler internals in test bodies. Architecture changes must preserve these scenarios green.
 
 ## Code Conventions
 
