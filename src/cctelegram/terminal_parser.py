@@ -873,8 +873,7 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
                     for k in range(j + 1, min(j + 8, footer_idx + 1))
                 )
                 or any(
-                    _RE_NUMBERED_OPTION.match(lines[k])
-                    for k in range(max(0, j - 7), j)
+                    _RE_NUMBERED_OPTION.match(lines[k]) for k in range(max(0, j - 7), j)
                 )
             ):
                 start_idx = j
