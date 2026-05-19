@@ -1454,6 +1454,45 @@ class TestResolveAskForm:
         assert form.options[0].cursor is True
         assert form.current_tab_inferred is True
 
+    def test_single_q_picker_no_pane_cursor_defaults_to_option_1(self):
+        """When the pane scrape doesn't detect a cursor character on any
+        option, the resolver defaults cursor=True on option 1.
+
+        Symptom (cgc-fork D6 — Backend AUQ, 2026-05-19 14:36 window=@37
+        thread=10636): the Telegram card rendered "1. FalkorDB Lite" with
+        no ❯ marker on any option. Either the live pane had no literal
+        cursor character (some Claude Code variants signal the selected
+        row with ANSI inverse-video that gets stripped when capture-pane
+        runs without ``-e``), or the cursor row scrolled out of the
+        captured visible region for the long-description AUQ. Either way
+        the renderer ended up with cursor=False on every option and the
+        user couldn't tell where they were.
+
+        Fix: ``_overlay_cursor`` falls through to ``cursor_at =
+        jsonl_options[0].number`` when the pane reports no cursor.
+        Matches Claude Code's fresh-AUQ behaviour (cursor starts on
+        option 1). Pick buttons dispatch by literal number, so a stale-
+        but-visible marker can never mis-route input.
+        """
+        picker_pane_no_cursor = (
+            "Fix the P1s how?\n"
+            "\n"
+            "  1. Send findings back to Hermes (Recommended)\n"
+            "  2. I fix the P1s directly\n"
+            "  3. Merge as-is, file P1s as follow-up issues\n"
+            "  4. Fix P1s + P2s together\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = resolve_ask_form(self._single_q_input(), picker_pane_no_cursor)
+        assert form is not None
+        # Cursor lands on option 1 by default.
+        assert form.options[0].cursor is True
+        assert form.options[1].cursor is False
+        assert form.options[2].cursor is False
+        assert form.options[3].cursor is False
+        assert form.current_tab_inferred is True
+
     # ── CB6 — Strong-match requirement before overlay ─────────────────────
 
     def test_drift_pane_question_outside_jsonl_no_overlay(self):

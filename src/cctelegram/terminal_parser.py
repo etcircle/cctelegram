@@ -1234,14 +1234,24 @@ def _overlay_cursor(
     cursor flag onto the JSONL option so the renderer can highlight the
     selected row. Labels stay from JSONL (authoritative for order /
     spelling); cursor flips per pane.
+
+    When the pane scrape detected NO cursor on any option (e.g. the
+    cursor row scrolled out of the captured visible region for a
+    long-description AUQ, or a Claude Code variant uses ANSI inverse-
+    video on the row instead of a literal ``❯``), default the cursor
+    to the first JSONL option. That matches Claude Code's fresh-AUQ
+    behaviour (cursor starts on option 1) and ensures the renderer
+    always shows the user where they are. Pick buttons dispatch by
+    literal number, so a stale-but-visible cursor marker can never
+    mis-route input.
     """
-    if not pane_options:
-        return jsonl_options
     cursor_at: int | None = None
     for opt in pane_options:
         if opt.cursor and opt.number is not None:
             cursor_at = opt.number
             break
+    if cursor_at is None and jsonl_options:
+        cursor_at = jsonl_options[0].number
     if cursor_at is None:
         return jsonl_options
     return tuple(
