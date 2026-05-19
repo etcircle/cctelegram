@@ -2,7 +2,7 @@
 
 When two users see the same interactive picker card (e.g. shared topic),
 a click from a *non-owner* user must:
-  - be answered with "Not your card.",
+  - be answered with "This control isn't yours.",
   - NOT consume the legitimate owner's token (CB3 fix — the older
     consume-then-reject path destroyed tokens on wrong-user clicks).
 
@@ -67,7 +67,7 @@ async def test_wrong_user_click_is_rejected_without_consuming_token(
 
     intruder_update.callback_query.answer.assert_awaited()
     answer_text = intruder_update.callback_query.answer.await_args.args[0]
-    assert answer_text == "Not your card."
+    assert answer_text == "This control isn't yours."
     # Critical CB3 invariant: the wrong-user click did NOT consume the token.
     assert token in _pick_tokens
     # No tmux keystroke was sent.

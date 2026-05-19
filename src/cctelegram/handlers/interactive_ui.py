@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
+from ..callback_dispatcher import checked_callback_data
 from ..config import config
 from ..session import session_id_for_window, session_manager
 from ..terminal_parser import (
@@ -466,6 +467,7 @@ async def assert_nav_dispatchable(
     thread_id: int | None,
     window_id: str,
     *,
+    tmux_mgr=None,
     is_esc: Literal[False] = False,
 ) -> TmuxWindow | None: ...
 
@@ -477,6 +479,7 @@ async def assert_nav_dispatchable(
     thread_id: int | None,
     window_id: str,
     *,
+    tmux_mgr=None,
     is_esc: Literal[True],
 ) -> TmuxWindow | Literal["__esc_clear__"] | None: ...
 
@@ -487,6 +490,7 @@ async def assert_nav_dispatchable(
     thread_id: int | None,
     window_id: str,
     *,
+    tmux_mgr=None,
     is_esc: bool = False,
 ) -> TmuxWindow | Literal["__esc_clear__"] | None:
     """Guard a nav-keystroke callback before it dispatches keys to tmux.
@@ -519,6 +523,8 @@ async def assert_nav_dispatchable(
     back at the shell. CB5 (long-question case) is handled inside
     ``visible_pane_liveness`` via the picker-anchor fallback.
     """
+    if tmux_mgr is None:
+        tmux_mgr = tmux_manager
     if not has_interactive_surface(user_id, thread_id):
         if is_esc:
             # Cleanup is idempotent and what ESC wants.
@@ -530,13 +536,13 @@ async def assert_nav_dispatchable(
             return NAV_ESC_CLEAR
         await query.answer("Window changed")
         return None
-    w = await tmux_manager.find_window_by_id(window_id)
+    w = await tmux_mgr.find_window_by_id(window_id)
     if w is None:
         if is_esc:
             return NAV_ESC_CLEAR
         await query.answer("Window not found")
         return None
-    visible = await tmux_manager.capture_pane(w.window_id, scrollback_lines=0)
+    visible = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=0)
     state = visible_pane_liveness(visible)
     if state == "absent":
         if is_esc:
@@ -568,6 +574,7 @@ async def _notify_waiting_dm(
     window_id: str,
     thread_id: int | None,
     prompt_text: str,
+    session_mgr,
 ) -> None:
     """Emergency-only DM fallback when the topic-first attention card fails.
 
@@ -588,8 +595,8 @@ async def _notify_waiting_dm(
         )
         return
 
-    display = session_manager.get_display_name(window_id) or window_id
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    display = session_mgr.get_display_name(window_id) or window_id
+    chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
     link = _topic_link(chat_id, thread_id)
     message = f"🔔 Claude is waiting for input in {display}"
     if link:
@@ -955,11 +962,14 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "␣ Space", callback_data=f"{CB_ASK_SPACE}{window_id}"[:64]
+                "␣ Space",
+                callback_data=checked_callback_data(f"{CB_ASK_SPACE}{window_id}"),
             ),
-            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_id}"[:64]),
             InlineKeyboardButton(
-                "⇥ Tab", callback_data=f"{CB_ASK_TAB}{window_id}"[:64]
+                "↑", callback_data=checked_callback_data(f"{CB_ASK_UP}{window_id}")
+            ),
+            InlineKeyboardButton(
+                "⇥ Tab", callback_data=checked_callback_data(f"{CB_ASK_TAB}{window_id}")
             ),
         ]
     )
@@ -967,7 +977,8 @@ def _build_interactive_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
+                    "↓",
+                    callback_data=checked_callback_data(f"{CB_ASK_DOWN}{window_id}"),
                 ),
             ]
         )
@@ -975,13 +986,16 @@ def _build_interactive_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
+                    "←",
+                    callback_data=checked_callback_data(f"{CB_ASK_LEFT}{window_id}"),
                 ),
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
+                    "↓",
+                    callback_data=checked_callback_data(f"{CB_ASK_DOWN}{window_id}"),
                 ),
                 InlineKeyboardButton(
-                    "→", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
+                    "→",
+                    callback_data=checked_callback_data(f"{CB_ASK_RIGHT}{window_id}"),
                 ),
             ]
         )
@@ -989,13 +1003,15 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_id}"[:64]
+                "⎋ Esc", callback_data=checked_callback_data(f"{CB_ASK_ESC}{window_id}")
             ),
             InlineKeyboardButton(
-                "🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
+                "🔄",
+                callback_data=checked_callback_data(f"{CB_ASK_REFRESH}{window_id}"),
             ),
             InlineKeyboardButton(
-                "⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_id}"[:64]
+                "⏎ Enter",
+                callback_data=checked_callback_data(f"{CB_ASK_ENTER}{window_id}"),
             ),
         ]
     )
@@ -1534,6 +1550,8 @@ async def handle_interactive_ui(
     tool_input: dict | None = None,
     rerender_guard: object = _NO_GUARD,
     from_poller: bool = False,
+    tmux_mgr=None,
+    session_mgr=None,
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
 
@@ -1556,9 +1574,12 @@ async def handle_interactive_ui(
     the re-render — the world has moved on. Default ``_NO_GUARD`` means
     "always render" (monitor / JSONL dispatch path).
     """
+    if tmux_mgr is None:
+        tmux_mgr = tmux_manager
+    if session_mgr is None:
+        session_mgr = session_manager
     ikey = (user_id, thread_id or 0)
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-    w = await tmux_manager.find_window_by_id(window_id)
+    w = await tmux_mgr.find_window_by_id(window_id)
     if not w:
         return False
 
@@ -1574,7 +1595,7 @@ async def handle_interactive_ui(
     # "tmux probably mid-redraw"; bail without rendering so we don't post
     # a partial card, but ALSO don't destructively clear (callers gate
     # cleanup on ``has_interactive_surface``, which we don't touch).
-    visible = await tmux_manager.capture_pane(w.window_id, scrollback_lines=0)
+    visible = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=0)
     state = visible_pane_liveness(visible)
     if state != "present":
         logger.debug(
@@ -1588,7 +1609,7 @@ async def handle_interactive_ui(
     # Picker confirmed live. Now capture with scrollback for the structured
     # parse — long AskUserQuestion text pushes early options off the top of
     # the visible pane, and the parser needs them.
-    pane_text = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    pane_text = await tmux_mgr.capture_pane(w.window_id, scrollback_lines=500)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
@@ -1699,6 +1720,8 @@ async def handle_interactive_ui(
     keyboard = _build_interactive_keyboard(
         window_id, ui_name=content.name, pick_rows=pick_rows
     )
+
+    chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
 
     # PR 3: if we're rendering a single card but an active multi-tab
     # session exists for this route, the form has changed shape (e.g.
@@ -1825,7 +1848,9 @@ async def handle_interactive_ui(
             TopicSendOutcome.TOPIC_CLOSED,
             TopicSendOutcome.FORBIDDEN,
         ):
-            await _notify_waiting_dm(bot, user_id, window_id, thread_id, text)
+            await _notify_waiting_dm(
+                bot, user_id, window_id, thread_id, text, session_mgr
+            )
         return False
     _interactive_msgs[ikey] = sent.message_id
     _interactive_mode[ikey] = window_id
@@ -1851,6 +1876,8 @@ async def clear_interactive_msg(
     user_id: int,
     bot: Bot | None = None,
     thread_id: int | None = None,
+    *,
+    session_mgr=None,
 ) -> None:
     """Clear tracked interactive surfaces (single card + multi-tab session).
 
@@ -1858,6 +1885,8 @@ async def clear_interactive_msg(
     State mutations under the route lock (snapshot + drop + bump
     generation), Telegram deletes outside the lock.
     """
+    if session_mgr is None:
+        session_mgr = session_manager
     ikey = (user_id, thread_id or 0)
 
     # ── Phase 1: snapshot + drop state under lock ──────────────────
@@ -1922,7 +1951,7 @@ async def clear_interactive_msg(
     if bot is None:
         return
 
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
 
     # ── Phase 2: Telegram I/O outside the lock ─────────────────────
     if single_msg_id is not None:

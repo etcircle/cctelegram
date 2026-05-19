@@ -18,6 +18,12 @@ import pytest
 from telegram import CallbackQuery, User
 
 from cctelegram import bot as bot_module
+from cctelegram.callback_dispatcher import directory as dispatcher_directory
+from cctelegram.callback_dispatcher import effort as dispatcher_effort
+from cctelegram.callback_dispatcher import history as dispatcher_history
+from cctelegram.callback_dispatcher import interactive as dispatcher_interactive
+from cctelegram.callback_dispatcher import screenshot as dispatcher_screenshot
+from cctelegram.callback_dispatcher import bash as dispatcher_bash
 from cctelegram.handlers import inbound_telegram as inbound_module
 from cctelegram.handlers.callback_data import (
     CB_DIR_BIND_EXISTING,
@@ -89,19 +95,22 @@ def _patch_both(name: str, *args, **kwargs) -> Iterator[object]:
         kwargs["new"] = mock
     with ExitStack() as stack:
         result = None
-        if hasattr(bot_module, name):
-            result = stack.enter_context(
-                patch.object(bot_module, name, *args, **kwargs)
-            )
-        if hasattr(inbound_module, name):
-            inbound_result = stack.enter_context(
-                patch.object(inbound_module, name, *args, **kwargs)
-            )
-            # If the name lives only on ``inbound_module`` (e.g. helpers no
-            # longer aliased from ``bot``), return the inbound-side mock so
-            # ``as mock_X`` still binds something assertable.
-            if result is None:
-                result = inbound_result
+        for module in (
+            bot_module,
+            inbound_module,
+            dispatcher_directory,
+            dispatcher_effort,
+            dispatcher_history,
+            dispatcher_interactive,
+            dispatcher_screenshot,
+            dispatcher_bash,
+        ):
+            if hasattr(module, name):
+                module_result = stack.enter_context(
+                    patch.object(module, name, *args, **kwargs)
+                )
+                if result is None:
+                    result = module_result
         yield result
 
 
@@ -339,7 +348,13 @@ async def test_create_and_bind_non_resume_hook_timeout_kills_created_window() ->
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
     ):
         await bot_module._create_and_bind_window(
-            query, context, user, "/repo", pending_thread_id=10
+            query,
+            context,
+            user,
+            "/repo",
+            pending_thread_id=10,
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
         )
 
     wait_for_map.assert_awaited_once_with("@42", timeout=5.0)
@@ -385,7 +400,13 @@ async def test_create_and_bind_hook_timeout_surfaces_cleanup_failure() -> None:
         patch.object(CallbackQuery, "answer", new_callable=AsyncMock) as answer,
     ):
         await bot_module._create_and_bind_window(
-            query, context, user, "/repo", pending_thread_id=10
+            query,
+            context,
+            user,
+            "/repo",
+            pending_thread_id=10,
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
         )
 
     kill_window.assert_awaited_once_with("@43")
@@ -447,6 +468,8 @@ async def test_create_and_bind_resume_timeout_does_not_kill_created_resume_windo
             "/repo",
             pending_thread_id=10,
             resume_session_id="resume-123",
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
         )
 
     wait_for_map.assert_awaited_once_with("@44", timeout=15.0)
@@ -1472,7 +1495,13 @@ async def test_create_and_bind_owner_replaced_after_await_does_not_flush_new_pay
         _patch_both("aggregator_replay_payload", new_callable=AsyncMock) as mock_replay,
     ):
         await bot_module._create_and_bind_window(
-            query, context, user, str(tmp_path), pending_thread_id=10
+            query,
+            context,
+            user,
+            str(tmp_path),
+            pending_thread_id=10,
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
         )
 
     mock_kill.assert_awaited_once_with("@10")
@@ -1508,7 +1537,9 @@ async def test_existing_window_bind_owner_replaced_after_await_does_not_bind_or_
     window.window_id = "@0"
     window.window_name = "existing-window"
 
-    async def replace_owner_during_unbound_list() -> list[tuple[str, str, str]]:
+    async def replace_owner_during_unbound_list(
+        tmux_mgr: object, session_mgr: object
+    ) -> list[tuple[str, str, str]]:
         context.user_data = _pending_user_data(new_payload, thread_id=99)
         context.user_data["_pending_thread_text"] = "topic 99 text"
         return [("@0", "existing-window", str(tmp_path))]
@@ -1620,7 +1651,13 @@ async def test_create_and_bind_window_pending_flush_failure_is_explicit_and_clea
         else:
             mock_replay.return_value = flush_failure
         await bot_module._create_and_bind_window(
-            query, context, user, str(tmp_path), pending_thread_id=10
+            query,
+            context,
+            user,
+            str(tmp_path),
+            pending_thread_id=10,
+            tmux_mgr=bot_module.tmux_manager,
+            session_mgr=bot_module.session_manager,
         )
 
     mock_bind.assert_called_once_with(1, 10, "@0", window_name="created-window")

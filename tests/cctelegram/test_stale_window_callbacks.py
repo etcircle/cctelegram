@@ -81,7 +81,7 @@ async def test_stale_screenshot_refresh_rejected_after_topic_rebound_or_unbound(
         await bot_module.callback_handler(update, context)
 
     update.callback_query.answer.assert_awaited_once_with(
-        "Stale controls (topic mismatch)", show_alert=True
+        "This button is stale for this topic — refresh the picker.", show_alert=True
     )
     mock_find.assert_not_called()
     mock_capture.assert_not_called()
@@ -116,7 +116,7 @@ async def test_stale_history_pagination_rejected_before_tmux_lookup(
         await bot_module.callback_handler(update, context)
 
     update.callback_query.answer.assert_awaited_once_with(
-        "Stale history (topic mismatch)", show_alert=True
+        "This button is stale for this topic — refresh the picker.", show_alert=True
     )
     mock_find.assert_not_called()
     mock_history.assert_not_called()
@@ -151,7 +151,7 @@ async def test_stale_screenshot_quick_key_rejected_after_topic_rebound_or_unboun
         await bot_module.callback_handler(update, context)
 
     update.callback_query.answer.assert_awaited_once_with(
-        "Stale controls (topic mismatch)", show_alert=True
+        "This button is stale for this topic — refresh the picker.", show_alert=True
     )
     mock_find.assert_not_called()
     mock_send_keys.assert_not_called()
@@ -188,7 +188,7 @@ async def test_stale_interactive_key_rejected_after_topic_rebound_or_unbound(
         await bot_module.callback_handler(update, context)
 
     update.callback_query.answer.assert_awaited_once_with(
-        "Stale controls (topic mismatch)", show_alert=True
+        "This button is stale for this topic — refresh the picker.", show_alert=True
     )
     mock_find.assert_not_called()
     mock_send_keys.assert_not_called()

@@ -41,6 +41,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from telegram import (
     Bot,
@@ -316,10 +317,13 @@ def _get_thread_id(update: Update) -> int | None:
     return tid
 
 
-async def _list_unbound_windows() -> list[tuple[str, str, str]]:
+async def _list_unbound_windows(
+    tmux_mgr: Any,
+    session_mgr: Any,
+) -> list[tuple[str, str, str]]:
     """Return tmux windows not currently bound to any topic, as (id, name, cwd)."""
-    all_windows = await tmux_manager.list_windows()
-    bound_ids = {bid for _, _, bid in session_manager.iter_thread_bindings()}
+    all_windows = await tmux_mgr.list_windows()
+    bound_ids = {bid for _, _, bid in session_mgr.iter_thread_bindings()}
     return [
         (w.window_id, w.window_name, w.cwd)
         for w in all_windows
@@ -489,7 +493,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # unbound tmux windows exist, the browser surfaces an opt-in
         # "🖥 Bind existing window" button so the user can pivot to the
         # window picker — but the directory choice stays primary.
-        unbound_count = len(await _list_unbound_windows())
+        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
         start_path = str(config.browse_root)
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, unbound_count=unbound_count
@@ -736,7 +740,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ):
                 return
 
-        unbound_count = len(await _list_unbound_windows())
+        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
         start_path = str(config.browse_root)
         msg_text, keyboard, subdirs = build_directory_browser(
             start_path, unbound_count=unbound_count
@@ -979,7 +983,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # window" opt-in row that pivots to the window picker. We never
         # auto-default to an existing window's cwd, since that locks the
         # user into a directory they didn't choose.
-        unbound_count = len(await _list_unbound_windows())
+        unbound_count = len(await _list_unbound_windows(tmux_manager, session_manager))
         logger.info(
             "Unbound topic: showing directory browser (user=%d, thread=%d, unbound=%d)",
             user.id,
@@ -1036,7 +1040,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             user.id,
             thread_id,
         )
-        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            wid,
+            thread_id,
+            tmux_mgr=tmux_manager,
+            session_mgr=session_manager,
+        )
         # Small delay to let UI render in Telegram before text arrives
         await asyncio.sleep(0.3)
 
@@ -1070,7 +1081,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     interactive_window = get_interactive_window(user.id, thread_id)
     if interactive_window and interactive_window == wid:
         await asyncio.sleep(0.2)
-        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            wid,
+            thread_id,
+            tmux_mgr=tmux_manager,
+            session_mgr=session_manager,
+        )
 
 
 # --- Window creation helper ---
@@ -1079,6 +1097,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _cleanup_unbound_created_window(
     window_id: str,
     window_name: str,
+    tmux_mgr,
     *,
     reason: str = "SessionStart hook timeout",
 ) -> bool:
@@ -1092,7 +1111,7 @@ async def _cleanup_unbound_created_window(
         )
         return False
     try:
-        killed = await tmux_manager.kill_window(window_id)
+        killed = await tmux_mgr.kill_window(window_id)
     except Exception as e:  # pragma: no cover - tmux_manager normally swallows errors
         logger.error(
             "Failed to clean up unbound tmux window %s (%s) after %s: %s",
@@ -1125,6 +1144,7 @@ async def _abort_created_window_after_pending_owner_change(
     user_data: dict | None,
     user_id: int,
     pending_thread_id: int,
+    tmux_mgr,
     created_wid: str,
     created_wname: str,
     resume_session_id: str | None,
@@ -1144,6 +1164,7 @@ async def _abort_created_window_after_pending_owner_change(
         cleanup_ok = await _cleanup_unbound_created_window(
             created_wid,
             created_wname,
+            tmux_mgr,
             reason="pending owner change before bind",
         )
         cleanup_note = (
@@ -1173,6 +1194,9 @@ async def _create_and_bind_window(
     user: object,
     selected_path: str,
     pending_thread_id: int | None,
+    *,
+    tmux_mgr: Any,
+    session_mgr: Any,
     resume_session_id: str | None = None,
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
@@ -1195,7 +1219,7 @@ async def _create_and_bind_window(
         await query.answer("Stale picker", show_alert=True)
         return
 
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
+    success, message, created_wname, created_wid = await tmux_mgr.create_window(
         selected_path, resume_session_id=resume_session_id
     )
     if success:
@@ -1216,6 +1240,7 @@ async def _create_and_bind_window(
                 user_data=context.user_data,
                 user_id=user.id,
                 pending_thread_id=pending_thread_id,
+                tmux_mgr=tmux_mgr,
                 created_wid=created_wid,
                 created_wname=created_wname,
                 resume_session_id=resume_session_id,
@@ -1226,7 +1251,7 @@ async def _create_and_bind_window(
         # Resume sessions take longer to start (loading session state), so use
         # a longer timeout to avoid silently dropping messages.
         hook_timeout = 15.0 if resume_session_id else 5.0
-        hook_ok = await session_manager.wait_for_session_map_entry(
+        hook_ok = await session_mgr.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )
 
@@ -1238,6 +1263,7 @@ async def _create_and_bind_window(
                 user_data=context.user_data,
                 user_id=user.id,
                 pending_thread_id=pending_thread_id,
+                tmux_mgr=tmux_mgr,
                 created_wid=created_wid,
                 created_wname=created_wname,
                 resume_session_id=resume_session_id,
@@ -1257,7 +1283,7 @@ async def _create_and_bind_window(
                 pending_thread_id,
             )
             cleanup_ok = await _cleanup_unbound_created_window(
-                created_wid, created_wname
+                created_wid, created_wname, tmux_mgr
             )
             cleanup_note = (
                 "The unmonitored tmux window was cleaned up."
@@ -1287,7 +1313,7 @@ async def _create_and_bind_window(
         # writing to the resumed session's JSONL file. Override window_state to
         # track the original session_id so the monitor can route messages back.
         if resume_session_id:
-            ws = session_manager.get_window_state(created_wid)
+            ws = session_mgr.get_window_state(created_wid)
             if not hook_ok:
                 # Hook timed out — manually populate window_state so the
                 # monitor can still route messages back to this topic.
@@ -1301,7 +1327,7 @@ async def _create_and_bind_window(
                 ws.session_id = resume_session_id
                 ws.cwd = str(selected_path)
                 ws.window_name = created_wname
-                session_manager._save_state()
+                session_mgr._save_state()
             elif ws.session_id != resume_session_id:
                 logger.info(
                     "Resume override: window %s session_id %s -> %s",
@@ -1310,14 +1336,14 @@ async def _create_and_bind_window(
                     resume_session_id,
                 )
                 ws.session_id = resume_session_id
-                session_manager._save_state()
+                session_mgr._save_state()
 
         if pending_thread_id is not None:
             # Pre-register the new session in the monitor so the first
             # user/assistant exchange isn't dropped by the default
             # end-of-file offset initialization in
             # ``SessionMonitor.check_for_updates``.
-            ws = session_manager.get_window_state(created_wid)
+            ws = session_mgr.get_window_state(created_wid)
             track_sid = resume_session_id or ws.session_id
             track_cwd = ws.cwd or selected_path
 
@@ -1353,9 +1379,7 @@ async def _create_and_bind_window(
             from cctelegram import bot as _bot_module
 
             if _bot_module.session_monitor is not None:
-                file_path = session_manager._build_session_file_path(
-                    track_sid, track_cwd
-                )
+                file_path = session_mgr._build_session_file_path(track_sid, track_cwd)
                 if file_path is not None:
                     # Resume: skip pre-existing transcript history. New
                     # sessions: read from the start so the seed message and
@@ -1374,6 +1398,7 @@ async def _create_and_bind_window(
                     user_data=context.user_data,
                     user_id=user.id,
                     pending_thread_id=pending_thread_id,
+                    tmux_mgr=tmux_mgr,
                     created_wid=created_wid,
                     created_wname=created_wname,
                     resume_session_id=resume_session_id,
@@ -1381,7 +1406,7 @@ async def _create_and_bind_window(
                 return
 
             # Thread bind flow: bind thread to newly created window
-            session_manager.bind_thread(
+            session_mgr.bind_thread(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 

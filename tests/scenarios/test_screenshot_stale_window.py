@@ -58,7 +58,7 @@ async def test_screenshot_key_with_topic_mismatch_is_rejected(
 
     update.callback_query.answer.assert_awaited()
     answer_text = update.callback_query.answer.await_args.args[0]
-    assert "Stale controls" in answer_text
+    assert "This button is stale" in answer_text
     assert scenario.tmux.sent_keys == []
 
 

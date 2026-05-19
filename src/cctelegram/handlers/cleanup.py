@@ -13,6 +13,8 @@ from typing import Any
 
 from telegram import Bot
 
+from ..session import session_manager
+
 from . import attention
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
@@ -73,7 +75,7 @@ async def clear_topic_state(
     clear_tool_msg_ids_for_topic(user_id, thread_id)
 
     # Clear interactive UI state (also deletes message from chat)
-    await clear_interactive_msg(user_id, bot, thread_id)
+    await clear_interactive_msg(user_id, bot, thread_id, session_mgr=session_manager)
 
     # Drop any live attention card state — fresh topic gets a fresh episode.
     attention.clear(user_id, thread_id)
