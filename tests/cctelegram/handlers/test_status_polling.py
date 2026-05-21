@@ -1124,6 +1124,123 @@ class TestAbsentStreakHysteresis:
             assert route not in status_polling._absent_streak
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "shape,pane",
+        [
+            # ``full``: both prompt and Submit/Cancel options visible in the
+            # tail. The exact shape from the 2026-05-21 incident.
+            (
+                "full",
+                "  ...question content scrolled off above this line...\n"
+                "\n"
+                "Ready to submit your answers?\n"
+                "\n"
+                "❯ 1. Submit answers\n"
+                "  2. Cancel\n",
+            ),
+            # ``options-only``: only the Submit/Cancel options remain in
+            # the tail; the ``Ready to submit your answers?`` prompt has
+            # scrolled off above too. Matches the 2026-05-17 12:31
+            # production incident shape pinned in
+            # ``TestVisiblePaneLiveness.test_submit_answers_options_only_visible_is_present``.
+            # Removing the ``Submit answers`` regex from
+            # ``_PICKER_ANCHOR_MARKERS`` would re-introduce the
+            # destructive clear on this shape; the parametrize entry
+            # pins it independently of the prompt regex.
+            (
+                "options-only",
+                "\n❯ 1. Submit answers\n  2. Cancel\n",
+            ),
+            # ``prompt-only``: only the ``Ready to submit your answers?``
+            # prompt remains in the tail (options have wrapped below or
+            # been masked). Removing the prompt regex from
+            # ``_PICKER_ANCHOR_MARKERS`` would re-introduce the
+            # destructive clear on this shape; the parametrize entry
+            # pins it independently of the options regex.
+            (
+                "prompt-only",
+                "  ...prior picker content scrolled off...\n"
+                "\n"
+                "Ready to submit your answers?\n",
+            ),
+        ],
+        ids=["full", "options-only", "prompt-only"],
+    )
+    async def test_submit_screen_anchor_visible_prevents_clear(
+        self, mock_bot: AsyncMock, shape: str, pane: str
+    ):
+        """Regression — 2026-05-21 09:16:07 → 09:16:09 incident on @40 / msg
+        34496: the multi-Q AskUserQuestion advanced to the Submit-confirmation
+        screen with a long-question pane; the tab header
+        (``← ☒ ... ✔ Submit →``) scrolled above the visible region.
+        ``extract_interactive_content`` returned None for every UI_PATTERN
+        (none of multi-tab / single-tab / plain-numbered match a Submit screen
+        without ``Enter to select`` and without a visible tab header), so the
+        absent streak hit ABSENT_STREAK_THRESHOLD in 3 polls and the card was
+        destructively cleared while the picker was still live on the pane.
+
+        The 2026-05-20 ``_PICKER_ANCHOR_MARKERS`` work fixed the same shape
+        in ``visible_pane_liveness`` / ``handle_interactive_ui``, but didn't
+        propagate to status_polling's clear gate. This parametrize pins the
+        bypass on every distinct Submit-screen tail shape: full (prompt +
+        options), options-only, and prompt-only. Each anchor must
+        independently keep the card alive — codex P2 review 2026-05-21:
+        without the per-shape coverage, a single-regex removal could go
+        unnoticed because the surviving anchor still fires.
+        """
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        window_id = "@40"
+        user_id = 6427984308
+        thread_id = 34451
+        ikey = (user_id, thread_id)
+        route = (user_id, thread_id, window_id)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 34496  # the destroyed card in the real incident
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_interactive_msg", new_callable=AsyncMock
+            ) as mock_clear,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+            # Drive ABSENT_STREAK_THRESHOLD + 2 polls — well past the
+            # threshold that the legacy code would have used to clear.
+            # With the picker-anchor bypass, the streak resets each tick
+            # and the clear must never fire.
+            for _ in range(status_polling.ABSENT_STREAK_THRESHOLD + 2):
+                await status_polling.update_status_message(
+                    mock_bot,
+                    user_id=user_id,
+                    window_id=window_id,
+                    thread_id=thread_id,
+                )
+
+            assert mock_clear.call_count == 0, (
+                f"shape={shape}: clear must not fire while picker anchors "
+                f"are visible in the tail"
+            )
+            # The bypass calls _absent_streak.pop on every tick where the
+            # picker anchor is visible.
+            assert route not in status_polling._absent_streak
+
+    @pytest.mark.asyncio
     async def test_window_switch_clears_immediately_no_hysteresis(
         self, mock_bot: AsyncMock
     ):

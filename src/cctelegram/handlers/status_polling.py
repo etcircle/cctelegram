@@ -34,6 +34,7 @@ from .. import route_runtime
 from ..session import session_manager
 from ..terminal_parser import (
     extract_interactive_content,
+    is_picker_anchor_visible,
     is_status_active,
     parse_status_line,
 )
@@ -337,6 +338,25 @@ async def update_status_message(
         if not has_interactive_surface(user_id, thread_id):
             # Publish race: mode set but no card yet. Drop any leftover
             # streak so the new lifecycle starts from zero once published.
+            _absent_streak.pop(route, None)
+            return
+        # 2026-05-21: ``extract_interactive_content`` does not match the
+        # multi-Q AskUserQuestion Submit-confirmation screen when the tab
+        # header has scrolled above the visible region (long-question
+        # case). The picker is still live — its tail anchors
+        # (``Ready to submit your answers?`` / ``❯ 1. Submit answers``)
+        # are visible and ``visible_pane_liveness`` would correctly
+        # return ``present`` — but ``ui_content`` is None and the
+        # hysteresis below would clear the card mid-Submit, leaving the
+        # user staring at a live picker on the pane with no Telegram
+        # card to dispatch from. Observed 2026-05-21 09:16:07 → 09:16:09
+        # on @40 / msg 34496 (multi-Q D3-D6 form). The 2026-05-20
+        # ``_PICKER_ANCHOR_MARKERS`` work fixed the same shape in
+        # ``visible_pane_liveness`` (used by ``handle_interactive_ui``)
+        # but didn't propagate to status_polling's clear gate. Check
+        # ``is_picker_anchor_visible`` here as the same fallback: tail
+        # anchors present → reset the streak, keep the card.
+        if is_picker_anchor_visible(pane_text):
             _absent_streak.pop(route, None)
             return
         # Hysteresis: a single absent poll can be a transient redraw frame on
