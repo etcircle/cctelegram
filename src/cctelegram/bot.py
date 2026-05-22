@@ -856,7 +856,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # (which has only pane text) can also render the full option list
             # via the JSONL payload when it dispatches handle_interactive_ui.
             if msg.tool_name == "AskUserQuestion":
-                remember_ask_tool_input(wid, msg.tool_input)
+                remember_ask_tool_input(wid, msg.tool_input, msg.tool_use_id)
             # Flush pending content for THIS route only — unrelated topics
             # must not delay the interactive prompt.
             queue = get_content_queue((user_id, thread_id or 0, wid))
@@ -1086,6 +1086,26 @@ async def post_init(application: Application) -> None:
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
+
+    # Wave A (Bug A — duplicate picker on restart) requires the
+    # SessionManager.window_states[wid].session_id field to be populated
+    # BEFORE hydrate_interactive_state runs its staleness checks.
+    # SessionMonitor calls load_session_map() inside its polling loop
+    # (session_monitor.py:1081), but that's too late — by then the first
+    # poll has already fired and a stale _interactive_msgs lookup would
+    # have missed the persisted entry. Call it explicitly here.
+    await session_manager.load_session_map()
+
+    # Hydrate interactive UI persisted state (Wave A, Bug A fix).
+    # MUST run AFTER resolve_stale_ids() AND load_session_map() so
+    # window-id remaps and session_id bindings are both visible to
+    # hydrate's resolve_window_for_thread + session_id_for_window
+    # lookups. MUST run BEFORE SessionMonitor() and the polling tasks
+    # so the first poll cycle sees the restored _interactive_msgs map
+    # and takes the edit-branch instead of fresh-send.
+    from .handlers.interactive_ui import hydrate_interactive_state
+
+    hydrate_interactive_state(session_manager)
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's

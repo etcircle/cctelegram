@@ -235,6 +235,461 @@ from cctelegram.terminal_parser import (  # noqa: E402
 )
 
 
+class TestShouldPostAuqContext:
+    """Threshold gate for the AUQ context-message dump."""
+
+    def test_long_description_triggers(self):
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": "A", "description": "x" * 260},
+                        {"label": "B", "description": "short"},
+                    ],
+                }
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is True
+
+    def test_short_descriptions_still_fire(self):
+        """v3+: gate is question-text-based, not description-length-based.
+
+        Under v2 (250-char threshold), short descriptions returned False.
+        Under v3+ (gate aligns with formatter, which keys on question
+        text), any question with non-empty text + at least one labeled
+        option returns True regardless of description length. This is
+        the user invariant from 2026-05-22: always post info+picker.
+        """
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": "A", "description": "short A"},
+                        {"label": "B", "description": "short B"},
+                    ],
+                }
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is True
+
+    def test_missing_descriptions_still_fire(self):
+        """v3+: gate is question-text-based; descriptions are optional.
+
+        Under v2 (250-char threshold), descriptionless options returned
+        False. Under v3+, question text is the trigger.
+        """
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is True
+
+    def test_label_only_no_question_text_skipped(self):
+        """v3+ (Codex P2 #4): label-only forms with no question text
+        are skipped because the formatter (``_format_auq_context_message``)
+        skips the whole question when ``question``/``header`` is empty.
+        Firing the gate would consume the claim and post a header-only
+        message.
+        """
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is False
+
+    def test_question_only_no_options_fires(self):
+        """Hermes additional finding: question-only forms still trigger
+        the info message — content exists, just no options. Formatter
+        renders the question text in this case.
+        """
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {"question": "Are you sure?"},
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is True
+
+    def test_header_only_fires(self):
+        """Gate accepts ``header`` as a question-text fallback (mirrors
+        what _format_auq_context_message uses)."""
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {"header": "Confirm migration", "options": [{"label": "Yes"}]},
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is True
+
+    def test_blank_question_text_returns_false(self):
+        """Whitespace-only question text is treated as empty."""
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {"question": "   ", "options": [{"label": "A"}]},
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is False
+
+    def test_multi_question_only_one_long_triggers(self):
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q1?",
+                    "options": [{"label": "A", "description": "short"}],
+                },
+                {
+                    "question": "Q2?",
+                    "options": [{"label": "B", "description": "y" * 300}],
+                },
+            ]
+        }
+        assert _should_post_auq_context(tool_input) is True
+
+    def test_malformed_inputs_return_false(self):
+        from cctelegram.handlers.interactive_ui import _should_post_auq_context
+
+        assert _should_post_auq_context(None) is False
+        assert _should_post_auq_context({}) is False
+        assert _should_post_auq_context({"questions": "nope"}) is False
+        assert _should_post_auq_context({"questions": [None, 1]}) is False
+        assert _should_post_auq_context({"questions": [{"options": "nope"}]}) is False
+
+
+class TestFormatAuqContextMessage:
+    """Plain-text formatter for the AUQ context-message dump."""
+
+    def test_single_question_format(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "D5 — Pick the migration strategy.",
+                        "header": "Migration",
+                        "options": [
+                            {
+                                "label": "Drop the flag",
+                                "description": (
+                                    "Long description explaining the trade-off "
+                                    "of dropping the flag entirely."
+                                ),
+                            },
+                            {
+                                "label": "Keep the flag",
+                                "description": "Short description.",
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+        # Header line present
+        assert out.startswith("📋 AskUserQuestion — full details")
+        # Question text present (no Q1. prefix in single-question mode)
+        assert "D5 — Pick the migration strategy." in out
+        # Both options listed with full descriptions
+        assert "1. Drop the flag" in out
+        assert "Long description explaining the trade-off" in out
+        assert "2. Keep the flag" in out
+        assert "Short description." in out
+        # No multi-question hint
+        assert "Picker below answers each question one at a time" not in out
+
+    def test_multi_question_format(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "Q1: which approach?",
+                        "options": [
+                            {"label": "A1", "description": "alpha"},
+                            {"label": "B1", "description": "beta"},
+                        ],
+                    },
+                    {
+                        "question": "Q2: which timing?",
+                        "options": [
+                            {"label": "Now", "description": "Right away."},
+                            {"label": "Later", "description": "Next sprint."},
+                        ],
+                    },
+                ]
+            }
+        )
+        assert "📋 AskUserQuestion — full details" in out
+        assert "Picker below answers each question one at a time" in out
+        assert "Q1. Q1: which approach?" in out
+        assert "Q2. Q2: which timing?" in out
+        # Per-question option numbering resets
+        assert "1. A1" in out
+        assert "2. B1" in out
+        assert "1. Now" in out
+        assert "2. Later" in out
+        # Descriptions intact
+        assert "Right away." in out
+        assert "Next sprint." in out
+
+    def test_description_preserves_line_breaks(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "Q?",
+                        "options": [
+                            {
+                                "label": "Multi-line",
+                                "description": "Line one.\nLine two.",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        assert "   Line one." in out
+        assert "   Line two." in out
+
+    def test_empty_options_skipped(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        out = _format_auq_context_message(
+            {
+                "questions": [
+                    {
+                        "question": "Q?",
+                        "options": [
+                            {"label": "", "description": "skipped — no label"},
+                            {"label": "Real", "description": "kept"},
+                        ],
+                    }
+                ]
+            }
+        )
+        assert "skipped — no label" not in out
+        assert "1. Real" in out  # numbering still 1-based
+
+
+class TestClaimAuqContextPost:
+    """Atomic check-and-set for the AUQ context-post gate."""
+
+    def setup_method(self):
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._last_completed_ask_tool_input.clear()
+        iui._last_auq_tool_use_id.clear()
+        iui._auq_context_posted.clear()
+
+    def test_no_auq_cached_returns_false(self):
+        from cctelegram.handlers.interactive_ui import claim_auq_context_post
+
+        assert claim_auq_context_post("@99") is False
+
+    def test_first_claim_succeeds_second_fails(self):
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post,
+            remember_ask_tool_input,
+        )
+
+        remember_ask_tool_input(
+            "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
+        )
+        assert claim_auq_context_post("@5") is True
+        assert claim_auq_context_post("@5") is False
+
+    def test_new_tool_use_id_resets_claim(self):
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post,
+            remember_ask_tool_input,
+        )
+
+        remember_ask_tool_input(
+            "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
+        )
+        assert claim_auq_context_post("@5") is True
+        # Same window, new AUQ tool_use_id → claim resets.
+        remember_ask_tool_input(
+            "@5", {"questions": [{"options": [{"label": "B"}]}]}, "toolu_2"
+        )
+        assert claim_auq_context_post("@5") is True
+        assert claim_auq_context_post("@5") is False
+
+    def test_forget_drops_post_state(self):
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post,
+            forget_ask_tool_input,
+            remember_ask_tool_input,
+        )
+
+        remember_ask_tool_input(
+            "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
+        )
+        assert claim_auq_context_post("@5") is True
+        forget_ask_tool_input("@5")
+        # After tool_result clears the cache, a fresh re-cache (e.g. via
+        # hydrate after restart) should be claimable again.
+        remember_ask_tool_input(
+            "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_1"
+        )
+        assert claim_auq_context_post("@5") is True
+
+    def test_missing_tool_use_id_blocks_claim(self):
+        """If remember_ask_tool_input is called WITHOUT a tool_use_id
+        (e.g. a legacy test path or unmigrated caller), the claim gate
+        returns False — we can't dedup without an ID, and over-posting
+        would be more harmful than under-posting."""
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post,
+            remember_ask_tool_input,
+        )
+
+        remember_ask_tool_input("@5", {"questions": [{"options": [{"label": "A"}]}]})
+        assert claim_auq_context_post("@5") is False
+
+    def test_remember_without_id_clears_stale_id_state(self):
+        """Hermes P3 hardening (2026-05-22 diff review): if an earlier
+        call left a tool_use_id + posted state in place and a later
+        caller invokes remember_ask_tool_input WITHOUT a tool_use_id
+        (e.g. a test helper or unmigrated legacy path), the stale ID
+        must be cleared so the no-id caller's "no claim" guarantee
+        holds. Otherwise the old ID + posted state could mark a fresh
+        AUQ as 'already context-posted' just because the IDs match."""
+        from cctelegram.handlers.interactive_ui import (
+            claim_auq_context_post,
+            remember_ask_tool_input,
+        )
+
+        remember_ask_tool_input(
+            "@5", {"questions": [{"options": [{"label": "A"}]}]}, "toolu_old"
+        )
+        assert claim_auq_context_post("@5") is True  # posted
+        # Caller without an ID overwrites the cache. Stale ID + posted
+        # state should be wiped.
+        remember_ask_tool_input("@5", {"questions": [{"options": [{"label": "B"}]}]})
+        assert claim_auq_context_post("@5") is False  # no ID to claim
+
+
+class TestSendAuqContextMessage:
+    """Behavior of the multi-part AUQ context-message sender."""
+
+    def setup_method(self):
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._last_completed_ask_tool_input.clear()
+        iui._last_auq_tool_use_id.clear()
+        iui._auq_context_posted.clear()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_propagates(self, monkeypatch):
+        """Codex P2 (2026-05-22 diff review): RetryAfter must NOT be
+        swallowed — the outer flood-control machinery owns back-off."""
+        from telegram.error import RetryAfter
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        async def _raise_retry_after(*args, **kwargs):
+            raise RetryAfter(retry_after=5)
+
+        monkeypatch.setattr(iui, "topic_send", _raise_retry_after)
+
+        with pytest.raises(RetryAfter):
+            await iui._send_auq_context_message(
+                None,  # type: ignore[arg-type]
+                user_id=1,
+                thread_id=None,
+                chat_id=1,
+                window_id="@5",
+                tool_input={
+                    "questions": [
+                        {
+                            "question": "Q?",
+                            "options": [
+                                {
+                                    "label": "A",
+                                    "description": "x" * 50,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+    @pytest.mark.asyncio
+    async def test_stops_on_failed_chunk(self, monkeypatch):
+        """Hermes P3 (2026-05-22 diff review): structurally-failed
+        chunk (topic_send returns sent=None) stops the sequence so
+        the user doesn't see [1/N] then [3/N] with a hole."""
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        # Force the formatter to produce > one chunk by stuffing huge
+        # descriptions; build_response_parts splits past 3000 chars.
+        long_desc = ("paragraph " * 100).strip()  # ~1000 chars
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": f"Option {i}", "description": long_desc}
+                        for i in range(1, 11)  # 10 options × ~1000 chars
+                    ],
+                }
+            ]
+        }
+
+        send_calls: list[int] = []
+
+        async def _fail_second(*args, **kwargs):
+            send_calls.append(kwargs.get("part_index", 0))
+            if len(send_calls) == 2:
+                # Second chunk: structural failure.
+                return None, TopicSendOutcome.TOPIC_NOT_FOUND
+            # Other chunks: succeed.
+            from unittest.mock import Mock
+
+            return Mock(message_id=100 + len(send_calls)), TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_send", _fail_second)
+
+        await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input=tool_input,
+        )
+
+        # Two send attempts: chunk 1 ok, chunk 2 failed, stop.
+        assert len(send_calls) == 2
+
+
 class TestRenderAskUserQuestion:
     def test_single_question_picker(self):
         form = AskUserQuestionForm(
@@ -255,6 +710,61 @@ class TestRenderAskUserQuestion:
         assert "Enter to select" in out
         # No tab strip rendered for a single-question form
         assert "☒" not in out and "☐" not in out
+
+    def test_walkback_title_fallback_when_jsonl_missing(self):
+        """When ``current_question_title`` is None (pane-only parse
+        before JSONL has flushed), the renderer falls back to
+        ``pane_walkback_title`` so the user still sees the question
+        header. Regression for the 2026-05-21 D5 incident where the
+        Telegram card landed with options only, no context."""
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title=None,
+            options=(
+                AskOption(
+                    label="Drop the flag — ripple is just the new behavior",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                ),
+                AskOption(
+                    label="One-time migration — v3 to v4 schema bump",
+                    recommended=False,
+                    cursor=False,
+                    number=2,
+                ),
+            ),
+            pane_walkback_title=(
+                "D5 — If durationMode-as-permanent-flag is cruft, "
+                "how do we handle legacy voice_patch ops?"
+            ),
+        )
+        out = _render_ask_user_question(form)
+        # Walk-back title appears at the top, ahead of the options.
+        assert (
+            "D5 — If durationMode-as-permanent-flag is cruft, "
+            "how do we handle legacy voice_patch ops?"
+        ) in out
+        assert "❯ 1. Drop the flag" in out
+        # The fallback only fires when current_question_title is None;
+        # it must NOT shadow an authoritative title from JSONL.
+        title_idx = out.index("D5 — If")
+        option_idx = out.index("❯ 1. Drop the flag")
+        assert title_idx < option_idx
+
+    def test_jsonl_title_wins_over_walkback(self):
+        """When both ``current_question_title`` and
+        ``pane_walkback_title`` are set, the JSONL-authoritative title
+        wins — the walk-back is strictly a fallback."""
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="JSONL authoritative title",
+            options=(AskOption(label="A", recommended=False, cursor=True, number=1),),
+            pane_walkback_title="Walkback guess that should be ignored",
+        )
+        out = _render_ask_user_question(form)
+        assert "JSONL authoritative title" in out
+        assert "Walkback guess" not in out
 
     def test_multitab_picker_with_recommended(self):
         form = AskUserQuestionForm(
@@ -1772,3 +2282,645 @@ class TestClearInteractiveMsgWalksBothMaps:
         assert (42, 7) not in _multi_tab_sessions
 
         _route_locks.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Wave A (Bug A — duplicate picker on restart) + Bug B
+# Persistence + hydrate + tri-state context-send tests (plan v5).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def _isolated_interactive_state_file(tmp_path, monkeypatch):
+    """Redirect interactive_state.json to a tmp_path and clear all state.
+
+    Used by every persistence/hydrate test so we never touch the real
+    ~/.cc-telegram/interactive_state.json.
+    """
+    from cctelegram.handlers import interactive_ui as iui
+
+    fake_interactive_file = tmp_path / "interactive_state.json"
+
+    def _fake_path():
+        return fake_interactive_file
+
+    monkeypatch.setattr(iui, "_interactive_state_file_path", _fake_path)
+
+    iui._interactive_msgs.clear()
+    iui._interactive_msg_meta.clear()
+    iui._auq_context_posted.clear()
+    iui._last_completed_ask_tool_input.clear()
+    iui._last_auq_tool_use_id.clear()
+    yield fake_interactive_file
+    iui._interactive_msgs.clear()
+    iui._interactive_msg_meta.clear()
+    iui._auq_context_posted.clear()
+    iui._last_completed_ask_tool_input.clear()
+    iui._last_auq_tool_use_id.clear()
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestInteractiveStatePersistence:
+    """Write-through persistence for _interactive_msgs + _auq_context_posted."""
+
+    def test_set_interactive_msg_persists_to_disk(
+        self, _isolated_interactive_state_file
+    ):
+        import json as _json
+
+        from cctelegram.handlers.interactive_ui import _set_interactive_msg
+
+        _set_interactive_msg(
+            (1, 10),
+            msg_id=42,
+            window_id="@5",
+            session_id="sess-uuid",
+            tool_use_id="toolu_abc",
+        )
+        assert _isolated_interactive_state_file.exists()
+        data = _json.loads(_isolated_interactive_state_file.read_text())
+        assert data["interactive_msgs"]["1:10"]["msg_id"] == 42
+        assert data["interactive_msgs"]["1:10"]["window_id"] == "@5"
+        assert data["interactive_msgs"]["1:10"]["session_id"] == "sess-uuid"
+        assert data["interactive_msgs"]["1:10"]["tool_use_id"] == "toolu_abc"
+        assert data["auq_context_posted"] == {}
+
+    def test_clear_interactive_msg_persists(self, _isolated_interactive_state_file):
+        import json as _json
+
+        from cctelegram.handlers.interactive_ui import (
+            _clear_interactive_msg,
+            _set_interactive_msg,
+        )
+
+        _set_interactive_msg(
+            (1, 10), msg_id=42, window_id="@5", session_id="s", tool_use_id=None
+        )
+        returned = _clear_interactive_msg((1, 10))
+        assert returned == 42
+        data = _json.loads(_isolated_interactive_state_file.read_text())
+        assert data["interactive_msgs"] == {}
+
+    def test_persist_handles_io_error_gracefully(self, monkeypatch, caplog):
+        """OSError on disk write must be logged, not raised."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        def _raise_oserror(path, data, *, indent=2):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(iui, "atomic_write_json", _raise_oserror)
+        with caplog.at_level("WARNING"):
+            iui._set_interactive_msg(
+                (1, 10),
+                msg_id=42,
+                window_id="@5",
+                session_id="s",
+                tool_use_id=None,
+            )
+        # In-memory mutation still happened.
+        assert iui._interactive_msgs[(1, 10)] == 42
+        assert any(
+            "Failed to persist interactive_state.json" in r.message
+            for r in caplog.records
+        )
+
+    def test_claim_auq_context_persists(self, _isolated_interactive_state_file):
+        import json as _json
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._last_auq_tool_use_id["@5"] = "toolu_xyz"
+        claimed = iui.claim_auq_context_post("@5")
+        assert claimed is True
+        data = _json.loads(_isolated_interactive_state_file.read_text())
+        assert data["auq_context_posted"]["@5"] == "toolu_xyz"
+
+    def test_forget_ask_tool_input_persists_drop(
+        self, _isolated_interactive_state_file
+    ):
+        import json as _json
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._last_auq_tool_use_id["@5"] = "toolu_xyz"
+        iui.claim_auq_context_post("@5")
+        iui.forget_ask_tool_input("@5")
+        data = _json.loads(_isolated_interactive_state_file.read_text())
+        assert data["auq_context_posted"] == {}
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestHydrateInteractiveState:
+    """Hydrate at bot startup — restoration + staleness/remap/normalization."""
+
+    def _write_state(self, path, **kwargs):
+        import json as _json
+
+        path.write_text(_json.dumps(kwargs))
+
+    def _session_mgr_stub(self, window_states, route_window_map):
+        """Build a minimal mock of session_manager API used by hydrate.
+
+        ``window_states``: ``{window_id: session_id}``.
+        ``route_window_map``: ``{(user_id, thread_id_or_None): window_id}``.
+        """
+        from unittest.mock import MagicMock
+
+        sm = MagicMock()
+        sm.window_states = {wid: object() for wid in window_states}
+
+        def _sid_for_win(wid):
+            return window_states.get(wid)
+
+        def _win_for_thread(user_id, thread_id):
+            return route_window_map.get((user_id, thread_id or 0))
+
+        sm.session_id_for_window = _sid_for_win
+        sm.resolve_window_for_thread = _win_for_thread
+        return sm
+
+    def test_hydrate_handles_missing_file(self, _isolated_interactive_state_file):
+        from cctelegram.handlers import interactive_ui as iui
+
+        assert not _isolated_interactive_state_file.exists()
+        sm = self._session_mgr_stub({}, {})
+        iui.hydrate_interactive_state(sm)
+        assert iui._interactive_msgs == {}
+        assert iui._interactive_msg_meta == {}
+
+    def test_hydrate_handles_malformed_json(self, _isolated_interactive_state_file):
+        from cctelegram.handlers import interactive_ui as iui
+
+        _isolated_interactive_state_file.write_text("{not json")
+        sm = self._session_mgr_stub({}, {})
+        iui.hydrate_interactive_state(sm)  # must not raise
+        assert iui._interactive_msgs == {}
+
+    def test_hydrate_restores_matching_session(self, _isolated_interactive_state_file):
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@5",
+                    "session_id": "sess-1",
+                    "tool_use_id": "toolu_a",
+                    "created_at": "2026-05-22T00:00:00+00:00",
+                }
+            },
+            auq_context_posted={},
+        )
+        sm = self._session_mgr_stub({"@5": "sess-1"}, {(1, 10): "@5"})
+        iui.hydrate_interactive_state(sm)
+        assert iui._interactive_msgs[(1, 10)] == 42
+        assert iui._interactive_msg_meta[(1, 10)].window_id == "@5"
+
+    def test_hydrate_drops_mismatching_session(self, _isolated_interactive_state_file):
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@5",
+                    "session_id": "old-sess",
+                    "tool_use_id": "toolu_a",
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={},
+        )
+        sm = self._session_mgr_stub({"@5": "new-sess"}, {(1, 10): "@5"})
+        iui.hydrate_interactive_state(sm)
+        assert (1, 10) not in iui._interactive_msgs
+        # Crucially: no topic_delete is called by hydrate (it's sync,
+        # no Telegram I/O at all). The orphan card stays.
+
+    def test_hydrate_drops_on_route_rebind(self, _isolated_interactive_state_file):
+        """Codex P2 #2 (v3): route now resolves to a DIFFERENT window
+        with DIFFERENT session. Persisted-window fallback would
+        mis-attribute the msg_id; v3+ drops instead."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@5",
+                    "session_id": "old-sess",
+                    "tool_use_id": "toolu_a",
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={},
+        )
+        # Route now bound to @7 (different window) with a different session.
+        # The OLD window @5 still exists with its old session.
+        sm = self._session_mgr_stub(
+            {"@5": "old-sess", "@7": "new-sess"},
+            {(1, 10): "@7"},
+        )
+        iui.hydrate_interactive_state(sm)
+        # MUST drop — falling back to rec.window_id @5 would attribute
+        # the msg to a route that no longer owns it.
+        assert (1, 10) not in iui._interactive_msgs
+
+    def test_hydrate_handles_partial_record(self, _isolated_interactive_state_file):
+        """from_dict rejects msg_id <= 0 + empty window_id (P3 hardening)."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {"msg_id": 0, "window_id": "@5", "session_id": "s"},
+                "2:20": {"msg_id": 100, "window_id": "", "session_id": "s"},
+                "3:30": {
+                    "msg_id": 42,
+                    "window_id": "@7",
+                    "session_id": "s",
+                    "tool_use_id": None,
+                    "created_at": "x",
+                },
+            },
+            auq_context_posted={},
+        )
+        sm = self._session_mgr_stub({"@7": "s"}, {(3, 30): "@7"})
+        iui.hydrate_interactive_state(sm)
+        # Only the valid record survives.
+        assert list(iui._interactive_msgs.keys()) == [(3, 30)]
+
+    def test_hydrate_remaps_window_id(self, _isolated_interactive_state_file):
+        """Pure @12 → @13 remap (same session, route is still bound)."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@12",
+                    "session_id": "s",
+                    "tool_use_id": None,
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={},
+        )
+        # tmux server restart: route's window remapped to @13.
+        sm = self._session_mgr_stub({"@13": "s"}, {(1, 10): "@13"})
+        iui.hydrate_interactive_state(sm)
+        assert iui._interactive_msgs[(1, 10)] == 42
+        assert iui._interactive_msg_meta[(1, 10)].window_id == "@13"
+
+    def test_hydrate_normalizes_none_vs_empty_session(
+        self, _isolated_interactive_state_file
+    ):
+        """Persisted session_id='', current_session_id_for_window=None → KEEP."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@5",
+                    "session_id": "",
+                    "tool_use_id": None,
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={},
+        )
+        # session_id_for_window returns None for @5; treat as equal to "".
+        sm = self._session_mgr_stub({"@5": None}, {(1, 10): "@5"})
+        iui.hydrate_interactive_state(sm)
+        assert (1, 10) in iui._interactive_msgs
+
+    def test_hydrate_prunes_unknown_context_marker(
+        self, _isolated_interactive_state_file
+    ):
+        """Markers whose window is not in window_states get pruned."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={},
+            auq_context_posted={"@99": "toolu_dead"},
+        )
+        sm = self._session_mgr_stub({"@5": "s"}, {})
+        iui.hydrate_interactive_state(sm)
+        assert iui._auq_context_posted == {}
+
+    def test_hydrate_remaps_context_marker_on_window_remap(
+        self, _isolated_interactive_state_file
+    ):
+        """v4 intent / v5 ordering: when meta remaps @12→@13 AND the
+        marker on @12 matches rec.tool_use_id, mirror the remap."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@12",
+                    "session_id": "s",
+                    "tool_use_id": "toolu_a",
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={"@12": "toolu_a"},
+        )
+        sm = self._session_mgr_stub({"@13": "s"}, {(1, 10): "@13"})
+        iui.hydrate_interactive_state(sm)
+        # Both moved to @13.
+        assert iui._interactive_msg_meta[(1, 10)].window_id == "@13"
+        assert iui._auq_context_posted == {"@13": "toolu_a"}
+
+    def test_hydrate_marker_remap_works_from_cold_module_state(
+        self, _isolated_interactive_state_file
+    ):
+        """Codex P2 #1 (v4→v5): cold restart — module dicts empty before
+        hydrate. Persisted markers are loaded into the LOCAL ctx_markers
+        dict FIRST, then the meta loop reads/mutates THAT dict, then
+        commits at the end. Without the v5 ordering fix, the meta loop
+        would read from the empty module dict and the remap would
+        dead-code on cold restart (the exact case that matters)."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Cold state simulation.
+        assert iui._interactive_msgs == {}
+        assert iui._auq_context_posted == {}
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@12",
+                    "session_id": "s",
+                    "tool_use_id": "toolu_a",
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={"@12": "toolu_a"},
+        )
+        sm = self._session_mgr_stub({"@13": "s"}, {(1, 10): "@13"})
+        iui.hydrate_interactive_state(sm)
+        # The remap had to read from a freshly-loaded local dict.
+        assert iui._auq_context_posted == {"@13": "toolu_a"}
+
+    def test_hydrate_mismatch_marker_not_remapped(
+        self, _isolated_interactive_state_file
+    ):
+        """If marker on @12 != rec.tool_use_id, it's NOT moved.
+        The marker belongs to a different AUQ that happened on the old
+        window. Natural prune (@12 not in window_states) drops it."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        self._write_state(
+            _isolated_interactive_state_file,
+            interactive_msgs={
+                "1:10": {
+                    "msg_id": 42,
+                    "window_id": "@12",
+                    "session_id": "s",
+                    "tool_use_id": "toolu_NEW",
+                    "created_at": "x",
+                }
+            },
+            auq_context_posted={"@12": "toolu_OLD"},
+        )
+        # @12 is no longer in window_states; @13 is current.
+        sm = self._session_mgr_stub({"@13": "s"}, {(1, 10): "@13"})
+        iui.hydrate_interactive_state(sm)
+        # Meta remapped to @13.
+        assert iui._interactive_msg_meta[(1, 10)].window_id == "@13"
+        # Marker NOT moved (mismatch). And @12 is unknown to session_mgr,
+        # so it's pruned. Result: empty.
+        assert iui._auq_context_posted == {}
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestSendAuqContextMessageTriState:
+    """v3 tri-state return values + v5 explicit NONE_SENT on no-op exits."""
+
+    @pytest.mark.asyncio
+    async def test_no_renderable_text_returns_none_sent(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Empty questions list → formatter returns just the header
+        # (whitespace-only after strip). v5 must return NONE_SENT
+        # explicitly so caller's rollback fires.
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input={"questions": []},
+        )
+        assert result is iui._ContextSendResult.NONE_SENT
+
+    @pytest.mark.asyncio
+    async def test_no_parts_returns_none_sent(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Force build_response_parts to return []
+        monkeypatch.setattr(
+            "cctelegram.handlers.response_builder.build_response_parts",
+            lambda *a, **kw: [],
+        )
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input={"questions": [{"question": "Q?"}]},
+        )
+        assert result is iui._ContextSendResult.NONE_SENT
+
+    @pytest.mark.asyncio
+    async def test_full_send_returns_full_sent(self, monkeypatch):
+        from unittest.mock import Mock
+
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        async def _ok(*args, **kwargs):
+            return Mock(message_id=100), TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_send", _ok)
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input={"questions": [{"question": "Q?"}]},
+        )
+        assert result is iui._ContextSendResult.FULL_SENT
+
+    @pytest.mark.asyncio
+    async def test_first_chunk_fails_returns_none_sent(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        async def _fail(*args, **kwargs):
+            return None, TopicSendOutcome.TOPIC_NOT_FOUND
+
+        monkeypatch.setattr(iui, "topic_send", _fail)
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input={"questions": [{"question": "Q?"}]},
+        )
+        assert result is iui._ContextSendResult.NONE_SENT
+
+    @pytest.mark.asyncio
+    async def test_partial_send_returns_partial_sent(self, monkeypatch):
+        """First chunk lands, second fails → PARTIAL_SENT (caller MUST
+        keep the claim; rolling back would duplicate chunk 1)."""
+        from unittest.mock import Mock
+
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        # Produce a tool_input that splits into multiple chunks.
+        long_desc = ("paragraph " * 100).strip()
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": f"Option {i}", "description": long_desc}
+                        for i in range(1, 11)
+                    ],
+                }
+            ]
+        }
+
+        call_counter = {"n": 0}
+
+        async def _ok_then_fail(*args, **kwargs):
+            call_counter["n"] += 1
+            if call_counter["n"] == 1:
+                return Mock(message_id=100), TopicSendOutcome.OK
+            return None, TopicSendOutcome.TOPIC_NOT_FOUND
+
+        monkeypatch.setattr(iui, "topic_send", _ok_then_fail)
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input=tool_input,
+        )
+        assert result is iui._ContextSendResult.PARTIAL_SENT
+
+    @pytest.mark.asyncio
+    async def test_exception_after_first_chunk_returns_partial(self, monkeypatch):
+        """Non-RetryAfter exception after chunk 1 lands → PARTIAL_SENT."""
+        from unittest.mock import Mock
+
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        long_desc = ("paragraph " * 100).strip()
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q?",
+                    "options": [
+                        {"label": f"Option {i}", "description": long_desc}
+                        for i in range(1, 11)
+                    ],
+                }
+            ]
+        }
+
+        call_counter = {"n": 0}
+
+        async def _ok_then_raise(*args, **kwargs):
+            call_counter["n"] += 1
+            if call_counter["n"] == 1:
+                return Mock(message_id=100), TopicSendOutcome.OK
+            raise RuntimeError("network blew up")
+
+        monkeypatch.setattr(iui, "topic_send", _ok_then_raise)
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input=tool_input,
+        )
+        assert result is iui._ContextSendResult.PARTIAL_SENT
+
+    @pytest.mark.asyncio
+    async def test_exception_before_any_chunk_returns_none(self, monkeypatch):
+        """Non-RetryAfter exception before any chunk lands → NONE_SENT."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        async def _raise(*args, **kwargs):
+            raise RuntimeError("immediate failure")
+
+        monkeypatch.setattr(iui, "topic_send", _raise)
+        result = await iui._send_auq_context_message(
+            None,  # type: ignore[arg-type]
+            user_id=1,
+            thread_id=None,
+            chat_id=1,
+            window_id="@5",
+            tool_input={"questions": [{"question": "Q?"}]},
+        )
+        assert result is iui._ContextSendResult.NONE_SENT
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestPostInitHydrateOrdering:
+    """Codex P2 #1 (v3): load_session_map must run BEFORE hydrate
+    so window_states[wid].session_id is populated."""
+
+    @pytest.mark.asyncio
+    async def test_post_init_calls_load_session_map_before_hydrate(self, monkeypatch):
+        """Sequence check: in bot.post_init, load_session_map runs
+        BEFORE hydrate_interactive_state. We verify the source has
+        them in that order; this guards against future reordering."""
+        from pathlib import Path
+
+        src = Path("src/cctelegram/bot.py").read_text()
+        # Find post_init body and check the relative position of the
+        # two calls.
+        post_init_idx = src.index("async def post_init(")
+        body = src[post_init_idx:]
+        lsm_idx = body.index("await session_manager.load_session_map()")
+        hyd_idx = body.index("hydrate_interactive_state(session_manager)")
+        assert lsm_idx < hyd_idx, (
+            "load_session_map() must run BEFORE hydrate_interactive_state() "
+            "so window_states have session_id populated before hydrate's "
+            "staleness check fires."
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolve_stale_ids_runs_before_hydrate(self):
+        """v3 invariant: resolve_stale_ids must precede hydrate so
+        window-id remaps are visible to hydrate's resolve_window_for_thread."""
+        from pathlib import Path
+
+        src = Path("src/cctelegram/bot.py").read_text()
+        post_init_idx = src.index("async def post_init(")
+        body = src[post_init_idx:]
+        rsi_idx = body.index("await session_manager.resolve_stale_ids()")
+        hyd_idx = body.index("hydrate_interactive_state(session_manager)")
+        assert rsi_idx < hyd_idx

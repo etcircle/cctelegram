@@ -920,7 +920,7 @@ class SessionMonitor:
                 continue
 
             try:
-                tool_input = await self._find_latest_pending_auq(jsonl_path)
+                candidate = await self._find_latest_pending_auq(jsonl_path)
             except Exception as e:
                 logger.warning(
                     "AUQ hydrate: scan failed for window %s session %s: %s",
@@ -930,22 +930,30 @@ class SessionMonitor:
                 )
                 continue
 
-            if tool_input is not None:
-                remember_ask_tool_input(window_id, tool_input)
-                logger.info(
-                    "AUQ cache hydrated for window %s session %s — "
-                    "%d question(s) from %s",
-                    window_id,
-                    session_id[:8],
-                    len(tool_input.get("questions", []))
-                    if isinstance(tool_input.get("questions"), list)
-                    else 0,
-                    jsonl_path.name,
-                )
+            if candidate is not None:
+                tool_input = candidate.get("input")
+                tool_use_id = candidate.get("id")
+                if isinstance(tool_input, dict):
+                    remember_ask_tool_input(
+                        window_id,
+                        tool_input,
+                        tool_use_id if isinstance(tool_use_id, str) else None,
+                    )
+                    logger.info(
+                        "AUQ cache hydrated for window %s session %s — "
+                        "%d question(s) from %s",
+                        window_id,
+                        session_id[:8],
+                        len(tool_input.get("questions", []))
+                        if isinstance(tool_input.get("questions"), list)
+                        else 0,
+                        jsonl_path.name,
+                    )
 
     async def _find_latest_pending_auq(self, jsonl_path: Path) -> dict | None:
-        """Return the ``tool_use.input`` of the most recent AskUserQuestion in
-        ``jsonl_path`` that has no matching ``tool_result``, or None.
+        """Return ``{"id": tool_use_id, "input": tool_input}`` for the most
+        recent AskUserQuestion in ``jsonl_path`` that has no matching
+        ``tool_result``, or ``None``.
 
         Reads the JSONL tail (up to ``_AUQ_HYDRATE_TAIL_BYTES``; capped at
         ``_AUQ_HYDRATE_HARD_CAP`` from the end). When mid-line at the read
@@ -1032,10 +1040,12 @@ class SessionMonitor:
                     if isinstance(rid, str):
                         answered_ids.add(rid)
 
-        # Most recent unanswered AUQ wins.
+        # Most recent unanswered AUQ wins. Returns the full candidate
+        # dict (``id`` + ``input``) so the AUQ context-message gate in
+        # ``handlers.interactive_ui`` can dedup per ``tool_use.id``.
         for cand in reversed(candidates):
             if cand["id"] not in answered_ids:
-                return cand["input"]
+                return cand
         return None
 
     async def _monitor_loop(self) -> None:

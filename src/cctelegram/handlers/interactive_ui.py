@@ -25,6 +25,9 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
@@ -40,6 +43,7 @@ from ..terminal_parser import (
     visible_pane_liveness,
 )
 from ..tmux_manager import tmux_manager
+from ..utils import atomic_write_json
 from . import attention
 from .callback_data import (
     CB_ASK_DOWN,
@@ -83,16 +87,442 @@ _interactive_mode: dict[tuple[int, int], str] = {}
 # AUQ payload is available but the Telegram card still needs rendering.
 _last_completed_ask_tool_input: dict[str, dict] = {}
 
+# Companion to ``_last_completed_ask_tool_input``: tracks the JSONL
+# ``tool_use.id`` for the currently-cached AUQ. Used by the AUQ context
+# message gate (``claim_auq_context_post``) to dedup per-AUQ posts.
+# Separate dict (rather than extending the cache value) so existing
+# readers of ``_last_completed_ask_tool_input`` stay unchanged.
+_last_auq_tool_use_id: dict[str, str] = {}
 
-def remember_ask_tool_input(window_id: str, tool_input: dict | None) -> None:
-    """Store the latest AskUserQuestion ``tool_use.input`` for a window."""
+# Per-window record of the ``tool_use.id`` whose context message has
+# already been posted. Compared against ``_last_auq_tool_use_id`` to
+# decide whether the next ``handle_interactive_ui`` invocation should
+# post a fresh context message or skip (already done for this AUQ).
+# Cleared by ``forget_ask_tool_input`` so the next AUQ in the same
+# window starts with a clean slate. Persisted alongside
+# ``_interactive_msg_meta`` to survive ``launchctl kickstart``.
+_auq_context_posted: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class _InteractiveMsgMeta:
+    """Sidecar metadata for a persisted ``_interactive_msgs`` entry.
+
+    Carries the route-anchored bindings (``window_id`` + ``session_id``)
+    that ``hydrate_interactive_state`` needs to validate the entry on
+    startup. ``_interactive_msgs`` keeps the bare ``int`` shape for
+    existing readers; this dict is the persist source of truth.
+    """
+
+    msg_id: int
+    window_id: str
+    session_id: str
+    tool_use_id: str | None
+    created_at: str  # ISO 8601 UTC
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        return {
+            "msg_id": self.msg_id,
+            "window_id": self.window_id,
+            "session_id": self.session_id,
+            "tool_use_id": self.tool_use_id,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_InteractiveMsgMeta | None":
+        """Build a record from JSON-decoded payload; return None on corruption.
+
+        Rejects msg_id <= 0 and empty/non-string window_id so downstream
+        readers (topic_edit / topic_delete) can't send malformed args
+        to Telegram. Other fields fall back to "" / None on missing
+        keys.
+        """
+        try:
+            msg_id_raw = d["msg_id"]
+            window_id_raw = d["window_id"]
+        except (KeyError, TypeError):
+            return None
+        try:
+            msg_id = int(msg_id_raw)
+        except (TypeError, ValueError):
+            return None
+        if msg_id <= 0:
+            return None
+        if not isinstance(window_id_raw, str) or not window_id_raw.strip():
+            return None
+        tool_use_id_raw = d.get("tool_use_id")
+        tool_use_id = str(tool_use_id_raw) if isinstance(tool_use_id_raw, str) else None
+        return cls(
+            msg_id=msg_id,
+            window_id=window_id_raw,
+            session_id=str(d.get("session_id") or ""),
+            tool_use_id=tool_use_id,
+            created_at=str(d.get("created_at", "")),
+        )
+
+
+# Sidecar to ``_interactive_msgs``: full metadata for persistence +
+# staleness validation. Every mutation of ``_interactive_msgs`` goes
+# through ``_set_interactive_msg`` / ``_clear_interactive_msg`` so the
+# two dicts stay in sync. On-disk shape is the union of both dicts at
+# ``~/.cc-telegram/interactive_state.json``.
+_interactive_msg_meta: dict[tuple[int, int], _InteractiveMsgMeta] = {}
+
+
+class _ContextSendResult(Enum):
+    """Outcome of ``_send_auq_context_message``.
+
+    The caller in ``handle_interactive_ui`` uses this to decide
+    whether to roll back the ``claim_auq_context_post`` claim:
+    NONE_SENT means no chunks landed → rolling back is safe.
+    PARTIAL_SENT means chunk 1 (at least) landed → rolling back
+    would re-send chunk 1 on the next render and duplicate it.
+    FULL_SENT means all chunks landed → no rollback needed.
+    """
+
+    FULL_SENT = "full_sent"
+    NONE_SENT = "none_sent"
+    PARTIAL_SENT = "partial_sent"
+
+
+def remember_ask_tool_input(
+    window_id: str,
+    tool_input: dict | None,
+    tool_use_id: str | None = None,
+) -> None:
+    """Store the latest AskUserQuestion ``tool_use.input`` for a window.
+
+    ``tool_use_id`` (the JSONL ``tool_use.id``) is optional for
+    backward compat with call sites that don't have it (e.g. tests
+    that only care about the input dict), but production callers
+    in ``bot.py`` and ``session_monitor._hydrate_ask_tool_input_cache``
+    pass it so the AUQ context-message gate can dedup per AUQ.
+    """
     if isinstance(tool_input, dict):
         _last_completed_ask_tool_input[window_id] = tool_input
+        if isinstance(tool_use_id, str):
+            _last_auq_tool_use_id[window_id] = tool_use_id
+        else:
+            # Caller doesn't have a tool_use_id (test helper or legacy
+            # path). Drop any stale ID + posted state so the context
+            # gate's "missing id blocks claim" guarantee holds even if
+            # an earlier remember left state behind. Hermes P3 hardening,
+            # 2026-05-22 diff review.
+            _last_auq_tool_use_id.pop(window_id, None)
+            _auq_context_posted.pop(window_id, None)
 
 
 def forget_ask_tool_input(window_id: str) -> None:
-    """Drop the cached AskUserQuestion input for a window (e.g. on tool_result)."""
+    """Drop the cached AskUserQuestion input for a window (e.g. on tool_result).
+
+    Also persists the cleared ``_auq_context_posted`` state so a
+    subsequent restart doesn't carry forward a stale claim marker.
+    """
     _last_completed_ask_tool_input.pop(window_id, None)
+    _last_auq_tool_use_id.pop(window_id, None)
+    had_marker = _auq_context_posted.pop(window_id, None) is not None
+    if had_marker:
+        _persist_interactive_state()
+
+
+def claim_auq_context_post(window_id: str) -> bool:
+    """Atomic check-and-set for the AUQ context-message gate.
+
+    Returns ``True`` iff the caller owns the right to send the AUQ
+    context message (i.e. an AUQ is cached for this window AND its
+    ``tool_use.id`` has not yet been context-posted). On ``True``,
+    the slot is immediately claimed so concurrent callers see
+    ``False`` and skip the duplicate post.
+
+    Synchronous — relies on asyncio's single-thread semantics for
+    atomicity between the read and the write. The function does not
+    cross an ``await`` boundary, so two coroutines for the same
+    window cannot interleave between the check and the set.
+
+    Persists the claim to ``interactive_state.json`` (write-through)
+    so a ``launchctl kickstart`` between claim and the next render
+    doesn't re-fire the context message for an already-posted AUQ.
+    """
+    current_id = _last_auq_tool_use_id.get(window_id)
+    if current_id is None:
+        return False
+    if _auq_context_posted.get(window_id) == current_id:
+        return False
+    _auq_context_posted[window_id] = current_id
+    _persist_interactive_state()
+    return True
+
+
+# ── Persistence + hydrate (Wave A, Bug A) ────────────────────────────────
+#
+# ``_interactive_msgs`` and ``_auq_context_posted`` live in process
+# memory; without persistence they wipe on every ``launchctl kickstart``,
+# producing the duplicate-picker bug the 2026-05-22 fix addresses. The
+# persistence layer is a write-through to ``interactive_state.json``
+# (separate from ``state.json`` to avoid coupling with SessionManager's
+# save path). Hydrate runs once in ``bot.post_init`` AFTER
+# ``resolve_stale_ids()`` and ``load_session_map()`` so window_id remaps
+# and session_id bindings are both available to the staleness check.
+
+
+def _interactive_state_file_path() -> Path:
+    """Resolve the on-disk persistence path for interactive UI state."""
+    return Path(config.state_file).parent / "interactive_state.json"
+
+
+def _persist_interactive_state() -> None:
+    """Atomic write of ``_interactive_msg_meta`` + ``_auq_context_posted``.
+
+    Called from inside the route-lock-held section, immediately after
+    the in-memory mutation it persists. Sync — atomic_write_json is
+    blocking but the file is < 10 KB in practice and we don't yield
+    the event loop. Errors are logged at WARNING but not raised — a
+    disk-full / read-only fs must not bring down the bot. Next
+    mutation retries the persist.
+    """
+    path = _interactive_state_file_path()
+    try:
+        data: dict[str, dict] = {
+            "interactive_msgs": {
+                f"{u}:{t}": rec.to_dict()
+                for (u, t), rec in _interactive_msg_meta.items()
+            },
+            "auq_context_posted": dict(_auq_context_posted),
+        }
+        atomic_write_json(path, data)
+    except OSError as exc:
+        logger.warning("Failed to persist interactive_state.json: %s", exc)
+
+
+def _set_interactive_msg(
+    ikey: tuple[int, int],
+    msg_id: int,
+    window_id: str,
+    session_id: str,
+    tool_use_id: str | None,
+) -> None:
+    """Write-through: update ``_interactive_msgs`` + sidecar + persist.
+
+    Call inside the route-lock-held section. ``session_id`` may be ""
+    (e.g., SessionStart hook hasn't fired yet for a new window);
+    hydrate normalizes None vs "" on read.
+    """
+    _interactive_msgs[ikey] = msg_id
+    _interactive_msg_meta[ikey] = _InteractiveMsgMeta(
+        msg_id=msg_id,
+        window_id=window_id,
+        session_id=session_id,
+        tool_use_id=tool_use_id,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    _persist_interactive_state()
+
+
+def _clear_interactive_msg(ikey: tuple[int, int]) -> int | None:
+    """Pop both ``_interactive_msgs`` and the sidecar, persist, return prior msg_id."""
+    msg_id = _interactive_msgs.pop(ikey, None)
+    _interactive_msg_meta.pop(ikey, None)
+    _persist_interactive_state()
+    return msg_id
+
+
+def _refresh_interactive_msg_meta(
+    ikey: tuple[int, int],
+    msg_id: int,
+    window_id: str,
+    session_id: str,
+    tool_use_id: str | None,
+) -> None:
+    """Refresh sidecar metadata without resetting ``created_at``.
+
+    Called from the edit-success branch (OK / MESSAGE_NOT_MODIFIED) so
+    metadata stays current after a window-id remap, a delayed
+    SessionStart hook fire, or a first-time ``tool_use_id`` reveal on
+    a previously pane-only render. ``created_at`` is preserved when
+    the sidecar entry already exists (the same card is being
+    refreshed, not freshly sent).
+    """
+    existing = _interactive_msg_meta.get(ikey)
+    created_at = existing.created_at if existing else datetime.now(UTC).isoformat()
+    _interactive_msgs[ikey] = msg_id
+    _interactive_msg_meta[ikey] = _InteractiveMsgMeta(
+        msg_id=msg_id,
+        window_id=window_id,
+        session_id=session_id,
+        tool_use_id=tool_use_id,
+        created_at=created_at,
+    )
+    _persist_interactive_state()
+
+
+def hydrate_interactive_state(session_mgr) -> None:
+    """Restore ``_interactive_msgs`` + ``_auq_context_posted`` from disk.
+
+    Called ONCE during bot startup from ``bot.post_init`` IMMEDIATELY
+    AFTER ``await session_manager.resolve_stale_ids()`` AND
+    ``await session_manager.load_session_map()``, and BEFORE
+    ``monitor = SessionMonitor()``. Sync — no asyncio.Lock creation,
+    no await.
+
+    Per-entry decision tree:
+      1. Look up the route's current window via
+         ``session_mgr.resolve_window_for_thread(user_id, thread_id)``.
+      2. If no current window (unbound route), drop the entry. The
+         persisted msg_id has no live owner. Do NOT delete the orphan
+         card — it may belong to legitimate user history.
+      3. If current window's session_id matches the persisted
+         ``rec.session_id``, keep the entry; rewrite ``rec.window_id``
+         if the route was remapped (e.g., @12 → @13 across tmux server
+         restart).
+      4. If current window's session_id mismatches, drop. The route
+         was rebound or the session was cleared; no fallback to the
+         persisted window_id (would mis-attribute the msg_id to a
+         route that no longer owns the card).
+
+    Session-id comparisons normalize None vs "": session_id_for_window
+    returns None for windows with no recorded session, persisted
+    entries may carry "" for the same condition.
+
+    ``_auq_context_posted`` markers are loaded into a local dict FIRST
+    so the meta loop's remap mirror can read and update them; markers
+    whose window is unknown to session_mgr are pruned; the local
+    dict is then committed to the module-level ``_auq_context_posted``.
+    """
+    path = _interactive_state_file_path()
+    if not path.exists():
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Interactive state hydrate read failed: %s", exc)
+        return
+    if not isinstance(data, dict):
+        return
+
+    def _norm(s: str | None) -> str:
+        return s or ""
+
+    state_mutated_any = False
+    pruned_ctx_any = False
+
+    raw_ctx_for_load = data.get("auq_context_posted")
+    ctx_markers: dict[str, str] = {}
+    if isinstance(raw_ctx_for_load, dict):
+        for wid, tuid in raw_ctx_for_load.items():
+            if isinstance(wid, str) and isinstance(tuid, str):
+                ctx_markers[wid] = tuid
+
+    raw = data.get("interactive_msgs")
+    if isinstance(raw, dict):
+        for key_str, payload in raw.items():
+            if not isinstance(payload, dict) or not isinstance(key_str, str):
+                continue
+            try:
+                u_str, t_str = key_str.split(":")
+                user_id = int(u_str)
+                thread_id = int(t_str)
+            except ValueError:
+                continue
+            rec = _InteractiveMsgMeta.from_dict(payload)
+            if rec is None:
+                continue
+
+            current_window = session_mgr.resolve_window_for_thread(
+                user_id, thread_id if thread_id else None
+            )
+            if current_window is None:
+                logger.info(
+                    "AUQ hydrate: dropping unowned interactive_msg "
+                    "(user=%d thread=%d persisted_window=%s "
+                    "persisted_session=%s)",
+                    user_id,
+                    thread_id,
+                    rec.window_id,
+                    (rec.session_id[:8] if rec.session_id else "<empty>"),
+                )
+                state_mutated_any = True
+                continue
+
+            cur_session = session_mgr.session_id_for_window(current_window)
+            if _norm(cur_session) != _norm(rec.session_id):
+                logger.info(
+                    "AUQ hydrate: dropping stale interactive_msg "
+                    "(user=%d thread=%d persisted_window=%s "
+                    "current_window=%s persisted_session=%s "
+                    "current_session=%s)",
+                    user_id,
+                    thread_id,
+                    rec.window_id,
+                    current_window,
+                    (rec.session_id[:8] if rec.session_id else "<empty>"),
+                    (cur_session[:8] if cur_session else "<none>"),
+                )
+                state_mutated_any = True
+                continue
+
+            if current_window != rec.window_id:
+                logger.info(
+                    "AUQ hydrate: remapping persisted window %s → %s "
+                    "(user=%d thread=%d session matched)",
+                    rec.window_id,
+                    current_window,
+                    user_id,
+                    thread_id,
+                )
+                old_window_id = rec.window_id
+                rec = _InteractiveMsgMeta(
+                    msg_id=rec.msg_id,
+                    window_id=current_window,
+                    session_id=rec.session_id,
+                    tool_use_id=rec.tool_use_id,
+                    created_at=rec.created_at,
+                )
+                state_mutated_any = True
+                old_marker = ctx_markers.get(old_window_id)
+                if (
+                    old_marker is not None
+                    and rec.tool_use_id is not None
+                    and old_marker == rec.tool_use_id
+                ):
+                    ctx_markers.pop(old_window_id, None)
+                    ctx_markers[current_window] = old_marker
+                    logger.info(
+                        "AUQ hydrate: also remapped context marker %s → %s",
+                        old_window_id,
+                        current_window,
+                    )
+
+            ikey = (user_id, thread_id)
+            _interactive_msgs[ikey] = rec.msg_id
+            _interactive_msg_meta[ikey] = rec
+
+    known_windows = set(session_mgr.window_states.keys())
+    for wid, tuid in ctx_markers.items():
+        if wid not in known_windows:
+            logger.debug(
+                "AUQ hydrate: pruning stale context-posted marker for "
+                "unknown window %s",
+                wid,
+            )
+            pruned_ctx_any = True
+            continue
+        _auq_context_posted[wid] = tuid
+
+    if isinstance(raw_ctx_for_load, dict) and len(_auq_context_posted) != len(
+        raw_ctx_for_load
+    ):
+        pruned_ctx_any = True
+
+    logger.info(
+        "AUQ hydrate: %d interactive_msg entries, %d context-posted markers",
+        len(_interactive_msgs),
+        len(_auq_context_posted),
+    )
+
+    if state_mutated_any or pruned_ctx_any:
+        _persist_interactive_state()
 
 
 def _resolve_ask_tool_input(window_id: str, explicit: dict | None) -> dict | None:
@@ -692,6 +1122,199 @@ def _truncate_description(description: str) -> str:
     return flat[: _DESCRIPTION_CHAR_CAP - 1].rstrip() + "…"
 
 
+def _should_post_auq_context(tool_input: dict | None) -> bool:
+    """True iff the AUQ has at least one question with renderable text.
+
+    User invariant 2026-05-22: always post a separate "📋 AskUserQuestion
+    — full details" info message alongside the picker for every AUQ
+    that has any content to show. The gate aligns with what
+    ``_format_auq_context_message`` actually renders — the formatter
+    skips the whole question when ``question``/``header`` text is
+    empty, so a gate firing on label-only forms would consume the
+    claim and post a header-only message (the "convergent
+    overengineering" risk Codex flagged on v2).
+
+    Returns False only for malformed input (not a dict, no questions
+    list, every question missing both ``question`` and ``header`` text).
+    """
+    if not isinstance(tool_input, dict):
+        return False
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list):
+        return False
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        question_text = q.get("question") or q.get("header")
+        if isinstance(question_text, str) and question_text.strip():
+            return True
+    return False
+
+
+def _format_auq_context_message(tool_input: dict) -> str:
+    """Render the JSONL AUQ ``tool_use.input`` as a readable context dump.
+
+    Output shape:
+
+        📋 AskUserQuestion — full details
+        (Picker below answers each question one at a time.)  ← multi-Q only
+
+        Q1. <question>
+
+        1. <label>
+           <full description, paragraph as-is>
+
+        2. <label>
+           <full description>
+
+        Q2. <question>  ← only when len(questions) > 1
+        …
+
+    Plain text only — no markdown to convert later. The send layer's
+    ``build_response_parts`` chunks on the 3000-char boundary and adds
+    ``[i/N]`` markers when the message exceeds the limit.
+    """
+    questions_raw = tool_input.get("questions") or []
+    questions = [q for q in questions_raw if isinstance(q, dict)]
+    parts: list[str] = ["📋 AskUserQuestion — full details"]
+    if len(questions) > 1:
+        parts.append("(Picker below answers each question one at a time.)")
+    parts.append("")
+    for q_idx, q in enumerate(questions, start=1):
+        question_text = (q.get("question") or q.get("header") or "").strip()
+        if not question_text:
+            continue
+        if len(questions) > 1:
+            parts.append(f"Q{q_idx}. {question_text}")
+        else:
+            parts.append(question_text)
+        parts.append("")
+        options_raw = q.get("options") or []
+        # Filter to options with a non-empty label BEFORE enumerating so
+        # the displayed numbering stays 1..N without gaps when the JSONL
+        # contains malformed/empty option entries.
+        labeled = []
+        for o in options_raw:
+            if not isinstance(o, dict):
+                continue
+            label = (o.get("label") or "").strip()
+            if not label:
+                continue
+            description = (o.get("description") or "").strip()
+            labeled.append((label, description))
+        for opt_idx, (label, description) in enumerate(labeled, start=1):
+            parts.append(f"{opt_idx}. {label}")
+            if description:
+                for line in description.splitlines() or [description]:
+                    parts.append(f"   {line}")
+            parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+async def _send_auq_context_message(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int,
+    window_id: str,
+    tool_input: dict,
+) -> _ContextSendResult:
+    """Format and send the AUQ context message (multi-part if needed).
+
+    Returns a tri-state outcome (Wave A, Codex v2→v3 P2 #3):
+      * ``FULL_SENT`` — every chunk landed.
+      * ``NONE_SENT`` — zero chunks landed (pre-loop no-op exit, or the
+        first chunk failed). Caller may safely roll back the
+        ``claim_auq_context_post`` claim so the next render re-tries.
+      * ``PARTIAL_SENT`` — chunk 1 (at least) landed but a later chunk
+        failed. Caller MUST keep the claim — rolling back and
+        re-sending would duplicate the chunks that already reached
+        Telegram.
+
+    Anchors the first chunk to the user's last prompt via
+    ``peek_route_last_user_message`` (non-consuming). Subsequent chunks
+    land unanchored.
+
+    ``RetryAfter`` from python-telegram-bot's flood control IS re-raised
+    so the caller's flood-control contract is honored (the route lock
+    holds, the picker render inherits the back-off). Other exceptions
+    are caught and mapped to NONE_SENT/PARTIAL_SENT based on whether
+    any chunk landed (Hermes v3→v4 P2 #2 — preserve the existing
+    defensive catch).
+    """
+    from telegram.error import RetryAfter
+
+    from .message_queue import peek_route_last_user_message
+    from .response_builder import build_response_parts
+
+    text = _format_auq_context_message(tool_input)
+    if not text.strip():
+        # Codex v4→v5 P2 #2: explicit NONE_SENT so caller's
+        # ``if result is NONE_SENT`` rollback branch fires.
+        return _ContextSendResult.NONE_SENT
+    parts = build_response_parts(text, content_type="text", role="assistant")
+    if not parts:
+        return _ContextSendResult.NONE_SENT
+
+    anchor: ReplyParameters | None = None
+    if config.reply_context_enabled:
+        anchor_id = peek_route_last_user_message(user_id, thread_id, window_id)
+        if anchor_id is not None:
+            anchor = ReplyParameters(message_id=anchor_id)
+
+    session_id = session_id_for_window(window_id)
+    total = len(parts)
+    sent_any = False
+    for idx, chunk in enumerate(parts, start=1):
+        send_kwargs: dict = dict(
+            op="interactive",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text=chunk,
+            role="assistant",
+            content_type="text",
+            session_id=session_id,
+            part_index=idx if total > 1 else 0,
+        )
+        if idx == 1 and anchor is not None:
+            send_kwargs["reply_parameters"] = anchor
+        try:
+            sent, _outcome = await topic_send(bot, **send_kwargs)
+        except RetryAfter:
+            raise
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "AUQ context message send raised (window=%s, part %d/%d): %s",
+                window_id,
+                idx,
+                total,
+                exc,
+            )
+            return (
+                _ContextSendResult.PARTIAL_SENT
+                if sent_any
+                else _ContextSendResult.NONE_SENT
+            )
+        if sent is None:
+            logger.warning(
+                "AUQ context message chunk dropped (window=%s, part %d/%d) — "
+                "stopping mid-sequence to avoid a [i/N] gap",
+                window_id,
+                idx,
+                total,
+            )
+            return (
+                _ContextSendResult.PARTIAL_SENT
+                if sent_any
+                else _ContextSendResult.NONE_SENT
+            )
+        sent_any = True
+    return _ContextSendResult.FULL_SENT
+
+
 def _clip_card_body(body: str) -> str:
     """Hard-clip rendered card body to ``_CARD_BODY_CHAR_CAP`` chars.
 
@@ -766,8 +1389,15 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
         lines.append("  ".join(cells))
         lines.append("")
 
-    if form.current_question_title:
-        lines.append(form.current_question_title)
+    # ``current_question_title`` is the JSONL-authoritative title (used
+    # in the fingerprint + ``_strong_match``). ``pane_walkback_title`` is
+    # the pane-only walk-back fallback (display only) — important for
+    # fresh single-tab pickers that Claude Code hasn't flushed to JSONL
+    # yet (2026-05-21 D5 incident). The renderer prefers the
+    # authoritative title and falls through to the walk-back guess.
+    title = form.current_question_title or form.pane_walkback_title
+    if title:
+        lines.append(title)
         lines.append("")
 
     if form.options:
@@ -1207,7 +1837,7 @@ async def _handle_multi_tab_ask(
             # for this route, schedule it for deletion (mutual exclusion
             # — at most one of _interactive_msgs/_multi_tab_sessions is
             # set per route).
-            teardown_single_msg_id = _interactive_msgs.pop(ikey, None)
+            teardown_single_msg_id = _clear_interactive_msg(ikey)
             # PR 3.2: pre-size message_ids to tab_count so indices align
             # with the questions matrix (was: append-only, broke on
             # partial bundles).
@@ -1789,130 +2419,227 @@ async def handle_interactive_ui(
             session=multi_tab_session_to_clear,
         )
 
-    # Check if we have an existing interactive message to edit
-    existing_msg_id = _interactive_msgs.get(ikey)
-    if existing_msg_id:
-        edit_outcome = await topic_edit(
-            bot,
-            op="interactive",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            message_id=existing_msg_id,
-            text=text,
-            plain=True,
-            reply_markup=keyboard,
-        )
-        # MESSAGE_NOT_MODIFIED means Claude redrew an identical UI; treating it
-        # as success keeps the same Telegram message in place (no fresh card,
-        # no delete-then-resend churn).
-        if edit_outcome in (
-            TopicSendOutcome.OK,
-            TopicSendOutcome.MESSAGE_NOT_MODIFIED,
-        ):
-            _interactive_mode[ikey] = window_id
-            # The interactive card edit landed in the topic. The separate
-            # "🔔 waiting for input" attention card is suppressed here: it
-            # was a duplicate of the same content, in the same topic, with
-            # a self-pointing link. Telegram's own notification on the
-            # edited card already covers the "ping the user" use case; the
-            # attention card is reserved for the topic-send-failed branch
-            # below where the user genuinely doesn't see the card.
-            return True
-        # Edit failed — fall through to fresh send while keeping the old id
-        # so we can delete it after a new one lands.
+    # AUQ context message — posted ONCE per (window_id, tool_use_id)
+    # when at least one option description would be truncated by the
+    # picker card's per-option cap. Held under the same per-route lock
+    # as the picker send/edit below so concurrent bot.py + status_polling
+    # callers serialize on this route: the first claims the context-post
+    # slot via ``claim_auq_context_post``, posts context, then sends the
+    # picker; the second skips context (already posted) and edits the
+    # existing picker. Without the lock, the picker could land before
+    # the context message in the chat order (race flagged by hermes
+    # P1 on the 2026-05-22 design review). The lock is per-route so
+    # this does not stall other routes.
+    async with lock:
+        if content.name == "AskUserQuestion":
+            ctx_input = _resolve_ask_tool_input(window_id, tool_input)
+            if _should_post_auq_context(ctx_input) and claim_auq_context_post(
+                window_id
+            ):
+                ctx_result = await _send_auq_context_message(
+                    bot,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    chat_id=chat_id,
+                    window_id=window_id,
+                    tool_input=ctx_input,  # type: ignore[arg-type]
+                )
+                # Codex v2→v3 P2 #3: rollback the claim ONLY when nothing
+                # landed. PARTIAL_SENT keeps the claim — re-sending would
+                # duplicate the chunks that already reached Telegram.
+                if ctx_result is _ContextSendResult.NONE_SENT:
+                    _auq_context_posted.pop(window_id, None)
+                    _persist_interactive_state()
 
-    # Send new message (plain text — terminal content is not markdown).
-    # §2.5.2: anchor the interactive card to the user's prompt that triggered
-    # the tool, when we know it. ``peek`` (not consume) so the same anchor
-    # still applies when Claude follows up with assistant text after the
-    # user resolves the interactive card — both the card and the trailing
-    # text are responses to the same user prompt. The text-side
-    # ``_process_content_task`` is the canonical owner of the anchor's
-    # lifecycle (it pops on first-part send).
-    logger.info(
-        "Sending interactive UI to user %d for window_id %s", user_id, window_id
-    )
-    anchor: ReplyParameters | None = None
-    if config.reply_context_enabled:
-        from .message_queue import peek_route_last_user_message
+        # Staleness gate (Wave A, Bug A): if the persisted msg id was
+        # for a different session, treat the entry as stale and re-send.
+        # Do NOT delete the orphan card — it may belong to legitimate
+        # user history. Normalize None vs "" so a None-returning
+        # session_id_for_window doesn't falsely drop entries with an
+        # empty stored session_id.
+        meta = _interactive_msg_meta.get(ikey)
+        if meta is not None:
+            current_session = session_id_for_window(window_id)
+            if (current_session or "") != (meta.session_id or ""):
+                _interactive_msgs.pop(ikey, None)
+                _interactive_msg_meta.pop(ikey, None)
+                _persist_interactive_state()
+                logger.info(
+                    "AUQ session-id mismatch — dropping stale persisted "
+                    "msg %d (user=%d thread=%s window=%s "
+                    "persisted_session=%s current_session=%s)",
+                    meta.msg_id,
+                    user_id,
+                    thread_id,
+                    window_id,
+                    (meta.session_id or "<empty>")[:8],
+                    (current_session or "<none>")[:8],
+                )
 
-        anchor_id = peek_route_last_user_message(user_id, thread_id, window_id)
-        if anchor_id is not None:
-            anchor = ReplyParameters(message_id=anchor_id)
-    interactive_session_id = session_id_for_window(window_id)
-    if anchor is not None:
-        sent, send_outcome = await topic_send(
-            bot,
-            op="interactive",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            text=text,
-            plain=True,
-            reply_markup=keyboard,
-            reply_parameters=anchor,
-            role="tool",
-            content_type="tool_use",
-            session_id=interactive_session_id,
-        )
-    else:
-        sent, send_outcome = await topic_send(
-            bot,
-            op="interactive",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            text=text,
-            plain=True,
-            reply_markup=keyboard,
-            role="tool",
-            content_type="tool_use",
-            session_id=interactive_session_id,
-        )
-    if sent is None:
-        # Topic send failed — still mark interactive mode (prevents per-poll
-        # retry spam) and try the topic-first attention card. If that also
-        # cannot reach the topic, emergency-fall back to a direct DM.
-        _interactive_mode[ikey] = window_id
-        outcome = await attention.notify_waiting(
-            bot,
-            user_id=user_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            prompt_text=text,
-            kind="interactive_ui",
-        )
-        if outcome is not TopicSendOutcome.OK and send_outcome in (
-            TopicSendOutcome.TOPIC_NOT_FOUND,
-            TopicSendOutcome.TOPIC_CLOSED,
-            TopicSendOutcome.FORBIDDEN,
-        ):
-            await _notify_waiting_dm(
-                bot, user_id, window_id, thread_id, text, session_mgr
+        # Check if we have an existing interactive message to edit
+        existing_msg_id = _interactive_msgs.get(ikey)
+        if existing_msg_id:
+            edit_outcome = await topic_edit(
+                bot,
+                op="interactive",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                message_id=existing_msg_id,
+                text=text,
+                plain=True,
+                reply_markup=keyboard,
             )
-        return False
-    _interactive_msgs[ikey] = sent.message_id
-    _interactive_mode[ikey] = window_id
-    # See note above: the interactive card landed in the topic, so the
-    # duplicate "🔔 waiting for input" attention card is suppressed. The
-    # send-failed branch still fires notify_waiting because that's the
-    # only signal the user gets when the topic-send couldn't deliver.
-    # New message sent successfully — now safe to delete the old one
-    if existing_msg_id:
-        await topic_delete(
-            bot,
-            op="interactive",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            message_id=existing_msg_id,
+            # MESSAGE_NOT_MODIFIED means Claude redrew an identical UI;
+            # treating it as success keeps the same Telegram message in
+            # place (no fresh card, no delete-then-resend churn).
+            if edit_outcome in (
+                TopicSendOutcome.OK,
+                TopicSendOutcome.MESSAGE_NOT_MODIFIED,
+            ):
+                _interactive_mode[ikey] = window_id
+                # Hermes v2→v3 P2 #3: refresh sidecar so metadata stays
+                # current after window-id remaps, delayed SessionStart
+                # hook fires, or a first-time tool_use_id reveal on a
+                # previously pane-only render. created_at is preserved
+                # by the helper.
+                _refresh_interactive_msg_meta(
+                    ikey,
+                    msg_id=existing_msg_id,
+                    window_id=window_id,
+                    session_id=session_id_for_window(window_id) or "",
+                    tool_use_id=_last_auq_tool_use_id.get(window_id),
+                )
+                # The interactive card edit landed in the topic. The
+                # separate "🔔 waiting for input" attention card is
+                # suppressed here: it was a duplicate of the same
+                # content, in the same topic, with a self-pointing link.
+                # Telegram's own notification on the edited card already
+                # covers the "ping the user" use case; the attention
+                # card is reserved for the topic-send-failed branch
+                # below where the user genuinely doesn't see the card.
+                return True
+            # Edit failed — fall through to fresh send while keeping
+            # the old id so we can delete it after a new one lands.
+
+        # Send new message (plain text — terminal content is not
+        # markdown). §2.5.2: anchor the interactive card to the user's
+        # prompt that triggered the tool, when we know it. ``peek``
+        # (not consume) so the same anchor still applies when Claude
+        # follows up with assistant text after the user resolves the
+        # interactive card — both the card and the trailing text are
+        # responses to the same user prompt. The text-side
+        # ``_process_content_task`` is the canonical owner of the
+        # anchor's lifecycle (it pops on first-part send).
+        logger.info(
+            "Sending interactive UI to user %d for window_id %s",
+            user_id,
+            window_id,
         )
-    return True
+        anchor: ReplyParameters | None = None
+        if config.reply_context_enabled:
+            from .message_queue import peek_route_last_user_message
+
+            anchor_id = peek_route_last_user_message(user_id, thread_id, window_id)
+            if anchor_id is not None:
+                anchor = ReplyParameters(message_id=anchor_id)
+        interactive_session_id = session_id_for_window(window_id)
+        if anchor is not None:
+            sent, send_outcome = await topic_send(
+                bot,
+                op="interactive",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                text=text,
+                plain=True,
+                reply_markup=keyboard,
+                reply_parameters=anchor,
+                role="tool",
+                content_type="tool_use",
+                session_id=interactive_session_id,
+            )
+        else:
+            sent, send_outcome = await topic_send(
+                bot,
+                op="interactive",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                text=text,
+                plain=True,
+                reply_markup=keyboard,
+                role="tool",
+                content_type="tool_use",
+                session_id=interactive_session_id,
+            )
+        if sent is None:
+            # Topic send failed — still mark interactive mode (prevents
+            # per-poll retry spam) and try the topic-first attention
+            # card. If that also cannot reach the topic, emergency-fall
+            # back to a direct DM.
+            _interactive_mode[ikey] = window_id
+            # Ensure the sidecar doesn't carry a stale entry forward
+            # (Hermes v1→v2 hardening).
+            if _interactive_msg_meta.pop(ikey, None) is not None:
+                _interactive_msgs.pop(ikey, None)
+                _persist_interactive_state()
+            outcome = await attention.notify_waiting(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                prompt_text=text,
+                kind="interactive_ui",
+            )
+            if outcome is not TopicSendOutcome.OK and send_outcome in (
+                TopicSendOutcome.TOPIC_NOT_FOUND,
+                TopicSendOutcome.TOPIC_CLOSED,
+                TopicSendOutcome.FORBIDDEN,
+            ):
+                await _notify_waiting_dm(
+                    bot, user_id, window_id, thread_id, text, session_mgr
+                )
+            return False
+        _set_interactive_msg(
+            ikey,
+            msg_id=sent.message_id,
+            window_id=window_id,
+            session_id=interactive_session_id or "",
+            tool_use_id=_last_auq_tool_use_id.get(window_id),
+        )
+        _interactive_mode[ikey] = window_id
+        # See note above: the interactive card landed in the topic, so
+        # the duplicate "🔔 waiting for input" attention card is
+        # suppressed. The send-failed branch still fires notify_waiting
+        # because that's the only signal the user gets when the
+        # topic-send couldn't deliver.
+        # New message sent successfully — now safe to delete the old one.
+        if existing_msg_id:
+            # Codex defensive (v2 P2): topic_delete failure leaves the
+            # old card orphaned (we already overwrote _interactive_msgs
+            # with the new id, so the lifecycle is structurally correct
+            # — only the user's visible state has a stray card).
+            try:
+                await topic_delete(
+                    bot,
+                    op="interactive",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    window_id=window_id,
+                    message_id=existing_msg_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "topic_delete of old interactive msg=%d failed: %s",
+                    existing_msg_id,
+                    exc,
+                )
+        return True
 
 
 async def clear_interactive_msg(
@@ -1935,7 +2662,7 @@ async def clear_interactive_msg(
     # ── Phase 1: snapshot + drop state under lock ──────────────────
     lock = _get_route_lock(user_id, thread_id)
     async with lock:
-        single_msg_id = _interactive_msgs.pop(ikey, None)
+        single_msg_id = _clear_interactive_msg(ikey)
         # P2.2: capture the active window for this route BEFORE popping
         # ``_interactive_mode`` so we can scope token pruning correctly.
         # Multiple windows can never share a route (1 topic = 1 window),

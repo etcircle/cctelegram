@@ -519,6 +519,20 @@ class AskUserQuestionForm:
     # adding diagnostic state doesn't break callback tokens minted by
     # earlier renders.
     _meta: dict[str, str] = field(default_factory=dict, compare=False)
+    # Display-only question title captured from the pane walk-back when no
+    # JSONL data is available. Populated by ``parse_ask_user_question``
+    # only — ``resolve_ask_form`` does NOT propagate this through its
+    # merged-form constructors because every JSONL overlay path already
+    # has the authoritative title in ``current_question_title``. The
+    # renderer reads ``current_question_title or pane_walkback_title``
+    # so a fresh single-tab picker (before Claude Code flushes the AUQ
+    # ``tool_use`` line to JSONL) still gets a header in Telegram.
+    # MUST NOT be used by ``_strong_match`` or any other identity check:
+    # the walk-back can capture assistant prose or stale scrollback as a
+    # title (hermes review 2026-05-21), and substring-matching that
+    # against a JSONL question would mis-overlay stale labels onto a
+    # live pane (wrong-action class bug).
+    pane_walkback_title: str | None = field(default=None, compare=False)
 
     def _canonical_repr(self) -> str:
         """Stable string form used by ``fingerprint``.
@@ -859,6 +873,20 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             return None
         tabs = parsed_tabs
 
+    # Walk-back (single-tab path) captures a display-only question-title
+    # candidate from the line above the options block. Tracked separately
+    # from ``current_question_title`` (which goes into the fingerprint and
+    # into ``_strong_match`` for JSONL-stale detection): the walk-back is
+    # a heuristic guess that can accidentally pick up assistant prose or
+    # stale scrollback, so feeding it into the matcher would risk
+    # mis-overlaying stale JSONL labels onto a live pane (wrong-action
+    # class). The renderer falls back to ``pane_walkback_title`` when
+    # ``current_question_title`` is None — this gives the user context
+    # for fresh pickers before Claude Code has flushed the AUQ
+    # ``tool_use`` line to JSONL (2026-05-21 D5 incident at 22:49).
+    walkback_stop_idx: int | None = None
+    walkback_blank_gap: int = 0
+
     # Collect options below the tab header (multi-tab) or in the picker
     # region above the footer (single-tab). For multi-tab, options live
     # between the header and the next separator / next tab header /
@@ -888,13 +916,16 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             stripped = line.strip()
             if not stripped:
                 start_idx = j
+                walkback_blank_gap += 1
                 continue
             if _RE_NUMBERED_OPTION.match(line):
                 start_idx = j
+                walkback_blank_gap = 0
                 continue
             # Separator line (only ─ chars).
             if all(c == "─" for c in stripped):
                 start_idx = j
+                walkback_blank_gap = 0
                 continue
             # Description continuation — non-empty indented text within
             # ~7 lines (in either direction) of a numbered option. The
@@ -917,7 +948,18 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
                 )
             ):
                 start_idx = j
+                walkback_blank_gap = 0
                 continue
+            # Non-pattern line — title-display candidate. Only set
+            # ``walkback_stop_idx`` here so the for-loop falling off
+            # the top of the buffer (no break) keeps it at None: a
+            # buffer that is entirely pattern lines has no title to
+            # capture. Also reject indented lines as title candidates
+            # — Claude Code's question text is rendered at column 0,
+            # and indented lines above the topmost option are
+            # invariably scrollback noise (hermes review, 2026-05-21).
+            if not line.startswith(("  ", "\t")):
+                walkback_stop_idx = j
             break
         options_region = lines[start_idx : footer_idx + 1]
     else:
@@ -925,11 +967,13 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
 
     options = _parse_numbered_options(options_region)
 
-    # Question title heuristic: the first non-empty, non-separator line
-    # *above* the options block that doesn't look like an option / tab /
-    # separator. None when no such line is available within a small window.
+    # Multi-tab in-region title scan — sets the authoritative
+    # ``current_question_title`` for layouts where Claude Code prints
+    # the question text between the tab header and the first option.
+    # Inputs to ``_strong_match`` and the fingerprint canonical come
+    # from this field, so we only populate it from a region anchored
+    # by the tab header (a strong "this is the picker" signal).
     current_question_title: str | None = None
-    search_top = tab_header_idx + 1 if tab_header_idx is not None else 0
     for line in options_region:
         stripped = line.strip()
         if not stripped:
@@ -942,7 +986,37 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             continue
         current_question_title = stripped
         break
-    _ = search_top  # reserved for a future "search bounded above tabs" tweak
+
+    # ``pane_walkback_title`` (display only): walked-back title for the
+    # single-tab path. Bounded gap (≤2 blanks between candidate and
+    # topmost option) keeps us from pulling in pre-picker scrollback.
+    # Multi-line wraps capped at 3 physical lines so an entire stray
+    # paragraph cannot get glued together and accidentally match a
+    # JSONL substring (hermes review, 2026-05-21). The renderer falls
+    # back to this field when ``current_question_title`` is None.
+    pane_walkback_title: str | None = None
+    if walkback_stop_idx is not None and walkback_blank_gap <= 2:
+        parts: list[str] = [lines[walkback_stop_idx].strip()]
+        for k in range(walkback_stop_idx - 1, -1, -1):
+            if len(parts) >= 3:
+                break
+            prev_line = lines[k]
+            prev_stripped = prev_line.strip()
+            if not prev_stripped:
+                break
+            if _RE_NUMBERED_OPTION.match(prev_line):
+                break
+            if all(c == "─" for c in prev_stripped):
+                break
+            if prev_line.startswith(("  ", "\t")):
+                # Indented prior content is either an option-description
+                # continuation or unrelated bullet text — not part of the
+                # title. (Tmux's pane capture does not re-indent
+                # soft-wrapped lines, so a wrapped title's continuation
+                # would start at column 0.)
+                break
+            parts.append(prev_stripped)
+        pane_walkback_title = " ".join(reversed(parts))
 
     # Build a pane excerpt for verbatim fallback rendering. We pin it to the
     # tab header (if any) or the last ~25 lines otherwise — the renderer in
@@ -959,6 +1033,7 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         is_review_screen=is_review,
         is_free_text=is_free_text,
         pane_excerpt=pane_excerpt,
+        pane_walkback_title=pane_walkback_title,
     )
 
 

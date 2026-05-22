@@ -712,6 +712,7 @@ class TestExtractContextPct:
 
 from cctelegram.terminal_parser import (  # noqa: E402
     AskOption,
+    AskQuestion,
     AskTab,
     AskUserQuestionForm,
     parse_ask_user_question,
@@ -966,6 +967,280 @@ class TestParseAskUserQuestion:
         # First option carries the cursor
         assert form.options[0].cursor is True
 
+    # ── pane_walkback_title (display-only single-tab title) ───────────
+    #
+    # These pin the 2026-05-21 D5 incident: when Claude Code's AUQ TUI
+    # opens a fresh single-tab picker before flushing the AUQ tool_use
+    # line to JSONL, the bot has no JSONL cache to overlay. Pre-fix the
+    # in-region heuristic returned None for these panes because the
+    # title line sits ABOVE ``options_region``. Post-fix the walk-back
+    # captures the title into ``pane_walkback_title``, a display-only
+    # field that the renderer uses as a fallback for
+    # ``current_question_title``. The field is excluded from
+    # ``_canonical_repr`` / ``_strong_match`` to keep the walk-back
+    # guess from triggering wrong-action overlays on stale-cache races
+    # (hermes review 2026-05-21).
+
+    def test_walkback_title_d5_layout(self):
+        """Live D5 layout: question header on the line directly above
+        option 1, separated by a single blank, picker meta-options 5/6
+        beneath the JSONL options, "(Type something...)" between the
+        last option and the footer. Captured from 2026-05-21 22:49.
+        """
+        pane = (
+            "Good push. Let me lay out the cleaner alternatives.\n"
+            "\n"
+            "D5 — If durationMode-as-permanent-flag is cruft, how do we"
+            " handle legacy voice_patch ops?\n"
+            "\n"
+            "❯ 1. Drop the flag — ripple is just the new behavior\n"
+            "  2. One-time migration — v3 to v4 schema bump\n"
+            "  3. Strictly new behavior — require re-create for old ops\n"
+            "  4. Keep the flag, default differs by status\n"
+            "  5. Type something.\n"
+            "  6. Chat about this\n"
+            "\n"
+            "  (Type something — send a regular message to free-text)\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # Pane-only parse → JSONL-authoritative title stays None.
+        assert form.current_question_title is None
+        # Walk-back captures the actual question line.
+        assert form.pane_walkback_title == (
+            "D5 — If durationMode-as-permanent-flag is cruft, "
+            "how do we handle legacy voice_patch ops?"
+        )
+        # All six visible options preserved.
+        assert [o.number for o in form.options] == [1, 2, 3, 4, 5, 6]
+
+    def test_walkback_title_excluded_from_fingerprint(self):
+        """Hermes P1 defense: pane_walkback_title must NOT influence
+        the fingerprint canonical (so it cannot push the same pane
+        through different canonical reprs across rerenders) and must
+        NOT compare-affect the dataclass equality (compare=False).
+        """
+        pane = (
+            "Pick approach\n"
+            "\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        a = parse_ask_user_question(pane)
+        assert a is not None and a.pane_walkback_title == "Pick approach"
+        # Synthetic form with the SAME canonical fields but no walkback
+        # title still equals `a` (because pane_walkback_title is
+        # compare=False) and produces the SAME fingerprint.
+        b = AskUserQuestionForm(
+            tabs=a.tabs,
+            current_question_title=a.current_question_title,
+            options=a.options,
+            is_review_screen=a.is_review_screen,
+            is_free_text=a.is_free_text,
+            pane_excerpt=a.pane_excerpt,
+            questions=a.questions,
+            current_tab_inferred=a.current_tab_inferred,
+        )
+        assert b.pane_walkback_title is None
+        assert a.fingerprint() == b.fingerprint()
+        assert a == b
+
+    def test_walkback_title_wrapped_two_lines(self):
+        """Narrow-terminal hard-wrap: title spans two contiguous lines
+        with no blank between. Walk-back joins them with a space."""
+        pane = (
+            "How do we handle legacy voice_patch ops when the\n"
+            "durationMode flag turns out to be cruft?\n"
+            "\n"
+            "❯ 1. Drop the flag\n"
+            "  2. Migrate\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.pane_walkback_title == (
+            "How do we handle legacy voice_patch ops when the "
+            "durationMode flag turns out to be cruft?"
+        )
+
+    def test_walkback_title_multi_line_capped_at_three(self):
+        """Hermes P2 defense: cap multi-line collection at 3 physical
+        lines so an entire stray paragraph cannot get glued together
+        and accidentally substring-match a JSONL question."""
+        pane = (
+            "Line A unrelated paragraph from the assistant turn\n"
+            "Line B continuing the paragraph\n"
+            "Line C still continuing the paragraph\n"
+            "Line D the question itself ends here\n"
+            "\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # Only the last 3 contiguous non-indented lines collected.
+        assert form.pane_walkback_title == (
+            "Line B continuing the paragraph "
+            "Line C still continuing the paragraph "
+            "Line D the question itself ends here"
+        )
+
+    def test_walkback_title_no_header_returns_none(self):
+        """Picker with no header text above the options — walk-back
+        finds no candidate line, ``pane_walkback_title`` stays None,
+        renderer just skips the title block (no regression)."""
+        pane = (
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.current_question_title is None
+        assert form.pane_walkback_title is None
+
+    def test_walkback_title_with_separator_between_title_and_options(self):
+        """A `──` separator between the title line and the options
+        block. Walk-back skips the separator and lands on the title."""
+        pane = (
+            "Pick your approach\n"
+            "─────────────────────\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.pane_walkback_title == "Pick your approach"
+
+    def test_walkback_title_rejects_indented_line(self):
+        """Indented lines above the options block are NOT candidates
+        for the title — Claude Code renders the question at column 0,
+        and an indented line is invariably a description continuation
+        or unrelated scrollback bullet. The walk-back breaks but does
+        not set walkback_stop_idx, so pane_walkback_title stays None."""
+        pane = (
+            "  indented stale scrollback line\n"
+            "\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # The indented line is rejected; no title captured.
+        assert form.pane_walkback_title is None
+
+    def test_walkback_title_assistant_prose_above_picker_captured(self):
+        """Tradeoff case (hermes P2): when assistant prose sits
+        immediately above the picker with no blank-line separator and
+        the gap to options is small, the walk-back will capture it as
+        a title candidate. Acceptable graceful degradation BECAUSE:
+
+        1. ``pane_walkback_title`` is display-only — never feeds
+           ``_strong_match`` (so it cannot mis-overlay stale JSONL
+           labels onto the live pane).
+        2. Excluded from ``_canonical_repr`` — fingerprints stay
+           stable across rerenders even if the prose changes.
+        3. ``resolve_ask_form`` supersedes this with JSONL once Claude
+           Code flushes the AUQ tool_use line.
+
+        Pinning the false-positive so future readers understand it's
+        intentional. The alternative (refusing to capture prose
+        without strong structural cues) would also drop legitimate
+        D5-style titles.
+        """
+        pane = (
+            "OK let me think about this carefully.\n"
+            "\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.pane_walkback_title == "OK let me think about this carefully."
+
+    def test_walkback_title_blank_gap_too_large_rejected(self):
+        """Hermes P2 defense: gap > 2 blank lines between candidate
+        and options block indicates pre-picker scrollback, not the
+        question text. Walk-back captures the position but the
+        gap-bound below rejects acceptance."""
+        pane = (
+            "Possibly unrelated scrollback text\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # 4 blank lines between the candidate and option 1 → gap > 2
+        # → not accepted.
+        assert form.pane_walkback_title is None
+
+    def test_walkback_title_does_not_affect_strong_match(self):
+        """Hermes P1 defense: a walk-back title that happens to
+        substring-match a stale JSONL question must NOT trigger
+        ``_strong_match`` to return True. ``_strong_match`` reads
+        ``current_question_title`` only — the pane parser keeps that
+        as None for pane-only single-tab parses, so the matcher falls
+        through to the label-overlap path as before."""
+        from cctelegram.terminal_parser import _strong_match
+
+        pane = (
+            "D5 — Pick the approach\n"
+            "\n"
+            "❯ 1. Live answer A\n"
+            "  2. Live answer B\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        pane_form = parse_ask_user_question(pane)
+        assert pane_form is not None
+        assert pane_form.pane_walkback_title == "D5 — Pick the approach"
+
+        # Stale JSONL with the SAME D5 title but DIFFERENT options.
+        stale_q = AskQuestion(
+            title="D5 — Pick the approach",
+            header="D5",
+            options=(
+                AskOption(
+                    label="Stale option Alpha",
+                    recommended=False,
+                    cursor=False,
+                    number=1,
+                ),
+                AskOption(
+                    label="Stale option Bravo",
+                    recommended=False,
+                    cursor=False,
+                    number=2,
+                ),
+            ),
+        )
+        # Even though pane_walkback_title and stale_q.title match
+        # exactly, _strong_match must NOT use the walk-back title.
+        # current_question_title is None, label intersection is 0 →
+        # _strong_match returns False → resolve_ask_form's stale
+        # fallback fires, options come from pane (correct shape).
+        assert _strong_match(stale_q, pane_form) is False
+
     def test_non_picker_pane_returns_none(self):
         pane = (
             "Just regular Claude Code output\n"
@@ -1026,7 +1301,6 @@ class TestParseAskUserQuestion:
 
 
 from cctelegram.terminal_parser import (  # noqa: E402
-    AskQuestion,
     _questions_digest,
     build_form_from_tool_input,
     resolve_ask_form,

@@ -49,7 +49,10 @@ _AUQ_TOOL_INPUT = {
             "header": "Engine state",
             "options": [
                 {"label": "Actor / command channel", "description": "Single owner."},
-                {"label": "Shared state + locks", "description": "Reference repo's choice."},
+                {
+                    "label": "Shared state + locks",
+                    "description": "Reference repo's choice.",
+                },
             ],
         },
     ]

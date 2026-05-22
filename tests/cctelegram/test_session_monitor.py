@@ -741,8 +741,9 @@ class TestFindLatestPendingAuq:
         )
         result = await monitor._find_latest_pending_auq(f)
         assert result is not None
-        assert len(result["questions"]) == 2
-        assert result["questions"][0]["header"] == "Q1"
+        assert result["id"] == "auq_1"
+        assert len(result["input"]["questions"]) == 2
+        assert result["input"]["questions"][0]["header"] == "Q1"
 
     @pytest.mark.asyncio
     async def test_answered_auq_is_not_hydrated(self, monitor, tmp_path):
@@ -773,7 +774,8 @@ class TestFindLatestPendingAuq:
         )
         result = await monitor._find_latest_pending_auq(f)
         assert result is not None
-        assert len(result["questions"]) == 3
+        assert result["id"] == "auq_new"
+        assert len(result["input"]["questions"]) == 3
 
     @pytest.mark.asyncio
     async def test_invalid_json_lines_are_skipped(self, monitor, tmp_path):
@@ -785,6 +787,7 @@ class TestFindLatestPendingAuq:
         f.write_text(entries_text, encoding="utf-8")
         result = await monitor._find_latest_pending_auq(f)
         assert result is not None
+        assert result["id"] == "auq_1"
 
     @pytest.mark.asyncio
     async def test_preserves_first_full_line_when_tail_lands_on_line_boundary(
@@ -822,7 +825,8 @@ class TestFindLatestPendingAuq:
         # peek-byte fix this would return None because the only pending AUQ
         # line would have been dropped.
         assert result is not None
-        assert len(result["questions"]) == 3
+        assert result["id"] == "auq_after_boundary"
+        assert len(result["input"]["questions"]) == 3
 
     @pytest.mark.asyncio
     async def test_drops_partial_first_line_when_seeking_past_zero(
@@ -852,7 +856,8 @@ class TestFindLatestPendingAuq:
         # auq_first's JSON was clipped; partial-line drop discarded the
         # clipped chunk; auq_tail was wholly visible → that's what we get.
         assert result is not None
-        assert len(result["questions"]) == 2
+        assert result["id"] == "auq_tail"
+        assert len(result["input"]["questions"]) == 2
 
 
 class TestAuqCacheHydration:

@@ -430,7 +430,11 @@ class TestParseEntries:
             ),
             make_jsonl_entry(
                 "user",
-                [make_tool_result_block("t-auq-1", "Your questions have been answered.")],
+                [
+                    make_tool_result_block(
+                        "t-auq-1", "Your questions have been answered."
+                    )
+                ],
             ),
         ]
         result, pending = TranscriptParser.parse_entries(entries)
