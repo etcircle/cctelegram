@@ -445,7 +445,7 @@ def hydrate_interactive_state(session_mgr) -> None:
                 state_mutated_any = True
                 continue
 
-            cur_session = session_mgr.session_id_for_window(current_window)
+            cur_session = session_id_for_window(current_window)
             if _norm(cur_session) != _norm(rec.session_id):
                 logger.info(
                     "AUQ hydrate: dropping stale interactive_msg "

@@ -2418,15 +2418,38 @@ class TestHydrateInteractiveState:
 
         path.write_text(_json.dumps(kwargs))
 
+    @pytest.fixture(autouse=True)
+    def _bind_monkeypatch(self, monkeypatch):
+        """Capture pytest's monkeypatch for use inside ``_session_mgr_stub``.
+
+        Avoids threading ``monkeypatch`` through every test method's
+        signature.
+        """
+        self._mp = monkeypatch
+        yield
+
     def _session_mgr_stub(self, window_states, route_window_map):
         """Build a minimal mock of session_manager API used by hydrate.
 
         ``window_states``: ``{window_id: session_id}``.
         ``route_window_map``: ``{(user_id, thread_id_or_None): window_id}``.
+
+        ``session_id_for_window`` is a MODULE-LEVEL function in
+        ``session.py`` (line 1023), NOT a method on SessionManager.
+        We monkeypatch the imported name in ``interactive_ui`` so the
+        test maps the window→session lookup through ``window_states``.
+        Regression: bf840e6 called ``session_mgr.session_id_for_window``
+        which AttributeError'd at runtime against the real instance.
         """
         from unittest.mock import MagicMock
 
-        sm = MagicMock()
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.session import SessionManager
+
+        # spec=SessionManager makes MagicMock raise AttributeError on
+        # any attribute that doesn't exist on the real class — second
+        # line of defense against the bf840e6 mistake.
+        sm = MagicMock(spec=SessionManager)
         sm.window_states = {wid: object() for wid in window_states}
 
         def _sid_for_win(wid):
@@ -2435,7 +2458,7 @@ class TestHydrateInteractiveState:
         def _win_for_thread(user_id, thread_id):
             return route_window_map.get((user_id, thread_id or 0))
 
-        sm.session_id_for_window = _sid_for_win
+        self._mp.setattr(iui, "session_id_for_window", _sid_for_win)
         sm.resolve_window_for_thread = _win_for_thread
         return sm
 
@@ -2673,6 +2696,30 @@ class TestHydrateInteractiveState:
         iui.hydrate_interactive_state(sm)
         # The remap had to read from a freshly-loaded local dict.
         assert iui._auq_context_posted == {"@13": "toolu_a"}
+
+    def test_session_id_for_window_is_module_level_not_method(self):
+        """Anti-regression for bf840e6:
+
+        ``session_id_for_window`` is a module-level function in
+        ``session.py`` (line 1023), NOT a method on SessionManager.
+        Commit bf840e6 introduced ``session_mgr.session_id_for_window(...)``
+        in ``hydrate_interactive_state`` which AttributeError'd against
+        the real singleton, crash-looped the bot on startup, and
+        Telegram rate-limited getUpdates for ~36 minutes.
+
+        Future typos of this shape are caught by the ``spec=SessionManager``
+        mocks in the surrounding tests, but this explicit assertion
+        documents the contract.
+        """
+        from cctelegram.session import SessionManager, session_manager
+
+        assert not hasattr(SessionManager, "session_id_for_window"), (
+            "SessionManager class must NOT have a session_id_for_window "
+            "method. The function is module-level (session.py:1023). "
+            "Calling session_mgr.session_id_for_window(...) would "
+            "AttributeError at runtime."
+        )
+        assert not hasattr(session_manager, "session_id_for_window")
 
     def test_hydrate_mismatch_marker_not_remapped(
         self, _isolated_interactive_state_file
