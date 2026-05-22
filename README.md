@@ -146,6 +146,43 @@ If the bot runs under launchd (the recommended setup on macOS), restart it with:
 launchctl kickstart -k gui/$(id -u)/com.cc-telegram
 ```
 
+## Log rotation
+
+`launchd.err.log` and `launchd.out.log` are written by launchd's
+stderr/stdout redirect, not by Python's logging — so the bot can't
+rotate them itself. A small LaunchAgent handles rotation: every 30
+minutes it checks both files, gzips a dated copy into
+`~/.cc-telegram/log-archive/` if either exceeds 50MB, and truncates
+the original in place (safe under the bot's `O_APPEND` write).
+Archives older than 14 days are deleted automatically. Install with:
+
+```bash
+bash bin/install-log-rotate.sh
+```
+
+The script is idempotent — re-running replaces the existing agent.
+Override thresholds via env in the plist `EnvironmentVariables` block
+(`CC_TELEGRAM_LOG_ROTATE_THRESHOLD_MB`,
+`CC_TELEGRAM_LOG_ROTATE_MAX_AGE_DAYS`).
+
+Force a rotation pass now:
+
+```bash
+launchctl kickstart gui/$(id -u)/com.cc-telegram.log-rotate
+```
+
+Uninstall:
+
+```bash
+launchctl bootout gui/$(id -u)/com.cc-telegram.log-rotate
+rm ~/Library/LaunchAgents/com.cc-telegram.log-rotate.plist
+```
+
+Without this, a crash-loop (e.g. a startup AttributeError under
+`KeepAlive=true`) can balloon `launchd.err.log` to hundreds of
+megabytes and trigger Telegram `getUpdates` rate-limiting via the
+restart spam. The rotation cap also caps the blast radius.
+
 ## Config directory override
 
 Default config dir: `~/.cc-telegram`.
