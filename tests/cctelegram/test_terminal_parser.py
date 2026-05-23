@@ -1296,6 +1296,124 @@ class TestParseAskUserQuestion:
         form2 = AskUserQuestionForm(tabs=(tab,), options=(opt,))
         assert form == form2
 
+    # ── Bug C — dual-cursor disambiguation (Recommended + live cursor) ──
+
+    def test_bug_c_dual_cursor_drops_recommended_marker(self):
+        # The user moved the tmux cursor to option 3; Claude Code keeps a
+        # decorative ``❯`` on the Recommended row AND paints ``❯`` on the
+        # live cursor row. The parser must report the cursor on option 3
+        # only — the Recommended ``❯`` is decoration, not state.
+        pane = (
+            "❯ 1. Accept all fixes (Recommended)\n"
+            "  2. Cherry-pick\n"
+            "❯ 3. Reject and ship\n"
+            "  4. Type something.\n"
+            "─\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        cursor_numbers = [o.number for o in form.options if o.cursor]
+        assert cursor_numbers == [3], cursor_numbers
+        # Recommended flag survives the dedup — label structure unchanged.
+        rec_opt = next(o for o in form.options if o.number == 1)
+        assert rec_opt.recommended is True
+        assert rec_opt.cursor is False
+
+    def test_bug_c_single_cursor_on_recommended_preserved(self):
+        # Fresh AUQ state: cursor sits on the Recommended option, no other
+        # row has ``❯``. Dedup must NOT fire — the lone ``❯`` IS the
+        # cursor, even though it happens to land on the Recommended row.
+        pane = (
+            "❯ 1. Accept all fixes (Recommended)\n"
+            "  2. Cherry-pick\n"
+            "  3. Reject and ship\n"
+            "  4. Type something.\n"
+            "─\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        cursor_numbers = [o.number for o in form.options if o.cursor]
+        assert cursor_numbers == [1], cursor_numbers
+        rec_opt = next(o for o in form.options if o.number == 1)
+        assert rec_opt.recommended is True
+        assert rec_opt.cursor is True
+
+    def test_bug_c_single_cursor_on_non_recommended_preserved(self):
+        # Cursor is on a non-Recommended option and no other row has
+        # ``❯`` (e.g., the Recommended marker scrolled off the visible
+        # region, or Claude Code is in a TUI mode that omits the
+        # decorative marker). Dedup must NOT fire — the lone cursor
+        # passes through unchanged.
+        pane = (
+            "  1. Accept all fixes (Recommended)\n"
+            "  2. Cherry-pick\n"
+            "❯ 3. Reject and ship\n"
+            "  4. Type something.\n"
+            "─\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        cursor_numbers = [o.number for o in form.options if o.cursor]
+        assert cursor_numbers == [3], cursor_numbers
+
+    def test_bug_c_no_cursor_unchanged(self):
+        # Mid-redraw: pane scrape catches a frame between cursor draws and
+        # no row has ``❯``. Dedup must NOT fire (cursor_count == 0). The
+        # downstream JSONL overlay (``_overlay_cursor``) will default the
+        # cursor to the first JSONL option separately.
+        pane = (
+            "  1. Accept all fixes (Recommended)\n"
+            "  2. Cherry-pick\n"
+            "  3. Reject and ship\n"
+            "  4. Type something.\n"
+            "─\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        cursor_numbers = [o.number for o in form.options if o.cursor]
+        assert cursor_numbers == [], cursor_numbers
+
+    def test_bug_c_zero_cursor_after_dedup_restores_last(self):
+        # Defensive edge case (D6): theoretical pane state where every
+        # ``❯``-bearing row is also Recommended. Clearing all of them
+        # would leave the form with zero cursors — violates the
+        # renderer's "≥1 cursor on a multi-option form" invariant. The
+        # fix restores ``cursor=True`` on the LAST cleared Recommended
+        # row.
+        #
+        # In practice Claude Code emits at most one ``(Recommended)``
+        # label per form; this case is a defense against future TUI
+        # changes or skill prompts that mark multiple options as
+        # recommended.
+        pane = (
+            "❯ 1. First default (Recommended)\n"
+            "❯ 2. Second default (Recommended)\n"
+            "  3. Third option\n"
+            "  4. Type something.\n"
+            "─\n"
+            "  5. Chat about this\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        cursor_numbers = [o.number for o in form.options if o.cursor]
+        # Both Recommended rows had cursor; dedup cleared both; defense
+        # restored cursor on the LAST (option 2).
+        assert cursor_numbers == [2], cursor_numbers
+
 
 # ── PR 1 (multi-tab resolver + INF/QS fingerprint gates) ────────────────
 

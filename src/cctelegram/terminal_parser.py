@@ -685,6 +685,39 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
             break
         kept.append(opt)
         expected += 1
+    # Bug C dedup: Claude Code's TUI paints ``❯`` on BOTH the Recommended
+    # row (as a visual marker) and the live cursor row. Without
+    # disambiguation the parser reports multi-cursor and the renderer
+    # paints ``❯`` on every flagged row in Telegram. When the user has
+    # moved their cursor away from the Recommended option, the
+    # Recommended ``❯`` is decorative — drop it. If clearing all
+    # Recommended cursor flags would leave zero cursors on a
+    # multi-option form (theoretical: multiple Recommended rows, never
+    # observed), restore on the LAST cleared row to preserve the
+    # renderer's "≥1 cursor visible" invariant.
+    cursor_count = sum(1 for o in kept if o.cursor)
+    if cursor_count > 1:
+        cleared_recommended_idx: list[int] = []
+        for i, opt in enumerate(kept):
+            if opt.cursor and opt.recommended:
+                cleared_recommended_idx.append(i)
+                kept[i] = AskOption(
+                    label=opt.label,
+                    recommended=opt.recommended,
+                    cursor=False,
+                    number=opt.number,
+                    description=opt.description,
+                )
+        if cleared_recommended_idx and not any(o.cursor for o in kept):
+            restore_at = cleared_recommended_idx[-1]
+            opt = kept[restore_at]
+            kept[restore_at] = AskOption(
+                label=opt.label,
+                recommended=opt.recommended,
+                cursor=True,
+                number=opt.number,
+                description=opt.description,
+            )
     return tuple(kept)
 
 

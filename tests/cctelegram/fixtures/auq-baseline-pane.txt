@@ -1,0 +1,24 @@
+
+If you'd rather not switch to tmux, just answer here and we'll defer Wave 0 to a
+ more convenient moment.
+
+ELI10: I need you to physically move the tmux cursor so the picker shows `❯` on
+TWO rows at once — the Recommended row (where it always lives) and your live
+cursor row. The background bash will capture the pane in that state.
+
+Recommendation: A — if you have terminal access nearby.
+
+❯ 1. Done navigating (recommended)
+     I navigated to option 2 in tmux. The poll loop has captured the dual-cursor
+      state. Submit this and I'll inspect.
+  2. Pick option 2 directly
+     Skip tmux navigation. Bug C won't be triggered — we'll defer Wave 0
+     capture.
+  3. Defer Wave 0
+     I'll do this later when I have tmux access. Wrap autoplan now.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
