@@ -2433,6 +2433,18 @@ async def handle_interactive_ui(
     async with lock:
         if content.name == "AskUserQuestion":
             ctx_input = _resolve_ask_tool_input(window_id, tool_input)
+            logger.info(
+                "AUQ context gate eval: window=%s from_poller=%s "
+                "explicit_input=%s cached_input=%s tool_use_id=%s "
+                "should_post=%s already_posted=%s",
+                window_id,
+                from_poller,
+                tool_input is not None,
+                _last_completed_ask_tool_input.get(window_id) is not None,
+                _last_auq_tool_use_id.get(window_id),
+                _should_post_auq_context(ctx_input),
+                _auq_context_posted.get(window_id) is not None,
+            )
             if _should_post_auq_context(ctx_input) and claim_auq_context_post(
                 window_id
             ):
