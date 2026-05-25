@@ -1033,3 +1033,21 @@ def session_id_for_window(window_id: str | None) -> str | None:
         return None
     state = session_manager.get_window_state(window_id)
     return state.session_id or None
+
+
+def peek_session_id_for_window(window_id: str | None) -> str | None:
+    """Read-only sibling of ``session_id_for_window``.
+
+    ``session_id_for_window`` calls ``session_manager.get_window_state``
+    which auto-creates a ``WindowState`` on miss. Callers that should
+    NOT mutate SessionManager state on unknown windows — notably the
+    AUQ PreToolUse reader — use this peek variant instead. Returns
+    ``None`` when ``window_id`` is empty or the window isn't currently
+    in ``window_states``.
+    """
+    if not window_id:
+        return None
+    state = session_manager.window_states.get(window_id)
+    if state is None:
+        return None
+    return state.session_id or None

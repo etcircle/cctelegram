@@ -1209,6 +1209,26 @@ async def post_init(application: Application) -> None:
     session_monitor = monitor
     logger.info("Session monitor started")
 
+    # AUQ PreToolUse side-file maintenance:
+    #   1. Garbage-collect stale files (>1h old) left over from crashes
+    #      / kickstart-between-AUQs cases.
+    #   2. Warn (with the actionable install command) if the PreToolUse
+    #      hook entry is missing from ~/.claude/settings.json — the bot
+    #      will still work in form-source-only mode, but the user will
+    #      lose AUQ descriptions at pick time until they run
+    #      `cc-telegram hook --install`.
+    try:
+        from .handlers.interactive_ui import (
+            gc_stale_pretool_side_files,
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        gc_stale_pretool_side_files()
+        warn_if_pre_tool_use_hook_missing()
+    except Exception as e:  # noqa: BLE001
+        # Never let cleanup/maintenance crash bot startup.
+        logger.warning("AUQ pretool startup maintenance raised: %s", e)
+
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")

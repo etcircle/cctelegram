@@ -791,6 +791,12 @@ class SessionMonitor:
         # Tracked here so we can hand them to ``busy_indicator.clear_route``
         # once routes are resolved below.
         changed_window_ids: set[str] = set()
+        # window_id → OLD session_id for windows whose session_id flipped
+        # since the last poll. Used by the AUQ PreToolUse cleanup path
+        # below — ``forget_ask_tool_input`` resolves the side file via
+        # the CURRENT session (now the new one), so we must capture the
+        # old session_id here while it's still reachable.
+        changed_old_sessions: dict[str, str] = {}
 
         # Check for window session changes (window exists in both, but session_id changed)
         for window_id, old_session_id in self._last_session_map.items():
@@ -804,12 +810,19 @@ class SessionMonitor:
                 )
                 sessions_to_remove.add(old_session_id)
                 changed_window_ids.add(window_id)
+                changed_old_sessions[window_id] = old_session_id
 
         # Check for deleted windows (window in old map but not in current)
         old_windows = set(self._last_session_map.keys())
         current_windows = set(current_map.keys())
         deleted_windows = old_windows - current_windows
 
+        # Deleted windows: track their session_ids for AUQ side-file
+        # cleanup alongside sessions_to_remove. Codex P2 (chunk 5): even
+        # though the reader can't serve these (no window binding), the
+        # side files carry AUQ tool_input text and shouldn't linger
+        # until the next bot-startup GC.
+        deleted_session_ids: list[str] = []
         for window_id in deleted_windows:
             old_session_id = self._last_session_map[window_id]
             logger.info(
@@ -818,6 +831,7 @@ class SessionMonitor:
                 old_session_id,
             )
             sessions_to_remove.add(old_session_id)
+            deleted_session_ids.append(old_session_id)
 
         # Perform cleanup
         if sessions_to_remove:
@@ -866,8 +880,34 @@ class SessionMonitor:
             # place. Render path would then overlay options from the dead
             # AUQ onto the new session's pane — a wrong-action class shape.
             # Drop the cache for any window whose session_id changed.
+            #
+            # Codex R2 fix: also unlink the OLD session's PreToolUse side
+            # file BEFORE forget_ask_tool_input runs. By the time
+            # forget_ask_tool_input executes, ``peek_session_id_for_window``
+            # returns the NEW session_id, so a delete keyed by the current
+            # session would miss the old session's file entirely. We
+            # captured the old session_id in ``changed_old_sessions`` above
+            # for exactly this purpose.
+            from .handlers.interactive_ui import (
+                _unlink_pretool_side_file_for_session,
+            )
+
             for wid in changed_window_ids:
+                old_sid = changed_old_sessions.get(wid, "")
+                if old_sid:
+                    _unlink_pretool_side_file_for_session(old_sid)
                 forget_ask_tool_input(wid)
+
+        # Codex P2 (chunk 5): unlink side files for deleted windows
+        # too. Outside the ``if changed_window_ids`` block because a
+        # cycle with only deletes (no changes) still needs cleanup.
+        if deleted_session_ids:
+            from .handlers.interactive_ui import (
+                _unlink_pretool_side_file_for_session,
+            )
+
+            for sid in deleted_session_ids:
+                _unlink_pretool_side_file_for_session(sid)
 
         # Update last known map
         self._last_session_map = current_map

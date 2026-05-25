@@ -9,6 +9,9 @@ from cctelegram.terminal_parser import (
     is_interactive_ui,
     is_status_active,
     parse_status_line,
+    questions_content_digest,
+    questions_content_pairs_from_form,
+    questions_content_pairs_from_tool_input,
     strip_pane_chrome,
 )
 
@@ -2342,3 +2345,290 @@ class TestResolveAskForm:
             "another-unrelated-label",
         ]
         assert form.options[0].cursor is True
+
+
+# ── questions_content_digest + content pairs (AUQ PreToolUse hook surface) ──
+
+
+class TestQuestionsContentDigest:
+    """Pin the content-digest helper used by the PreToolUse hook.
+
+    The digest is a logging / cache key, not the side-file acceptance
+    criterion (acceptance is the projection predicate in
+    `_record_consistent_with_pane`). These tests pin:
+      1. Encoding stability across inputs.
+      2. Symmetry between `tool_input` (JSONL dict) and an equivalent
+         `AskUserQuestionForm` extracted from a full-pane render of the
+         same content.
+      3. Exclusion of UI state (cursor, recommended, numbering).
+    """
+
+    def test_digest_is_12_char_hex(self):
+        pairs = (("question?", ("opt a", "opt b")),)
+        d = questions_content_digest(pairs)
+        assert len(d) == 12
+        assert all(c in "0123456789abcdef" for c in d)
+
+    def test_digest_golden_fixture(self):
+        # Pin encoding stability: an exact known digest for a fixed input.
+        # If this changes, every persisted side file from prior versions
+        # has a stale fingerprint — important to know before merging.
+        pairs = (("Pick a fruit", ("Apple", "Banana")),)
+        assert questions_content_digest(pairs) == "148a9ef06267"
+
+    def test_digest_changes_when_label_renamed(self):
+        d1 = questions_content_digest((("Q", ("A", "B")),))
+        d2 = questions_content_digest((("Q", ("A", "B-renamed")),))
+        assert d1 != d2
+
+    def test_digest_changes_when_option_reordered(self):
+        d1 = questions_content_digest((("Q", ("A", "B")),))
+        d2 = questions_content_digest((("Q", ("B", "A")),))
+        assert d1 != d2
+
+    def test_digest_changes_when_title_changed(self):
+        d1 = questions_content_digest((("Q1", ("A",)),))
+        d2 = questions_content_digest((("Q2", ("A",)),))
+        assert d1 != d2
+
+    def test_digest_changes_with_extra_option(self):
+        d1 = questions_content_digest((("Q", ("A",)),))
+        d2 = questions_content_digest((("Q", ("A", "B")),))
+        assert d1 != d2
+
+    def test_digest_separators_avoid_pipe_collisions(self):
+        # Labels containing "|" must not collide with sibling labels —
+        # the encoding uses ASCII control separators \x1f / \x1e / \x1d.
+        d1 = questions_content_digest((("Q", ("A|B", "C")),))
+        d2 = questions_content_digest((("Q", ("A", "B|C")),))
+        assert d1 != d2
+
+
+class TestQuestionsContentPairsFromToolInput:
+    def test_extracts_single_question(self):
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick one",
+                    "options": [
+                        {"label": "Apple", "description": "fruit"},
+                        {"label": "Banana", "description": "also fruit"},
+                    ],
+                }
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs == (("Pick one", ("Apple", "Banana")),)
+
+    def test_extracts_multi_question(self):
+        tool_input = {
+            "questions": [
+                {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},
+                {"question": "Q2", "options": [{"label": "X"}]},
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs == (("Q1", ("A", "B")), ("Q2", ("X",)))
+
+    def test_descriptions_excluded(self):
+        with_desc = {
+            "questions": [
+                {"question": "Q", "options": [{"label": "A", "description": "loud"}]}
+            ]
+        }
+        without_desc = {"questions": [{"question": "Q", "options": [{"label": "A"}]}]}
+        assert questions_content_pairs_from_tool_input(
+            with_desc
+        ) == questions_content_pairs_from_tool_input(without_desc)
+
+    def test_none_for_non_dict_input(self):
+        assert questions_content_pairs_from_tool_input(None) is None
+        assert questions_content_pairs_from_tool_input("string") is None
+        assert questions_content_pairs_from_tool_input([1, 2]) is None
+
+    def test_none_for_missing_questions_array(self):
+        assert questions_content_pairs_from_tool_input({}) is None
+        assert questions_content_pairs_from_tool_input({"questions": "wrong"}) is None
+        assert questions_content_pairs_from_tool_input({"questions": []}) is None
+
+    def test_none_when_option_label_is_non_string(self):
+        bad = {"questions": [{"question": "Q", "options": [{"label": 42}]}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_question_title_is_non_string(self):
+        bad = {"questions": [{"question": 42, "options": [{"label": "A"}]}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_options_not_list(self):
+        bad = {"questions": [{"question": "Q", "options": "nope"}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_question_missing_question_key(self):
+        # Codex P2 round 1: missing required key must NOT silently become
+        # an empty string — caller expects None.
+        bad = {"questions": [{"options": [{"label": "A"}]}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_question_missing_options_key(self):
+        bad = {"questions": [{"question": "Q"}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+    def test_none_when_option_missing_label_key(self):
+        bad = {"questions": [{"question": "Q", "options": [{"description": "d"}]}]}
+        assert questions_content_pairs_from_tool_input(bad) is None
+
+
+class TestQuestionsContentPairsFromForm:
+    """The reader side — extract pairs from a parsed AskUserQuestionForm.
+
+    For single-question (pane-only) forms, uses ``current_question_title``
+    + ``options``. For multi-question forms (only populated when
+    ``resolve_ask_form`` is fed JSONL), uses ``questions[]``.
+    """
+
+    def test_single_question_form_via_real_parser(self):
+        # Parse a real single-question AUQ pane (the format Claude Code
+        # actually renders — bare numbered lines, no box-drawing) → form
+        # → pairs.
+        pane = (
+            "Pick a fruit\n"
+            "\n"
+            "❯ 1. Apple\n"
+            "  2. Banana\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        pairs = questions_content_pairs_from_form(form)
+        # Pane title may or may not be carried in current_question_title
+        # depending on parser walk-back logic. The labels MUST be present.
+        assert pairs is not None
+        assert len(pairs) == 1
+        _title, labels = pairs[0]
+        assert labels == ("Apple", "Banana")
+
+    def test_returns_none_when_form_has_no_options(self):
+        from cctelegram.terminal_parser import AskUserQuestionForm
+
+        form = AskUserQuestionForm()  # all defaults — no options
+        assert questions_content_pairs_from_form(form) is None
+
+    def test_excludes_cursor_state(self):
+        # Two pane renders that differ ONLY by which option has the cursor
+        # → identical content digest.
+        pane1 = (
+            "Pick one\n"
+            "\n"
+            "❯ 1. Apple\n"
+            "  2. Banana\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        pane2 = (
+            "Pick one\n"
+            "\n"
+            "  1. Apple\n"
+            "❯ 2. Banana\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form1 = parse_ask_user_question(pane1)
+        form2 = parse_ask_user_question(pane2)
+        assert form1 is not None and form2 is not None
+        # UI state differs (cursor position) but content digest must match.
+        pairs1 = questions_content_pairs_from_form(form1)
+        pairs2 = questions_content_pairs_from_form(form2)
+        assert pairs1 is not None and pairs2 is not None
+        assert questions_content_digest(pairs1) == questions_content_digest(pairs2)
+        # Sanity: the form-level fingerprint, which DOES include cursor
+        # state, differs.
+        assert form1.fingerprint() != form2.fingerprint()
+
+
+class TestDigestSymmetryToolInputVsForm:
+    """The critical symmetry test (Codex R3 ask): a JSONL ``tool_input``
+    and an equivalent ``AskUserQuestionForm`` parsed from the same TUI
+    rendering produce identical digests when the full form is visible.
+    """
+
+    def test_multi_question_digest_matches_via_build_form(self):
+        """Strict symmetry via ``build_form_from_tool_input`` — the form has
+        ``form.questions`` populated (multi-question matrix from JSONL), so
+        the read-side pair extractor walks that and the digest must equal
+        the write-side digest byte-for-byte. No early-exit fallback.
+
+        Codex P2 round 1 ask: the single-question symmetry test allows a
+        title-skip fallback; this test pins the strict byte-for-byte case.
+        """
+        from cctelegram.terminal_parser import build_form_from_tool_input
+
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q1: choose a fruit",
+                    "header": "Fruit",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "Apple", "description": "red"},
+                        {"label": "Banana", "description": "yellow"},
+                    ],
+                },
+                {
+                    "question": "Q2: choose a color",
+                    "header": "Color",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "Red", "description": "warm"},
+                        {"label": "Blue", "description": "cool"},
+                    ],
+                },
+            ]
+        }
+        form = build_form_from_tool_input(tool_input)
+        assert form is not None
+        assert form.questions  # multi-question matrix populated
+        input_pairs = questions_content_pairs_from_tool_input(tool_input)
+        form_pairs = questions_content_pairs_from_form(form)
+        assert input_pairs is not None and form_pairs is not None
+        # Strict byte-for-byte: same payload → same digest, no fallback path.
+        assert questions_content_digest(input_pairs) == questions_content_digest(
+            form_pairs
+        )
+
+    def test_single_question_digest_matches_tool_input(self):
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick a fruit",
+                    "options": [
+                        {"label": "Apple", "description": "red"},
+                        {"label": "Banana", "description": "yellow"},
+                    ],
+                }
+            ]
+        }
+        pane = (
+            "Pick a fruit\n"
+            "\n"
+            "❯ 1. Apple\n"
+            "  2. Banana\n"
+            "\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        input_pairs = questions_content_pairs_from_tool_input(tool_input)
+        form = parse_ask_user_question(pane)
+        assert input_pairs is not None
+        assert form is not None
+        form_pairs = questions_content_pairs_from_form(form)
+        assert form_pairs is not None
+        # Only confirm symmetry when the pane carried the full title; if
+        # the parser couldn't recover the title from this fixture, fall
+        # back to comparing labels only — the LIVE reader's predicate
+        # already handles title-missing as a separate case.
+        if form.current_question_title:
+            assert questions_content_digest(input_pairs) == questions_content_digest(
+                form_pairs
+            )
+        else:
+            assert input_pairs[0][1] == form_pairs[0][1]  # labels equal

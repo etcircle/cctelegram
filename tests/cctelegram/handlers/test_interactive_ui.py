@@ -3907,3 +3907,1150 @@ class TestCodexP2Fixes:
         assert rec.message_ids == (101, 202), (
             f"expected (101, 202), got {rec.message_ids}"
         )
+
+
+# ── AUQ PreToolUse-hook reader (chunk 3) ──────────────────────────────────
+
+
+import json as _json  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+from cctelegram.handlers.interactive_ui import (  # noqa: E402
+    PreToolAskRecord,
+    _PRETOOL_SCHEMA_VERSION,
+    _PRETOOL_TTL_SECONDS,
+    _labels_are_subsequence,
+    _pretool_ask_records,
+    _read_pretool_side_file,
+    _record_consistent_with_pane,
+    _resolve_pretool_record,
+)
+from cctelegram.terminal_parser import (  # noqa: E402,F811
+    questions_content_digest,
+    questions_content_pairs_from_tool_input,
+)
+
+
+def _write_pretool_side_file(
+    tmp_path: _Path,
+    *,
+    session_id: str = "550e8400-e29b-41d4-a716-446655440000",
+    tool_use_id: str = "toolu_017abcdef01234567890ab",
+    questions: list[dict] | None = None,
+    written_at: float | None = None,
+    schema_version: int = 1,
+) -> _Path:
+    """Write a PreToolUse side file under tmp_path/auq_pending/.
+
+    Returns the path. Tests pass tmp_path as the cc-telegram dir via
+    CC_TELEGRAM_DIR env var so app_dir() resolves to it.
+    """
+    if questions is None:
+        questions = [
+            {
+                "question": "Pick a fruit",
+                "options": [
+                    {"label": "Apple", "description": "red"},
+                    {"label": "Banana", "description": "yellow"},
+                ],
+            }
+        ]
+    tool_input = {"questions": questions}
+    pairs = questions_content_pairs_from_tool_input(tool_input)
+    assert pairs is not None
+    record = {
+        "schema_version": schema_version,
+        "session_id": session_id,
+        "tool_use_id": tool_use_id,
+        "tool_input": tool_input,
+        "written_at": written_at if written_at is not None else time.time(),
+        "input_fingerprint": questions_content_digest(pairs),
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": "/tmp/cwd",
+    }
+    pending_dir = tmp_path / "auq_pending"
+    pending_dir.mkdir(exist_ok=True)
+    target = pending_dir / f"{session_id}.json"
+    target.write_text(_json.dumps(record))
+    return target
+
+
+def _make_form_single_question(
+    title: str, labels: list[str], *, current_tab_inferred: bool = True
+) -> AskUserQuestionForm:
+    """Build an AskUserQuestionForm representing a single-question pane parse."""
+    options = tuple(
+        AskOption(label=lab, recommended=False, cursor=(i == 0), number=i + 1)
+        for i, lab in enumerate(labels)
+    )
+    return AskUserQuestionForm(
+        options=options,
+        current_question_title=title,
+        current_tab_inferred=current_tab_inferred,
+    )
+
+
+@pytest.fixture
+def _cc_telegram_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+    # Clear in-memory cache before AND after — keeps tests isolated.
+    _pretool_ask_records.clear()
+    yield tmp_path
+    _pretool_ask_records.clear()
+
+
+class TestReadPretoolSideFile:
+    def test_returns_none_when_file_missing(self, _cc_telegram_dir):
+        assert _read_pretool_side_file("not-a-session") is None
+
+    def test_reads_well_formed_file(self, _cc_telegram_dir):
+        _write_pretool_side_file(_cc_telegram_dir)
+        rec = _read_pretool_side_file("550e8400-e29b-41d4-a716-446655440000")
+        assert rec is not None
+        assert rec.tool_use_id == "toolu_017abcdef01234567890ab"
+        assert rec.tool_input["questions"][0]["question"] == "Pick a fruit"
+        assert len(rec.input_fingerprint) == 12
+
+    def test_rejects_unknown_schema_version(self, _cc_telegram_dir):
+        _write_pretool_side_file(_cc_telegram_dir, schema_version=999)
+        rec = _read_pretool_side_file("550e8400-e29b-41d4-a716-446655440000")
+        assert rec is None
+
+    def test_rejects_malformed_json(self, _cc_telegram_dir):
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir()
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        (pending_dir / f"{sid}.json").write_text("{not valid json")
+        assert _read_pretool_side_file(sid) is None
+
+    def test_rejects_non_dict_top_level(self, _cc_telegram_dir):
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir()
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        (pending_dir / f"{sid}.json").write_text("[1, 2, 3]")
+        assert _read_pretool_side_file(sid) is None
+
+    def test_rejects_non_dict_tool_input(self, _cc_telegram_dir):
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir()
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        (pending_dir / f"{sid}.json").write_text(
+            _json.dumps(
+                {"schema_version": _PRETOOL_SCHEMA_VERSION, "tool_input": "nope"}
+            )
+        )
+        assert _read_pretool_side_file(sid) is None
+
+
+class TestLabelsAreSubsequence:
+    def test_empty_visible_false(self):
+        assert _labels_are_subsequence((), ("A", "B")) is False
+
+    def test_full_match(self):
+        assert _labels_are_subsequence(("A", "B"), ("A", "B")) is True
+
+    def test_visible_longer_than_full_false(self):
+        assert _labels_are_subsequence(("A", "B", "C"), ("A", "B")) is False
+
+    def test_visible_is_prefix(self):
+        assert _labels_are_subsequence(("A",), ("A", "B", "C")) is True
+
+    def test_visible_is_suffix(self):
+        assert _labels_are_subsequence(("B", "C"), ("A", "B", "C")) is True
+
+    def test_visible_in_middle(self):
+        assert _labels_are_subsequence(("B", "C"), ("A", "B", "C", "D")) is True
+
+    def test_non_contiguous_rejected(self):
+        # A and C visible but not B → must reject (the contract is
+        # contiguous subsequence, not subset).
+        assert _labels_are_subsequence(("A", "C"), ("A", "B", "C")) is False
+
+    def test_different_label_rejected(self):
+        assert _labels_are_subsequence(("X",), ("A", "B")) is False
+
+
+class TestRecordConsistentWithPane:
+    def _single_q_record(self, labels: list[str], title: str = "Q"):
+        tool_input = {
+            "questions": [
+                {
+                    "question": title,
+                    "options": [{"label": lab, "description": "d"} for lab in labels],
+                }
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        return PreToolAskRecord(
+            tool_input=tool_input,
+            session_id="sess",
+            tool_use_id="tu",
+            written_at=time.time(),
+            input_fingerprint=questions_content_digest(pairs),
+        )
+
+    def test_no_pane_form(self):
+        rec = self._single_q_record(["A", "B"])
+        ok, reason = _record_consistent_with_pane(rec, None)
+        assert ok is False
+        assert reason == "no_pane_form"
+
+    def test_empty_pane_options(self):
+        rec = self._single_q_record(["A", "B"])
+        form = AskUserQuestionForm()  # no options
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "no_pane_form"
+
+    def test_single_question_full_match_accepted(self):
+        rec = self._single_q_record(["Apple", "Banana"])
+        form = _make_form_single_question("Q", ["Apple", "Banana"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_label_mismatch_rejected(self):
+        rec = self._single_q_record(["Apple", "Banana"])
+        form = _make_form_single_question("Q", ["Apple", "Cherry"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "label_mismatch"
+
+    def test_pane_title_missing_accepted_when_labels_match(self):
+        # Hermes edge case: long descriptions push title off-pane.
+        # Reader must STILL accept the record if labels match.
+        rec = self._single_q_record(["Apple", "Banana"], title="Pick a fruit")
+        form = _make_form_single_question("", ["Apple", "Banana"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_shows_subsequence_of_options_accepted(self):
+        # Pane scrolled — only options 2..N visible, option 1 off-screen.
+        rec = self._single_q_record(["Apple", "Banana", "Cherry"])
+        form = _make_form_single_question("Q", ["Banana", "Cherry"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_title_prefix_match_accepted(self):
+        # Pane truncates long question title; record carries full string.
+        # Each must be a prefix of the other.
+        rec = self._single_q_record(
+            ["A"], title="A long question that the pane truncated"
+        )
+        form = _make_form_single_question("A long question that the pane", ["A"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_pane_title_differs_substantively_rejected(self):
+        rec = self._single_q_record(["A"], title="Pick a fruit")
+        form = _make_form_single_question("Choose your favorite color", ["A"])
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is False
+        assert reason == "title_mismatch"
+
+    def test_multi_question_current_tab_inferred_match(self):
+        # Multi-tab record + reliable tab → match by title.
+        tool_input = {
+            "questions": [
+                {"question": "Q1: fruit", "options": [{"label": "A"}, {"label": "B"}]},
+                {
+                    "question": "Q2: color",
+                    "options": [{"label": "Red"}, {"label": "Blue"}],
+                },
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        rec = PreToolAskRecord(
+            tool_input=tool_input,
+            session_id="sess",
+            tool_use_id="tu",
+            written_at=time.time(),
+            input_fingerprint=questions_content_digest(pairs),
+        )
+        # Pane is on Q2.
+        form = _make_form_single_question(
+            "Q2: color", ["Red", "Blue"], current_tab_inferred=True
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+        assert reason == "ok"
+
+    def test_multi_question_uninferred_tab_falls_through_to_label_match(self):
+        # current_tab_inferred=False → predicate accepts any question
+        # whose labels match the visible labels.
+        tool_input = {
+            "questions": [
+                {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},
+                {"question": "Q2", "options": [{"label": "Red"}, {"label": "Blue"}]},
+            ]
+        }
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        rec = PreToolAskRecord(
+            tool_input=tool_input,
+            session_id="sess",
+            tool_use_id="tu",
+            written_at=time.time(),
+            input_fingerprint=questions_content_digest(pairs),
+        )
+        form = _make_form_single_question(
+            "", ["Red", "Blue"], current_tab_inferred=False
+        )
+        ok, reason = _record_consistent_with_pane(rec, form)
+        assert ok is True
+
+    def test_does_not_use_form_fingerprint_for_acceptance(self):
+        # Cursor on different option ⇒ form.fingerprint() differs but
+        # _record_consistent_with_pane must still accept (Codex R3 ask:
+        # NEVER use AskUserQuestionForm.fingerprint() in the predicate).
+        rec = self._single_q_record(["Apple", "Banana"])
+        form_cur_a = _make_form_single_question("Q", ["Apple", "Banana"])
+        form_cur_b = AskUserQuestionForm(
+            options=(
+                AskOption(label="Apple", recommended=False, cursor=False, number=1),
+                AskOption(label="Banana", recommended=False, cursor=True, number=2),
+            ),
+            current_question_title="Q",
+            current_tab_inferred=True,
+        )
+        assert form_cur_a.fingerprint() != form_cur_b.fingerprint()
+        ok_a, _ = _record_consistent_with_pane(rec, form_cur_a)
+        ok_b, _ = _record_consistent_with_pane(rec, form_cur_b)
+        assert ok_a is True and ok_b is True
+
+
+class TestResolvePretoolRecord:
+    def _bind_window_to_session(self, window_id: str, session_id: str):
+        # Drive session_manager state so session_id_for_window resolves.
+        from cctelegram.session import session_manager
+
+        session_manager.window_states.setdefault(
+            window_id,
+            type(
+                session_manager.window_states.get(window_id, None)
+                or type("WS", (), {})()
+            )(),
+        )
+        # Easier: use the public API to ensure mapping.
+        # session_manager has a set_session_id or similar — fall back to
+        # touching window_states directly.
+        ws = session_manager.window_states.get(window_id)
+        if ws is None:
+            from cctelegram.session import WindowState
+
+            ws = WindowState(cwd="/tmp/cwd", session_id=session_id)
+            session_manager.window_states[window_id] = ws
+        else:
+            object.__setattr__(ws, "session_id", session_id)
+
+    def test_returns_none_when_no_session_mapping(self, _cc_telegram_dir):
+        # No window→session map → reader returns None.
+        form = _make_form_single_question("Q", ["A"])
+        # Use a window_id that isn't in session_manager.
+        assert _resolve_pretool_record("@no-such-window", form) is None
+
+    def test_returns_none_when_side_file_missing(self, _cc_telegram_dir):
+        self._bind_window_to_session("@9001", "11111111-1111-1111-1111-111111111111")
+        form = _make_form_single_question("Q", ["A"])
+        assert _resolve_pretool_record("@9001", form) is None
+
+    def test_happy_path_returns_record(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9002", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        rec = _resolve_pretool_record("@9002", form)
+        assert rec is not None
+        assert rec.tool_use_id == "toolu_017abcdef01234567890ab"
+
+    def test_caches_after_first_resolve(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9003", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        _resolve_pretool_record("@9003", form)
+        assert "@9003" in _pretool_ask_records
+
+    def test_ttl_expiry_evicts_and_returns_none(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9004", sid)
+        _write_pretool_side_file(
+            _cc_telegram_dir,
+            session_id=sid,
+            written_at=time.time() - _PRETOOL_TTL_SECONDS - 1,
+        )
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        assert _resolve_pretool_record("@9004", form) is None
+        assert "@9004" not in _pretool_ask_records
+
+    def test_pane_drift_evicts_cached_record(self, _cc_telegram_dir):
+        # Cache invariant: a cached record that no longer matches the
+        # live pane is evicted on next call, not stale-served.
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9005", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form_initial = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        rec1 = _resolve_pretool_record("@9005", form_initial)
+        assert rec1 is not None
+        # Pane drifts to a different label set (user moved on).
+        form_drifted = _make_form_single_question("Other Q", ["Cherry", "Date"])
+        rec2 = _resolve_pretool_record("@9005", form_drifted)
+        assert rec2 is None
+        assert "@9005" not in _pretool_ask_records
+
+    def test_corrupt_file_evicts_cached_record(self, _cc_telegram_dir):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9006", sid)
+        _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+        rec1 = _resolve_pretool_record("@9006", form)
+        assert rec1 is not None
+        # Now corrupt the file on disk.
+        (_cc_telegram_dir / "auq_pending" / f"{sid}.json").write_text("{garbage")
+        rec2 = _resolve_pretool_record("@9006", form)
+        assert rec2 is None
+        assert "@9006" not in _pretool_ask_records
+
+    def test_future_written_at_evicts_record(self, _cc_telegram_dir):
+        # Codex chunk-3 P1: a side file with written_at in the future
+        # (clock skew or tampering) MUST be rejected, not stay valid
+        # indefinitely. The reader uses a -30s skew window.
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_FUTURE_SKEW_SECONDS,
+        )
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        # Bind window. Use the real session_manager (NOT iui's patch).
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states["@skew1"] = WindowState(
+            cwd="/tmp/cwd", session_id=sid
+        )
+        try:
+            _write_pretool_side_file(
+                _cc_telegram_dir,
+                session_id=sid,
+                written_at=time.time() + _PRETOOL_FUTURE_SKEW_SECONDS + 60,
+            )
+            form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+            assert _resolve_pretool_record("@skew1", form) is None
+        finally:
+            session_manager.window_states.pop("@skew1", None)
+
+    def test_recent_future_within_skew_window_accepted(self, _cc_telegram_dir):
+        # A tiny clock drift within the skew window must still accept
+        # (NTP can momentarily produce 1-2s of future-drift).
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states["@skew2"] = WindowState(
+            cwd="/tmp/cwd", session_id=sid
+        )
+        try:
+            _write_pretool_side_file(
+                _cc_telegram_dir, session_id=sid, written_at=time.time() + 2
+            )
+            form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+            assert _resolve_pretool_record("@skew2", form) is not None
+        finally:
+            session_manager.window_states.pop("@skew2", None)
+
+    def test_non_uuid_session_id_refused(self, _cc_telegram_dir, caplog):
+        # Codex chunk-3 P2: defense-in-depth against a corrupt
+        # session_map storing a non-UUID session_id that could escape
+        # auq_pending/ via path traversal.
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import _read_pretool_side_file
+
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            assert _read_pretool_side_file("../etc/passwd") is None
+        assert any(
+            "refusing to resolve non-UUID" in r.getMessage() for r in caplog.records
+        )
+
+    def test_fingerprint_is_recomputed_not_trusted_from_file(
+        self, _cc_telegram_dir, tmp_path
+    ):
+        # Codex chunk-3 P1: an attacker (or a malformed write) could
+        # poison the stored input_fingerprint with question text. The
+        # reader MUST recompute the fingerprint from the validated
+        # tool_input and never trust the stored value.
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        # Hand-craft a file with a poisoned input_fingerprint.
+        pending_dir = tmp_path / "auq_pending"
+        pending_dir.mkdir(exist_ok=True)
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        rec = {
+            "schema_version": _PRETOOL_SCHEMA_VERSION,
+            "session_id": sid,
+            "tool_use_id": "tu",
+            "tool_input": tool_input,
+            "written_at": time.time(),
+            "input_fingerprint": "SECRET_QUESTION_TEXT_LEAK",
+        }
+        (pending_dir / f"{sid}.json").write_text(_json.dumps(rec))
+        from cctelegram.handlers.interactive_ui import _read_pretool_side_file
+
+        loaded = _read_pretool_side_file(sid)
+        assert loaded is not None
+        # Recomputed → strict 12-hex, NOT the poisoned value.
+        assert loaded.input_fingerprint != "SECRET_QUESTION_TEXT_LEAK"
+        assert len(loaded.input_fingerprint) == 12
+        assert all(c in "0123456789abcdef" for c in loaded.input_fingerprint)
+
+    def test_peek_does_not_create_window_state(self):
+        # Codex chunk-3 P2: peek must NOT auto-create a WindowState
+        # for an unknown window. _resolve_pretool_record uses peek
+        # so probing for an unknown window doesn't mutate state.
+        from cctelegram.session import peek_session_id_for_window, session_manager
+
+        bogus = "@no-such-window-test"
+        assert bogus not in session_manager.window_states
+        assert peek_session_id_for_window(bogus) is None
+        # Crucially: peek did NOT create an entry.
+        assert bogus not in session_manager.window_states
+
+    def test_rejection_log_omits_question_text(self, _cc_telegram_dir, caplog):
+        # Privacy: rejection reason logs must NOT include question/option
+        # text. Trigger a pane-mismatch rejection and verify the log only
+        # has the reason code + fingerprint.
+        import logging as _logging
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind_window_to_session("@9007", sid)
+        _write_pretool_side_file(
+            _cc_telegram_dir,
+            session_id=sid,
+            questions=[
+                {
+                    "question": "ULTRA_SECRET_QUESTION_TEXT",
+                    "options": [
+                        {"label": "ULTRA_SECRET_LABEL_1"},
+                        {"label": "ULTRA_SECRET_LABEL_2"},
+                    ],
+                }
+            ],
+        )
+        form = _make_form_single_question("Different Q", ["Different Label"])
+        with caplog.at_level(
+            _logging.DEBUG, logger="cctelegram.handlers.interactive_ui"
+        ):
+            rec = _resolve_pretool_record("@9007", form)
+        assert rec is None
+        for record in caplog.records:
+            assert "ULTRA_SECRET" not in record.getMessage()
+
+
+# ── Gate routing (chunk 4): the R2 P1 fix verification ───────────────────
+
+
+@pytest.fixture
+def _pretool_gate_setup(tmp_path, monkeypatch):
+    """Set up CC_TELEGRAM_DIR + clean caches before each gate test."""
+    from cctelegram.handlers import interactive_ui as iui
+
+    monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+    iui._pretool_ask_records.clear()
+    iui._last_completed_ask_tool_input.clear()
+    iui._last_auq_tool_use_id.clear()
+    iui._auq_context_posted.clear()
+    iui._auq_context_msgs.clear()
+    iui._interactive_msgs.clear()
+    iui._interactive_mode.clear()
+    yield tmp_path
+    iui._pretool_ask_records.clear()
+    iui._last_completed_ask_tool_input.clear()
+    iui._last_auq_tool_use_id.clear()
+    iui._auq_context_posted.clear()
+    iui._auq_context_msgs.clear()
+    iui._interactive_msgs.clear()
+    iui._interactive_mode.clear()
+
+
+def _auq_pane_text(*, title: str, labels: list[str]) -> str:
+    """Render a numbered-options AUQ pane (no box-drawing) that the
+    real parse_ask_user_question accepts."""
+    lines = [title, ""]
+    for i, lab in enumerate(labels, start=1):
+        cursor = "❯" if i == 1 else " "
+        lines.append(f"{cursor} {i}. {lab}")
+    lines.append("")
+    lines.append("Enter to select · ↑/↓ to navigate · Esc to cancel")
+    return "\n".join(lines) + "\n"
+
+
+def _bind_window(window_id: str, session_id: str, cwd: str = "/tmp/cwd") -> None:
+    """Bind window_id → session_id in session_manager (sync API)."""
+    from cctelegram.session import WindowState, session_manager
+
+    ws = session_manager.window_states.get(window_id)
+    if ws is None:
+        ws = WindowState(cwd=cwd, session_id=session_id)
+        session_manager.window_states[window_id] = ws
+    else:
+        object.__setattr__(ws, "session_id", session_id)
+
+
+def _extract_gate_source_tag(caplog) -> str | None:
+    """Pull the ``ctx_source=...`` value from the latest gate-eval log."""
+    for record in reversed(caplog.records):
+        msg = record.getMessage()
+        if "AUQ context gate eval" not in msg:
+            continue
+        marker = "ctx_source="
+        idx = msg.find(marker)
+        if idx == -1:
+            continue
+        rest = msg[idx + len(marker) :]
+        end = rest.find(" ")
+        return rest[:end] if end != -1 else rest
+    return None
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestContextGateRouting:
+    """The R2 P1 fix: when a PreToolUse-hook record is present for a
+    live AUQ that hasn't flushed tool_use to JSONL yet, the gate must
+    route ctx_source to ``dict_via_hook`` — not fall through to form.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gate_routes_dict_via_hook_when_pretool_present_no_tool_use_id(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h1"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        labels = ["Apple", "Banana", "Cherry"]
+        title = "Pick a fruit"
+        _bind_window(window_id, session_id)
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            questions=[
+                {
+                    "question": title,
+                    "options": [
+                        {"label": lab, "description": f"about {lab}"} for lab in labels
+                    ],
+                }
+            ],
+        )
+
+        pane_text = _auq_pane_text(title=title, labels=labels)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {
+                window_id: type(
+                    "WS",
+                    (),
+                    {
+                        "window_id": window_id,
+                        "session_id": session_id,
+                        "cwd": "/tmp/cwd",
+                    },
+                )()
+            }
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                # NOTE: _last_auq_tool_use_id is INTENTIONALLY empty —
+                # this is the R2 P1 scenario. Pre-fix, the gate would
+                # have routed to "form" here.
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+        source_tag = _extract_gate_source_tag(caplog)
+        assert source_tag == "dict_via_hook", (
+            f"expected dict_via_hook, got {source_tag!r}. "
+            f"This is the R2 P1 regression test — failure means the gate "
+            f"is silently falling back to form despite a valid hook record."
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_routes_to_form_when_no_pretool_record(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        # No side file written. Today's default behavior — form-source
+        # fallback. Must still work post-patch (regression check).
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h2"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        _bind_window(window_id, session_id)
+        pane_text = _auq_pane_text(title="Q", labels=["A", "B"])
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {}
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+        source_tag = _extract_gate_source_tag(caplog)
+        assert source_tag == "form"
+
+    @pytest.mark.asyncio
+    async def test_gate_routes_dict_via_jsonl_when_both_present(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        # JSONL cache present + pretool record present → JSONL wins
+        # (it's authoritative and carries the JSONL tool_use_id used by
+        # downstream dedup/upgrade paths).
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h3"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        _bind_window(window_id, session_id)
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Q",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
+        # Prime BOTH:
+        iui._last_completed_ask_tool_input[window_id] = tool_input
+        iui._last_auq_tool_use_id[window_id] = "toolu_jsonl_id"
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            questions=tool_input["questions"],
+        )
+        pane_text = _auq_pane_text(title="Q", labels=["A", "B"])
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {}
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+        source_tag = _extract_gate_source_tag(caplog)
+        assert source_tag == "dict_via_jsonl"
+
+    @pytest.mark.asyncio
+    async def test_gate_dedup_key_uses_pretool_fingerprint_when_no_tool_use_id(
+        self, mock_bot: AsyncMock, _pretool_gate_setup, caplog
+    ):
+        # The dedup key when routed via hook: "pretool:<tool_use_id>" if
+        # the hook payload carried tool_use_id, else "pretool:<fp>".
+        # Verify the fingerprint variant.
+        import logging as _logging
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        window_id = "@h4"
+        session_id = "550e8400-e29b-41d4-a716-446655440000"
+        _bind_window(window_id, session_id)
+        # Write side file with empty tool_use_id so the gate falls back
+        # to fingerprint-based dedup key.
+        _write_pretool_side_file(
+            _pretool_gate_setup,
+            session_id=session_id,
+            tool_use_id="",
+            questions=[
+                {
+                    "question": "Q",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ],
+        )
+        pane_text = _auq_pane_text(title="Q", labels=["A", "B"])
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch.object(iui, "tmux_manager") as mock_tmux,
+            patch.object(iui, "session_manager") as mock_sm_iu,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=pane_text)
+            mock_sm_iu.resolve_chat_id.return_value = 100
+            mock_sm_iu.window_states = {}
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            with caplog.at_level(
+                _logging.INFO, logger="cctelegram.handlers.interactive_ui"
+            ):
+                await handle_interactive_ui(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+        # Find the dedup_key value in the gate-eval log line.
+        for record in reversed(caplog.records):
+            msg = record.getMessage()
+            if "AUQ context gate eval" not in msg:
+                continue
+            assert "dedup_key=pretool:" in msg, (
+                f"expected dedup_key=pretool:<fp>, got log: {msg}"
+            )
+            break
+        else:
+            pytest.fail("Did not find AUQ context gate eval log line")
+
+
+# ── Cleanup paths (chunk 5) ───────────────────────────────────────────────
+
+
+class TestPretoolCleanup:
+    """Cleanup of AUQ PreToolUse side files via the lifecycle hooks."""
+
+    def _bind(self, window_id: str, session_id: str) -> None:
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states[window_id] = WindowState(
+            cwd="/tmp/cwd", session_id=session_id
+        )
+
+    def _unbind(self, window_id: str) -> None:
+        from cctelegram.session import session_manager
+
+        session_manager.window_states.pop(window_id, None)
+
+    def test_forget_ask_tool_input_unlinks_side_file_for_current_session(
+        self, _cc_telegram_dir
+    ):
+        from cctelegram.handlers.interactive_ui import forget_ask_tool_input
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind("@cleanup1", sid)
+        try:
+            target = _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+            assert target.exists()
+            forget_ask_tool_input("@cleanup1")
+            assert not target.exists()
+        finally:
+            self._unbind("@cleanup1")
+
+    def test_forget_ask_tool_input_clears_pretool_cache(self, _cc_telegram_dir):
+        from cctelegram.handlers.interactive_ui import (
+            _pretool_ask_records,
+            _resolve_pretool_record,
+            forget_ask_tool_input,
+        )
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        self._bind("@cleanup2", sid)
+        try:
+            _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+            form = _make_form_single_question("Pick a fruit", ["Apple", "Banana"])
+            _resolve_pretool_record("@cleanup2", form)
+            assert "@cleanup2" in _pretool_ask_records
+            forget_ask_tool_input("@cleanup2")
+            assert "@cleanup2" not in _pretool_ask_records
+        finally:
+            self._unbind("@cleanup2")
+
+    def test_unlink_for_session_handles_non_uuid_session_id(self, _cc_telegram_dir):
+        # Defense: a corrupt session_id should not raise — the helper
+        # is best-effort and silently no-ops on non-UUID input.
+        from cctelegram.handlers.interactive_ui import (
+            _unlink_pretool_side_file_for_session,
+        )
+
+        # Should not raise.
+        _unlink_pretool_side_file_for_session("../etc/passwd")
+        _unlink_pretool_side_file_for_session("")
+
+    def test_unlink_for_session_silently_skips_missing_file(self, _cc_telegram_dir):
+        # No file written yet — unlink is silent.
+        from cctelegram.handlers.interactive_ui import (
+            _unlink_pretool_side_file_for_session,
+        )
+
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        _unlink_pretool_side_file_for_session(sid)
+        # No file created either.
+        assert not (_cc_telegram_dir / "auq_pending" / f"{sid}.json").exists()
+
+
+class TestPretoolStartupGC:
+    """Bot-startup garbage collection of stale side files."""
+
+    def test_deletes_files_older_than_1h(self, _cc_telegram_dir):
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_GC_AGE_SECONDS,
+            gc_stale_pretool_side_files,
+        )
+
+        old_sid = "11111111-1111-1111-1111-111111111111"
+        fresh_sid = "22222222-2222-2222-2222-222222222222"
+        old_file = _write_pretool_side_file(_cc_telegram_dir, session_id=old_sid)
+        fresh_file = _write_pretool_side_file(_cc_telegram_dir, session_id=fresh_sid)
+        # Backdate the old file's mtime past the GC cutoff.
+        old_mtime = time.time() - _PRETOOL_GC_AGE_SECONDS - 60
+        import os as _os
+
+        _os.utime(old_file, (old_mtime, old_mtime))
+
+        deleted = gc_stale_pretool_side_files()
+        assert deleted == 1
+        assert not old_file.exists()
+        assert fresh_file.exists()
+
+    def test_no_dir_no_action(self, tmp_path, monkeypatch):
+        # GC must not crash if auq_pending/ doesn't exist yet.
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        from cctelegram.handlers.interactive_ui import gc_stale_pretool_side_files
+
+        assert gc_stale_pretool_side_files() == 0
+
+    def test_gc_skips_unlink_when_file_replaced_during_scan(
+        self, _cc_telegram_dir, monkeypatch
+    ):
+        # Codex P2 (chunk 5): GC re-stats mtime right before unlink to
+        # close the TOCTOU window. Simulate the race by patching the
+        # second stat to return a fresh mtime — file must survive.
+        from pathlib import Path as _PPath
+
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_GC_AGE_SECONDS,
+            gc_stale_pretool_side_files,
+        )
+
+        sid = "11111111-1111-1111-1111-111111111111"
+        target = _write_pretool_side_file(_cc_telegram_dir, session_id=sid)
+        import os as _os
+
+        old_mtime = time.time() - _PRETOOL_GC_AGE_SECONDS - 60
+        _os.utime(target, (old_mtime, old_mtime))
+
+        real_stat = _PPath.stat
+        call_count = {"n": 0}
+
+        def flipping_stat(self, *args, **kwargs):
+            res = real_stat(self, *args, **kwargs)
+            if self.name == f"{sid}.json":
+                call_count["n"] += 1
+                if call_count["n"] >= 2:
+                    # Second stat (re-check) sees a fresh mtime —
+                    # GC must back off and leave the file.
+                    return os.stat_result(
+                        (
+                            res.st_mode,
+                            res.st_ino,
+                            res.st_dev,
+                            res.st_nlink,
+                            res.st_uid,
+                            res.st_gid,
+                            res.st_size,
+                            res.st_atime,
+                            time.time(),  # fresh mtime
+                            res.st_ctime,
+                        )
+                    )
+            return res
+
+        import os
+
+        monkeypatch.setattr(_PPath, "stat", flipping_stat)
+        deleted = gc_stale_pretool_side_files()
+        assert deleted == 0
+        assert target.exists()
+
+    def test_ignores_non_uuid_filenames(self, _cc_telegram_dir):
+        # An entry that doesn't match <uuid>.json (e.g. a leftover
+        # temp file) is left alone, even if older than the cutoff.
+        from cctelegram.handlers.interactive_ui import (
+            _PRETOOL_GC_AGE_SECONDS,
+            gc_stale_pretool_side_files,
+        )
+
+        pending_dir = _cc_telegram_dir / "auq_pending"
+        pending_dir.mkdir(exist_ok=True)
+        non_uuid = pending_dir / "not-a-uuid.json"
+        non_uuid.write_text("{}")
+        old_mtime = time.time() - _PRETOOL_GC_AGE_SECONDS - 60
+        import os as _os
+
+        _os.utime(non_uuid, (old_mtime, old_mtime))
+
+        gc_stale_pretool_side_files()
+        # Non-UUID file untouched.
+        assert non_uuid.exists()
+
+
+class TestPretoolMissingHookWarning:
+    """Bot-startup warning when PreToolUse hook entry is missing."""
+
+    def test_warns_when_settings_file_missing(self, tmp_path, caplog):
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import (
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            warned = warn_if_pre_tool_use_hook_missing(
+                tmp_path / "missing-settings.json"
+            )
+        assert warned is True
+        assert any(
+            "cc-telegram hook --install" in r.getMessage() for r in caplog.records
+        )
+
+    def test_warns_when_pretool_entry_missing(self, tmp_path, caplog):
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import (
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "cc-telegram hook"}]}
+                ]
+            }
+        }
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(_json.dumps(settings))
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            warned = warn_if_pre_tool_use_hook_missing(settings_file)
+        assert warned is True
+        assert any(
+            "cc-telegram hook --install" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_warn_when_pretool_entry_present(self, tmp_path, caplog):
+        import logging as _logging
+
+        from cctelegram.handlers.interactive_ui import (
+            warn_if_pre_tool_use_hook_missing,
+        )
+
+        settings = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": [{"type": "command", "command": "cc-telegram hook"}],
+                    }
+                ]
+            }
+        }
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(_json.dumps(settings))
+        with caplog.at_level(
+            _logging.WARNING, logger="cctelegram.handlers.interactive_ui"
+        ):
+            warned = warn_if_pre_tool_use_hook_missing(settings_file)
+        assert warned is False
+
+
+class TestSessionMonitorClearRace:
+    """Verify the /clear cleanup unlinks the OLD session's side file
+    (codex R2 finding: forget_ask_tool_input runs after session_id swap
+    and would otherwise miss the file)."""
+
+    def test_session_change_unlinks_old_side_file(self, _cc_telegram_dir):
+        # Simulate the cleanup path directly. session_monitor calls
+        # _unlink_pretool_side_file_for_session(old_sid) BEFORE
+        # forget_ask_tool_input(window_id) so the OLD session's file
+        # gets cleaned even though the window's WindowState now points
+        # to the new session.
+        from cctelegram.handlers.interactive_ui import (
+            _unlink_pretool_side_file_for_session,
+        )
+
+        old_sid = "11111111-1111-1111-1111-111111111111"
+        new_sid = "22222222-2222-2222-2222-222222222222"
+        old_file = _write_pretool_side_file(_cc_telegram_dir, session_id=old_sid)
+        # Bind window to NEW session (simulating /clear swap).
+        from cctelegram.session import WindowState, session_manager
+
+        session_manager.window_states["@race1"] = WindowState(
+            cwd="/tmp/cwd", session_id=new_sid
+        )
+        try:
+            assert old_file.exists()
+            _unlink_pretool_side_file_for_session(old_sid)
+            assert not old_file.exists()
+        finally:
+            session_manager.window_states.pop("@race1", None)
+
+
+class TestGateDedupAcrossPretoolToJsonl:
+    """Codex chunk-3+4 P2 delta: directly verify the gate's dedup-key
+    transition. A `pretool:<fp>` claim must block a subsequent JSONL
+    `tool_use_id` claim — no duplicate post."""
+
+    def test_pretool_claim_blocks_subsequent_jsonl_claim(self, _cc_telegram_dir):
+        from cctelegram.handlers.interactive_ui import (
+            _auq_context_posted,
+            claim_auq_context_post,
+        )
+
+        window_id = "@dedup1"
+        _auq_context_posted.pop(window_id, None)
+        # First: pretool claim with fingerprint-based key.
+        assert claim_auq_context_post(window_id, "pretool:abc123") is True
+        # Second: JSONL tool_use_id arrives (different key) → blocked.
+        assert claim_auq_context_post(window_id, "toolu_jsonl_id") is False
+        _auq_context_posted.pop(window_id, None)
