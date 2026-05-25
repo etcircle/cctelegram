@@ -373,7 +373,16 @@ async def update_status_message(
                 window_id,
             )
             return
-        await clear_interactive_msg(user_id, bot, thread_id)
+        # 2026-05-25: pane-absent clear means the AUQ vanished from
+        # Claude's TUI without a Telegram callback (the user never
+        # picked). Could be the user typing the answer in tmux directly
+        # OR Claude auto-resolving (bypassPermissions). Either way, the
+        # user's chat history would otherwise lose all trace of the
+        # picker. Tombstone instead of delete: edits the card body to a
+        # "resolved without Telegram input" notice and strips the
+        # keyboard. The other clear_interactive_msg call sites (topic
+        # close, window switch, callback-handled picks) keep delete.
+        await clear_interactive_msg(user_id, bot, thread_id, tombstone=True)
         _last_published_ui_hash.pop(route, None)
         _absent_streak.pop(route, None)
         should_check_new_ui = False

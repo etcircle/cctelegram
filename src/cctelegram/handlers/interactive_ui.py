@@ -29,6 +29,8 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
+from typing import Any
+
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
 from ..callback_dispatcher import checked_callback_data
@@ -102,6 +104,95 @@ _last_auq_tool_use_id: dict[str, str] = {}
 # window starts with a clean slate. Persisted alongside
 # ``_interactive_msg_meta`` to survive ``launchctl kickstart``.
 _auq_context_posted: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class _ContextMsgRecord:
+    """Sidecar record for a posted AUQ context message.
+
+    Tracks the chunked Telegram ``message_ids`` of a "📋 AskUserQuestion
+    — full details" post so that a later upgrade pass (when JSONL
+    finally flushes the rich dict source with per-option descriptions)
+    can edit the existing message(s) in place rather than spawning a
+    duplicate or leaving the form-source label-only render permanent.
+
+    ``source`` is ``"form"`` for the pane-derived fallback render
+    (commit 603c6bc) and ``"dict"`` for the rich JSONL render. Upgrade
+    runs only when source is ``"form"`` and a dict source arrives.
+    ``render_sha1`` is the SHA-1 of the rendered text (pre-chunking)
+    used to short-circuit a no-op upgrade when the dict source happens
+    to render identically to what's already on Telegram.
+    """
+
+    message_ids: tuple[int, ...]
+    source: str  # "form" | "dict"
+    dedup_key: str
+    tool_use_id: str | None
+    render_sha1: str
+    user_id: int
+    chat_id: int
+    thread_id: int  # 0 ⇔ None (JSON-safe)
+    session_id: str
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "message_ids": list(self.message_ids),
+            "source": self.source,
+            "dedup_key": self.dedup_key,
+            "tool_use_id": self.tool_use_id,
+            "render_sha1": self.render_sha1,
+            "user_id": self.user_id,
+            "chat_id": self.chat_id,
+            "thread_id": self.thread_id,
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_ContextMsgRecord | None":
+        try:
+            mids_raw = d["message_ids"]
+            uid = int(d["user_id"])
+            cid = int(d["chat_id"])
+            tid = int(d.get("thread_id", 0) or 0)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(mids_raw, list) or not mids_raw:
+            return None
+        try:
+            mids = tuple(int(m) for m in mids_raw)
+        except (TypeError, ValueError):
+            return None
+        if any(m <= 0 for m in mids):
+            return None
+        src = d.get("source")
+        if src not in ("form", "dict"):
+            return None
+        dk = d.get("dedup_key")
+        if not isinstance(dk, str) or not dk:
+            return None
+        tuid_raw = d.get("tool_use_id")
+        tuid = str(tuid_raw) if isinstance(tuid_raw, str) else None
+        return cls(
+            message_ids=mids,
+            source=src,
+            dedup_key=dk,
+            tool_use_id=tuid,
+            render_sha1=str(d.get("render_sha1") or ""),
+            user_id=uid,
+            chat_id=cid,
+            thread_id=tid,
+            session_id=str(d.get("session_id") or ""),
+            created_at=str(d.get("created_at") or ""),
+        )
+
+
+# Sidecar to ``_auq_context_posted``: full record of every posted AUQ
+# context message, keyed by window_id. Lets ``maybe_upgrade_auq_context_message``
+# locate and edit the chunked posts when a richer JSONL source arrives.
+# Cleared by ``forget_ask_tool_input`` together with ``_auq_context_posted``.
+_auq_context_msgs: dict[str, _ContextMsgRecord] = {}
 
 
 @dataclass(frozen=True)
@@ -229,13 +320,16 @@ def remember_ask_tool_input(
 def forget_ask_tool_input(window_id: str) -> None:
     """Drop the cached AskUserQuestion input for a window (e.g. on tool_result).
 
-    Also persists the cleared ``_auq_context_posted`` state so a
-    subsequent restart doesn't carry forward a stale claim marker.
+    Also persists the cleared ``_auq_context_posted`` /
+    ``_auq_context_msgs`` state so a subsequent restart doesn't carry
+    forward a stale claim marker or an upgrade record for a resolved
+    AUQ.
     """
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
     had_marker = _auq_context_posted.pop(window_id, None) is not None
-    if had_marker:
+    had_record = _auq_context_msgs.pop(window_id, None) is not None
+    if had_marker or had_record:
         _persist_interactive_state()
 
 
@@ -306,12 +400,15 @@ def _persist_interactive_state() -> None:
     """
     path = _interactive_state_file_path()
     try:
-        data: dict[str, dict] = {
+        data: dict[str, Any] = {
             "interactive_msgs": {
                 f"{u}:{t}": rec.to_dict()
                 for (u, t), rec in _interactive_msg_meta.items()
             },
             "auq_context_posted": dict(_auq_context_posted),
+            "auq_context_msgs": {
+                wid: rec.to_dict() for wid, rec in _auq_context_msgs.items()
+            },
         }
         atomic_write_json(path, data)
     except OSError as exc:
@@ -538,13 +635,41 @@ def hydrate_interactive_state(session_mgr) -> None:
     ):
         pruned_ctx_any = True
 
+    # Hydrate ``auq_context_msgs`` (chunked context-message records used
+    # by ``maybe_upgrade_auq_context_message``). Reject records whose
+    # window is unknown to session_mgr — the picker that anchored them
+    # is gone, no upgrade is possible. Backward compat: missing key is
+    # the pre-upgrade-feature shape; treat as empty.
+    raw_ctx_msgs = data.get("auq_context_msgs")
+    pruned_ctx_msg_any = False
+    if isinstance(raw_ctx_msgs, dict):
+        for wid, payload in raw_ctx_msgs.items():
+            if not isinstance(wid, str) or not isinstance(payload, dict):
+                pruned_ctx_msg_any = True
+                continue
+            if wid not in known_windows:
+                logger.debug(
+                    "AUQ hydrate: pruning stale auq_context_msgs record for "
+                    "unknown window %s",
+                    wid,
+                )
+                pruned_ctx_msg_any = True
+                continue
+            rec = _ContextMsgRecord.from_dict(payload)
+            if rec is None:
+                pruned_ctx_msg_any = True
+                continue
+            _auq_context_msgs[wid] = rec
+
     logger.info(
-        "AUQ hydrate: %d interactive_msg entries, %d context-posted markers",
+        "AUQ hydrate: %d interactive_msg entries, %d context-posted markers, "
+        "%d context_msgs records",
         len(_interactive_msgs),
         len(_auq_context_posted),
+        len(_auq_context_msgs),
     )
 
-    if state_mutated_any or pruned_ctx_any:
+    if state_mutated_any or pruned_ctx_any or pruned_ctx_msg_any:
         _persist_interactive_state()
 
 
@@ -1355,6 +1480,7 @@ async def _send_auq_context_message(
     chat_id: int,
     window_id: str,
     source: dict | AskUserQuestionForm,
+    dedup_key: str,
 ) -> _ContextSendResult:
     """Format and send the AUQ context message (multi-part if needed).
 
@@ -1407,6 +1533,7 @@ async def _send_auq_context_message(
     session_id = session_id_for_window(window_id)
     total = len(parts)
     sent_any = False
+    sent_msg_ids: list[int] = []
     for idx, chunk in enumerate(parts, start=1):
         send_kwargs: dict = dict(
             op="interactive",
@@ -1434,6 +1561,18 @@ async def _send_auq_context_message(
                 total,
                 exc,
             )
+            if sent_any:
+                _record_context_post(
+                    window_id=window_id,
+                    text=text,
+                    source=source,
+                    dedup_key=dedup_key,
+                    message_ids=tuple(sent_msg_ids),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    session_id=session_id,
+                )
             return (
                 _ContextSendResult.PARTIAL_SENT
                 if sent_any
@@ -1447,13 +1586,301 @@ async def _send_auq_context_message(
                 idx,
                 total,
             )
+            if sent_any:
+                _record_context_post(
+                    window_id=window_id,
+                    text=text,
+                    source=source,
+                    dedup_key=dedup_key,
+                    message_ids=tuple(sent_msg_ids),
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    session_id=session_id,
+                )
             return (
                 _ContextSendResult.PARTIAL_SENT
                 if sent_any
                 else _ContextSendResult.NONE_SENT
             )
         sent_any = True
+        sent_msg_ids.append(int(sent.message_id))
+    _record_context_post(
+        window_id=window_id,
+        text=text,
+        source=source,
+        dedup_key=dedup_key,
+        message_ids=tuple(sent_msg_ids),
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        session_id=session_id,
+    )
     return _ContextSendResult.FULL_SENT
+
+
+def _record_context_post(
+    *,
+    window_id: str,
+    text: str,
+    source: dict | AskUserQuestionForm,
+    dedup_key: str,
+    message_ids: tuple[int, ...],
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    session_id: str | None,
+) -> None:
+    """Write ``_auq_context_msgs[window_id]`` after a context-message send.
+
+    Captures everything ``maybe_upgrade_auq_context_message`` later
+    needs: the chunked Telegram ids, the source kind (so the upgrade
+    path knows whether a richer source can replace it), the rendered
+    text's SHA-1 (for no-op upgrade detection), and the route bindings
+    (so an upgrade fired from a non-route context — session_monitor
+    poll loop — still knows where to edit).
+    """
+    src_kind = "dict" if isinstance(source, dict) else "form"
+    render_sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    tool_use_id: str | None = None
+    if isinstance(source, dict):
+        # The dict came from JSONL via _resolve_ask_tool_input, which
+        # doesn't preserve the tool_use_id alongside the input. Look
+        # it up from the cache populated by remember_ask_tool_input.
+        tool_use_id = _last_auq_tool_use_id.get(window_id)
+    _auq_context_msgs[window_id] = _ContextMsgRecord(
+        message_ids=message_ids,
+        source=src_kind,
+        dedup_key=dedup_key,
+        tool_use_id=tool_use_id,
+        render_sha1=render_sha1,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id or 0,
+        session_id=session_id or "",
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    _persist_interactive_state()
+
+
+async def maybe_upgrade_auq_context_message(
+    bot: Bot,
+    window_id: str,
+    *,
+    session_mgr=None,
+) -> bool:
+    """If a form-source context message exists for ``window_id`` and the
+    rich JSONL dict is now cached, edit the message(s) in place to add
+    descriptions.
+
+    Idempotent: returns ``False`` (no action) when:
+      * no context record exists for the window,
+      * the record is already ``source="dict"`` (upgrade ran),
+      * no rich dict is cached in ``_last_completed_ask_tool_input``,
+      * the rich render is byte-identical to the form render (no-op,
+        but the record source is still flipped to ``"dict"`` so a
+        future call short-circuits here).
+
+    On real upgrade: re-renders the dict version, chunks it via
+    ``build_response_parts``, edits each existing message_id in order,
+    and appends new messages for any extra chunks (rich descriptions
+    are much longer than form labels — extra chunks are the common
+    case). Shorter-render edge case (rich is somehow shorter) does
+    NOT trim trailing messages — the leftover chunk(s) just keep the
+    form-source text and aren't strictly correct but also not
+    misleading; pruning would require another pass and is low-value.
+
+    Called from:
+      * ``bot.handle_new_message`` immediately after
+        ``remember_ask_tool_input`` succeeds with a dict input.
+      * ``session_monitor._hydrate_ask_tool_input_cache`` after the
+        same call (covers the case where the bot restarts before the
+        first AUQ tool_result, hydration finds the buffered tool_use,
+        and the originally form-rendered context message gets
+        upgraded).
+
+    Per-route lock serialises upgrade vs. any concurrent send/edit
+    triggered by ``handle_interactive_ui`` for the same route. We can
+    derive the route from the record we persisted at send time.
+    """
+    from telegram.error import RetryAfter
+
+    from .response_builder import build_response_parts
+
+    rec = _auq_context_msgs.get(window_id)
+    if rec is None:
+        return False
+    if rec.source == "dict":
+        return False
+
+    tool_input = _last_completed_ask_tool_input.get(window_id)
+    if not isinstance(tool_input, dict):
+        return False
+
+    new_text = _format_auq_context_message(tool_input)
+    if not new_text.strip():
+        return False
+    new_sha1 = hashlib.sha1(new_text.encode("utf-8")).hexdigest()
+    new_tool_use_id = _last_auq_tool_use_id.get(window_id)
+
+    if session_mgr is None:
+        session_mgr = session_manager
+    thread_id_arg: int | None = rec.thread_id if rec.thread_id else None
+    lock = _get_route_lock(rec.user_id, thread_id_arg)
+    async with lock:
+        # Re-check under lock — a concurrent send/clear may have raced.
+        rec = _auq_context_msgs.get(window_id)
+        if rec is None or rec.source == "dict":
+            return False
+
+        if new_sha1 == rec.render_sha1:
+            # No-op upgrade (rich render byte-identical — e.g. JSONL
+            # descriptions are also empty). Flip source/tool_use_id so
+            # a future call short-circuits without re-rendering.
+            _auq_context_msgs[window_id] = _ContextMsgRecord(
+                message_ids=rec.message_ids,
+                source="dict",
+                dedup_key=new_tool_use_id or rec.dedup_key,
+                tool_use_id=new_tool_use_id,
+                render_sha1=rec.render_sha1,
+                user_id=rec.user_id,
+                chat_id=rec.chat_id,
+                thread_id=rec.thread_id,
+                session_id=rec.session_id,
+                created_at=rec.created_at,
+            )
+            _persist_interactive_state()
+            return False
+
+        new_parts = build_response_parts(
+            new_text, content_type="text", role="assistant"
+        )
+        if not new_parts:
+            return False
+
+        existing_ids = list(rec.message_ids)
+        # Edit phase — overwrite chunks that already exist.
+        edited_ids: list[int] = []
+        for idx, (msg_id, chunk) in enumerate(zip(existing_ids, new_parts), start=1):
+            try:
+                outcome = await topic_edit(
+                    bot,
+                    op="interactive",
+                    user_id=rec.user_id,
+                    chat_id=rec.chat_id,
+                    thread_id=thread_id_arg,
+                    window_id=window_id,
+                    message_id=msg_id,
+                    text=chunk,
+                    plain=True,
+                )
+            except RetryAfter:
+                raise
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "AUQ context-message upgrade edit failed "
+                    "(window=%s, part %d/%d): %s",
+                    window_id,
+                    idx,
+                    len(new_parts),
+                    exc,
+                )
+                # Stop — partial upgrade is acceptable; we'll keep
+                # whatever chunks we managed to edit.
+                break
+            edited_ids.append(msg_id)
+            # MESSAGE_NOT_MODIFIED is fine — count as a successful edit.
+            if outcome not in (
+                TopicSendOutcome.OK,
+                TopicSendOutcome.MESSAGE_NOT_MODIFIED,
+            ):
+                logger.warning(
+                    "AUQ context-message upgrade edit unexpected outcome=%s "
+                    "(window=%s, part %d/%d)",
+                    outcome,
+                    window_id,
+                    idx,
+                    len(new_parts),
+                )
+                break
+
+        # Append phase — if the rich render is longer than the form
+        # render, send the extra chunks. New chunks land at the end of
+        # the chat (the picker card is in between, but Telegram doesn't
+        # let us insert messages between existing ones, and the user's
+        # view already follows the picker — extra chunks land below it,
+        # which is the same shape as the original first-send layout
+        # would have been for a longer text. The tradeoff is acceptable
+        # given the alternative is no descriptions at all).
+        appended_ids: list[int] = []
+        for idx, chunk in enumerate(
+            new_parts[len(existing_ids) :], start=len(existing_ids) + 1
+        ):
+            try:
+                sent, _outcome = await topic_send(
+                    bot,
+                    op="interactive",
+                    user_id=rec.user_id,
+                    chat_id=rec.chat_id,
+                    thread_id=thread_id_arg,
+                    window_id=window_id,
+                    text=chunk,
+                    role="assistant",
+                    content_type="text",
+                    session_id=rec.session_id or session_id_for_window(window_id),
+                    part_index=idx if len(new_parts) > 1 else 0,
+                )
+            except RetryAfter:
+                raise
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "AUQ context-message upgrade append failed "
+                    "(window=%s, part %d/%d): %s",
+                    window_id,
+                    idx,
+                    len(new_parts),
+                    exc,
+                )
+                break
+            if sent is None:
+                logger.warning(
+                    "AUQ context-message upgrade append chunk dropped "
+                    "(window=%s, part %d/%d)",
+                    window_id,
+                    idx,
+                    len(new_parts),
+                )
+                break
+            appended_ids.append(int(sent.message_id))
+
+        final_ids = tuple(edited_ids + appended_ids)
+        if not final_ids:
+            # Nothing landed — keep the existing record unchanged so a
+            # future poll can retry.
+            return False
+
+        _auq_context_msgs[window_id] = _ContextMsgRecord(
+            message_ids=final_ids,
+            source="dict",
+            dedup_key=new_tool_use_id or rec.dedup_key,
+            tool_use_id=new_tool_use_id,
+            render_sha1=new_sha1,
+            user_id=rec.user_id,
+            chat_id=rec.chat_id,
+            thread_id=rec.thread_id,
+            session_id=rec.session_id,
+            created_at=rec.created_at,
+        )
+        _persist_interactive_state()
+        logger.info(
+            "AUQ context-message upgrade: window=%s edited=%d appended=%d "
+            "tool_use_id=%s",
+            window_id,
+            len(edited_ids),
+            len(appended_ids),
+            (new_tool_use_id[:12] if new_tool_use_id else "<none>"),
+        )
+        return True
 
 
 def _clip_card_body(body: str) -> str:
@@ -2626,12 +3053,16 @@ async def handle_interactive_ui(
                     chat_id=chat_id,
                     window_id=window_id,
                     source=ctx_source,
+                    dedup_key=dedup_key,
                 )
                 # Codex v2→v3 P2 #3: rollback the claim ONLY when nothing
                 # landed. PARTIAL_SENT keeps the claim — re-sending would
                 # duplicate the chunks that already reached Telegram.
+                # 2026-05-25: also drop any stale auq_context_msgs record
+                # — if no chunk landed, there's nothing to upgrade later.
                 if ctx_result is _ContextSendResult.NONE_SENT:
                     _auq_context_posted.pop(window_id, None)
+                    _auq_context_msgs.pop(window_id, None)
                     _persist_interactive_state()
 
         # Staleness gate (Wave A, Bug A): if the persisted msg id was
@@ -2825,18 +3256,35 @@ async def handle_interactive_ui(
         return True
 
 
+_TOMBSTONE_TEXT = (
+    "🪦 AskUserQuestion resolved without a Telegram pick.\n"
+    "Claude continued — this picker is no longer active."
+)
+
+
 async def clear_interactive_msg(
     user_id: int,
     bot: Bot | None = None,
     thread_id: int | None = None,
     *,
     session_mgr=None,
+    tombstone: bool = False,
 ) -> None:
     """Clear tracked interactive surfaces (single card + multi-tab session).
 
     PR 3: walks both ``_interactive_msgs`` and ``_multi_tab_sessions``.
     State mutations under the route lock (snapshot + drop + bump
     generation), Telegram deletes outside the lock.
+
+    ``tombstone``: when ``True`` and a single-card msg_id is tracked,
+    edit that message into a non-actionable tombstone (text replaced,
+    reply_markup cleared) instead of deleting it. Used by
+    ``status_polling`` when the pane-absent hysteresis fires: the user
+    never picked an option (no Telegram callback consumed) but Claude
+    Code moved past the AUQ on its own (e.g. bypassPermissions
+    auto-resolution). Without the tombstone the user would wake up to
+    a chat with no record of the question. Multi-tab sessions still
+    delete (lower-priority follow-up — multi-tab stale-clear is rare).
     """
     if session_mgr is None:
         session_mgr = session_manager
@@ -2914,15 +3362,35 @@ async def clear_interactive_msg(
 
     # ── Phase 2: Telegram I/O outside the lock ─────────────────────
     if single_msg_id is not None:
-        await topic_delete(
-            bot,
-            op="interactive",
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=None,
-            message_id=single_msg_id,
-        )
+        if tombstone:
+            # Edit-in-place to a non-actionable tombstone. ``plain=True``
+            # so the emoji + body don't run through MarkdownV2.
+            # ``reply_markup=None`` clears the picker keyboard. If the
+            # edit fails (message deleted, etc.), do NOT fall back to
+            # delete — the user already lost the card once; a missing
+            # tombstone is fine, a phantom delete event is not.
+            await topic_edit(
+                bot,
+                op="interactive",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=cleared_window_id,
+                message_id=single_msg_id,
+                text=_TOMBSTONE_TEXT,
+                plain=True,
+                reply_markup=None,
+            )
+        else:
+            await topic_delete(
+                bot,
+                op="interactive",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=cleared_window_id,
+                message_id=single_msg_id,
+            )
 
     for msg_id in multi_msg_ids:
         if msg_id is None:
@@ -2934,7 +3402,7 @@ async def clear_interactive_msg(
                 user_id=user_id,
                 chat_id=chat_id,
                 thread_id=thread_id,
-                window_id=None,
+                window_id=cleared_window_id,
                 message_id=msg_id,
             )
         except Exception as exc:

@@ -122,6 +122,7 @@ from .handlers.interactive_ui import (
     forget_ask_tool_input,
     handle_interactive_ui,
     has_interactive_surface,
+    maybe_upgrade_auq_context_message,
     remember_ask_tool_input,
     set_interactive_mode,
 )
@@ -857,6 +858,20 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # via the JSONL payload when it dispatches handle_interactive_ui.
             if msg.tool_name == "AskUserQuestion":
                 remember_ask_tool_input(wid, msg.tool_input, msg.tool_use_id)
+                # If a context message was previously posted from the
+                # pane-derived form source (commit 603c6bc), this is
+                # the moment the rich JSONL dict arrives — upgrade the
+                # already-posted Telegram message(s) in place so the
+                # user sees per-option descriptions.
+                if isinstance(msg.tool_input, dict):
+                    try:
+                        await maybe_upgrade_auq_context_message(bot, wid)
+                    except Exception as exc:  # pragma: no cover — defensive
+                        logger.warning(
+                            "maybe_upgrade_auq_context_message raised (window=%s): %s",
+                            wid,
+                            exc,
+                        )
             # Flush pending content for THIS route only — unrelated topics
             # must not delay the interactive prompt.
             queue = get_content_queue((user_id, thread_id or 0, wid))

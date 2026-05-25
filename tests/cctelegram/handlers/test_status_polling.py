@@ -509,7 +509,9 @@ class TestInteractiveModeRaceGuard:
                 if tick + 1 < status_polling.ABSENT_STREAK_THRESHOLD:
                     mock_clear.assert_not_called()
 
-            mock_clear.assert_called_once_with(user_id, mock_bot, thread_id)
+            mock_clear.assert_called_once_with(
+                user_id, mock_bot, thread_id, tombstone=True
+            )
 
 
 # ── Topic existence probe (status_poll_loop) ────────────────────────────────

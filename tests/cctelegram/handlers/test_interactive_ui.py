@@ -894,6 +894,7 @@ class TestSendAuqContextMessage:
                         }
                     ]
                 },
+                dedup_key="t",
             )
 
     @pytest.mark.asyncio
@@ -940,6 +941,7 @@ class TestSendAuqContextMessage:
             chat_id=1,
             window_id="@5",
             source=tool_input,
+            dedup_key="t",
         )
 
         # Two send attempts: chunk 1 ok, chunk 2 failed, stop.
@@ -2565,12 +2567,14 @@ def _isolated_interactive_state_file(tmp_path, monkeypatch):
     iui._interactive_msgs.clear()
     iui._interactive_msg_meta.clear()
     iui._auq_context_posted.clear()
+    iui._auq_context_msgs.clear()
     iui._last_completed_ask_tool_input.clear()
     iui._last_auq_tool_use_id.clear()
     yield fake_interactive_file
     iui._interactive_msgs.clear()
     iui._interactive_msg_meta.clear()
     iui._auq_context_posted.clear()
+    iui._auq_context_msgs.clear()
     iui._last_completed_ask_tool_input.clear()
     iui._last_auq_tool_use_id.clear()
 
@@ -3024,6 +3028,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": []},
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -3043,6 +3048,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -3064,6 +3070,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.FULL_SENT
 
@@ -3083,6 +3090,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -3125,6 +3133,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source=tool_input,
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.PARTIAL_SENT
 
@@ -3165,6 +3174,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source=tool_input,
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.PARTIAL_SENT
 
@@ -3184,6 +3194,7 @@ class TestSendAuqContextMessageTriState:
             chat_id=1,
             window_id="@5",
             source={"questions": [{"question": "Q?"}]},
+            dedup_key="t",
         )
         assert result is iui._ContextSendResult.NONE_SENT
 
@@ -3225,3 +3236,325 @@ class TestPostInitHydrateOrdering:
         rsi_idx = body.index("await session_manager.resolve_stale_ids()")
         hyd_idx = body.index("hydrate_interactive_state(session_manager)")
         assert rsi_idx < hyd_idx
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestClearInteractiveMsgTombstone:
+    """``clear_interactive_msg(tombstone=True)`` edits the single card to a
+    non-actionable tombstone instead of deleting it.
+
+    Set up by ``status_polling`` when the pane-absent hysteresis fires:
+    the user never picked an option (no Telegram callback consumed) but
+    Claude Code moved past the AUQ on its own (e.g. bypassPermissions).
+    Without the tombstone the user's chat would lose all record of the
+    picker; the tombstone preserves the message as an explicit notice.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tombstone_edits_single_card_instead_of_deleting(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        ikey = (1, 42)
+        iui._interactive_msgs[ikey] = 12345
+        iui._interactive_mode[ikey] = "@5"
+
+        edits: list[dict] = []
+        deletes: list[dict] = []
+
+        async def _fake_edit(bot, **kwargs):
+            edits.append(kwargs)
+            return iui.TopicSendOutcome.OK
+
+        async def _fake_delete(bot, **kwargs):
+            deletes.append(kwargs)
+            return iui.TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+        monkeypatch.setattr(iui, "topic_delete", _fake_delete)
+
+        session_mgr = MagicMock()
+        session_mgr.resolve_chat_id = MagicMock(return_value=-100123)
+
+        await iui.clear_interactive_msg(
+            user_id=1,
+            bot=MagicMock(),
+            thread_id=42,
+            session_mgr=session_mgr,
+            tombstone=True,
+        )
+
+        assert len(edits) == 1, edits
+        assert len(deletes) == 0, deletes
+        edit = edits[0]
+        assert edit["message_id"] == 12345
+        assert edit["window_id"] == "@5"
+        assert edit["reply_markup"] is None
+        assert "Telegram pick" in edit["text"]
+        assert edit["plain"] is True
+
+    @pytest.mark.asyncio
+    async def test_tombstone_default_false_still_deletes(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        ikey = (1, 42)
+        iui._interactive_msgs[ikey] = 12345
+        iui._interactive_mode[ikey] = "@5"
+
+        edits: list[dict] = []
+        deletes: list[dict] = []
+
+        async def _fake_edit(bot, **kwargs):
+            edits.append(kwargs)
+            return iui.TopicSendOutcome.OK
+
+        async def _fake_delete(bot, **kwargs):
+            deletes.append(kwargs)
+            return iui.TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+        monkeypatch.setattr(iui, "topic_delete", _fake_delete)
+
+        session_mgr = MagicMock()
+        session_mgr.resolve_chat_id = MagicMock(return_value=-100123)
+
+        await iui.clear_interactive_msg(
+            user_id=1,
+            bot=MagicMock(),
+            thread_id=42,
+            session_mgr=session_mgr,
+        )
+
+        assert len(edits) == 0, edits
+        assert len(deletes) == 1, deletes
+        # The window_id quirk fix: cleared_window_id is propagated.
+        assert deletes[0]["window_id"] == "@5"
+        assert deletes[0]["message_id"] == 12345
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestAuqContextMsgRecordPersistence:
+    """``_auq_context_msgs`` round-trips through interactive_state.json."""
+
+    def test_record_persists_through_persist_then_load(
+        self, _isolated_interactive_state_file
+    ):
+        import json as _json
+
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(42, 43),
+            source="form",
+            dedup_key="form:abc123",
+            tool_use_id=None,
+            render_sha1="deadbeef",
+            user_id=1,
+            chat_id=-100,
+            thread_id=378,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+        iui._persist_interactive_state()
+
+        data = _json.loads(_isolated_interactive_state_file.read_text())
+        assert "auq_context_msgs" in data
+        assert "@5" in data["auq_context_msgs"]
+        payload = data["auq_context_msgs"]["@5"]
+        assert payload["message_ids"] == [42, 43]
+        assert payload["source"] == "form"
+        assert payload["dedup_key"] == "form:abc123"
+        assert payload["tool_use_id"] is None
+
+        rec = iui._ContextMsgRecord.from_dict(payload)
+        assert rec is not None
+        assert rec.message_ids == (42, 43)
+        assert rec.source == "form"
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestMaybeUpgradeAuqContextMessage:
+    """``maybe_upgrade_auq_context_message`` upgrades a form-source post
+    to dict-source by editing the existing Telegram message(s) in place.
+
+    Covers the descriptions-missing bug: live AUQs render only labels
+    from the pane form (commit 603c6bc), and the rich JSONL dict
+    arrives later (when Claude flushes after answer). This test pins
+    the contract: when the dict arrives, edit the message to include
+    descriptions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_upgrade_edits_form_source_to_dict(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Seed: form-source record (label-only) is persisted.
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101,),
+            source="form",
+            dedup_key="form:abc",
+            tool_use_id=None,
+            render_sha1="form-only-sha",
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+
+        # JSONL dict with rich descriptions is now cached.
+        iui._last_completed_ask_tool_input["@5"] = {
+            "questions": [
+                {
+                    "question": "Pick scope",
+                    "options": [
+                        {
+                            "label": "All tabs",
+                            "description": "Patch every extraction tab.",
+                        },
+                        {
+                            "label": "Just one",
+                            "description": "Limit to the visible tab.",
+                        },
+                    ],
+                }
+            ]
+        }
+        iui._last_auq_tool_use_id["@5"] = "toolu_01XYZ"
+
+        edits: list[dict] = []
+        sends: list[dict] = []
+
+        async def _fake_edit(bot, **kwargs):
+            edits.append(kwargs)
+            return iui.TopicSendOutcome.OK
+
+        async def _fake_send(bot, **kwargs):
+            sends.append(kwargs)
+            msg = MagicMock()
+            msg.message_id = 999
+            return msg, iui.TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+        monkeypatch.setattr(iui, "topic_send", _fake_send)
+
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@5"
+        )
+
+        assert result is True
+        assert len(edits) >= 1
+        # The first edit targets the existing message_id.
+        assert edits[0]["message_id"] == 101
+        # The edit text now contains a description fragment.
+        edited_text = edits[0]["text"]
+        assert "Patch every extraction tab." in edited_text
+
+        # Record has been flipped to dict source.
+        rec = iui._auq_context_msgs["@5"]
+        assert rec.source == "dict"
+        assert rec.tool_use_id == "toolu_01XYZ"
+        assert rec.message_ids[0] == 101
+
+    @pytest.mark.asyncio
+    async def test_upgrade_is_noop_when_already_dict(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101,),
+            source="dict",
+            dedup_key="toolu_01XYZ",
+            tool_use_id="toolu_01XYZ",
+            render_sha1="any",
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+
+        called = []
+
+        async def _fake_edit(bot, **kwargs):
+            called.append("edit")
+            return iui.TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@5"
+        )
+
+        assert result is False
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_upgrade_is_noop_when_no_record(self, monkeypatch):
+        from cctelegram.handlers import interactive_ui as iui
+
+        async def _fake_edit(bot, **kwargs):  # pragma: no cover
+            raise AssertionError("edit must not be called")
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@unknown"
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_upgrade_no_op_when_render_identical(self, monkeypatch):
+        """Form-source and dict-source happened to render identically
+        (e.g. descriptions empty in JSONL too). Skip the API call but
+        flip the source so a future call short-circuits."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Prime a dict with no descriptions — renders identically to
+        # what a form with the same labels would render.
+        tool_input = {
+            "questions": [
+                {
+                    "question": "Pick",
+                    "options": [
+                        {"label": "A"},
+                        {"label": "B"},
+                    ],
+                }
+            ]
+        }
+        rendered = iui._format_auq_context_message(tool_input)
+        import hashlib as _hashlib
+
+        identical_sha = _hashlib.sha1(rendered.encode("utf-8")).hexdigest()
+
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101,),
+            source="form",
+            dedup_key="form:abc",
+            tool_use_id=None,
+            render_sha1=identical_sha,
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+        iui._last_completed_ask_tool_input["@5"] = tool_input
+        iui._last_auq_tool_use_id["@5"] = "toolu_01XYZ"
+
+        called: list[str] = []
+
+        async def _fake_edit(bot, **kwargs):  # pragma: no cover
+            called.append("edit")
+            return iui.TopicSendOutcome.OK
+
+        monkeypatch.setattr(iui, "topic_edit", _fake_edit)
+
+        result = await iui.maybe_upgrade_auq_context_message(
+            bot=MagicMock(), window_id="@5"
+        )
+
+        # No-op upgrade returns False but flips the source.
+        assert result is False
+        assert called == []
+        rec = iui._auq_context_msgs["@5"]
+        assert rec.source == "dict"
+        assert rec.tool_use_id == "toolu_01XYZ"
