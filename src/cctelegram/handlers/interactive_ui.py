@@ -307,6 +307,14 @@ def remember_ask_tool_input(
                 # drop the stale context-post marker so the next claim
                 # succeeds for the new AUQ.
                 _auq_context_posted.pop(window_id, None)
+                # Codex P2 round 3 #2 (2026-05-25): also drop the
+                # auq_context_msgs record from the prior lifecycle.
+                # Without this, maybe_upgrade_auq_context_message
+                # would later edit the OLD message_ids with the NEW
+                # question's text (a stale record posing as if it
+                # belongs to the current AUQ) and then mark them
+                # "upgraded" — permanently wrong content.
+                _auq_context_msgs.pop(window_id, None)
         else:
             # Caller doesn't have a tool_use_id (test helper or legacy
             # path). Drop any stale ID + posted state so the context
@@ -315,6 +323,7 @@ def remember_ask_tool_input(
             # 2026-05-22 diff review.
             _last_auq_tool_use_id.pop(window_id, None)
             _auq_context_posted.pop(window_id, None)
+            _auq_context_msgs.pop(window_id, None)
 
 
 def forget_ask_tool_input(window_id: str) -> None:
@@ -1867,7 +1876,16 @@ async def maybe_upgrade_auq_context_message(
         # which is the same shape as the original first-send layout
         # would have been for a longer text. The tradeoff is acceptable
         # given the alternative is no descriptions at all).
+        #
+        # Codex P2 round 3 #1 (2026-05-25): a partial append failure
+        # must NOT commit. Same shape as the partial-edit case: if
+        # we commit source="dict" with edited_ids + a few appended ids,
+        # the tail chunks of the rich render will never get retried,
+        # leaving the context message permanently truncated. Track
+        # append_partial → abort without committing on partial.
         appended_ids: list[int] = []
+        append_partial = False
+        expected_appends = max(0, len(new_parts) - len(existing_ids))
         for idx, chunk in enumerate(
             new_parts[len(existing_ids) :], start=len(existing_ids) + 1
         ):
@@ -1896,6 +1914,7 @@ async def maybe_upgrade_auq_context_message(
                     len(new_parts),
                     exc,
                 )
+                append_partial = True
                 break
             if sent is None:
                 logger.warning(
@@ -1905,8 +1924,28 @@ async def maybe_upgrade_auq_context_message(
                     idx,
                     len(new_parts),
                 )
+                append_partial = True
                 break
             appended_ids.append(int(sent.message_id))
+
+        if append_partial or len(appended_ids) < expected_appends:
+            # Codex P2 round 3 #1: partial append. Do NOT commit —
+            # otherwise tail chunks of the rich render are lost
+            # forever (source="dict" short-circuits future retries).
+            # The already-edited chunks remain edited (their content
+            # is dict-source rich text) and the appended chunks that
+            # landed remain visible — slightly noisy, but next retry
+            # re-edits and re-appends and the noise resolves once
+            # the full upgrade succeeds (extras would render as the
+            # same text Telegram already shows → MESSAGE_NOT_MODIFIED).
+            logger.info(
+                "AUQ context-message upgrade: partial append "
+                "(window=%s, appended %d/%d) — record unchanged for retry",
+                window_id,
+                len(appended_ids),
+                expected_appends,
+            )
+            return False
 
         final_ids = tuple(edited_ids + appended_ids)
         if not final_ids:

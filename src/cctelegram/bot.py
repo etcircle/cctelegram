@@ -1139,6 +1139,13 @@ async def post_init(application: Application) -> None:
         await handle_new_message(msg, application.bot)
 
     monitor.set_message_callback(message_callback)
+    # Wire bot reference for hydrate-time AUQ context-message upgrades
+    # (Codex P2 round 3 #3, 2026-05-25). Without this, a form-source
+    # context message persisted pre-restart wouldn't get its
+    # descriptions edited in once the buffered AUQ is discovered in
+    # JSONL — the normal bot.handle_new_message upgrade hook only fires
+    # for NEW lines, and the buffered AUQ is already past the offset.
+    monitor.set_bot(application.bot)
 
     # Stage 3: event-driven RunState. Gated together with the digest /
     # status_polling RunState reads — flipping the flag wires both ends so

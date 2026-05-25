@@ -3749,3 +3749,49 @@ class TestCodexP2Fixes:
         # Must NOT have committed — source stays "form" for retry.
         assert rec.source == "form"
         assert rec.message_ids == (101, 102)
+
+    def test_remember_clears_auq_context_msgs_on_tool_use_id_rotation(self):
+        """Codex round 3 P2 #2: when remember_ask_tool_input sees a
+        NEW tool_use_id for the same window, it clears _auq_context_posted
+        AND _auq_context_msgs. Without clearing _auq_context_msgs, the
+        next AUQ's dict arrival would trigger maybe_upgrade which would
+        edit the OLD lifecycle's message_ids with the NEW question's
+        text — permanently wrong content."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        # Lifecycle 1: window @5 has a form-source record + an active
+        # tool_use_id from JSONL hydrate.
+        iui._last_auq_tool_use_id["@5"] = "toolu_OLD"
+        iui._auq_context_posted["@5"] = "form:abc"
+        iui._auq_context_msgs["@5"] = iui._ContextMsgRecord(
+            message_ids=(101,),
+            source="form",
+            dedup_key="form:abc",
+            tool_use_id="toolu_OLD",
+            render_sha1="sha-old",
+            user_id=1,
+            chat_id=-100,
+            thread_id=42,
+            session_id="sess-1",
+            created_at="2026-05-25T07:00:00+00:00",
+        )
+
+        # Lifecycle 2: a NEW AUQ arrives in the same window before
+        # tool_result fires for the old one.
+        iui.remember_ask_tool_input(
+            "@5",
+            {"questions": [{"question": "New Q?"}]},
+            "toolu_NEW",
+        )
+
+        # All three records for the old lifecycle MUST be cleared.
+        assert "@5" not in iui._auq_context_posted, (
+            "_auq_context_posted must clear on tool_use_id rotation"
+        )
+        assert "@5" not in iui._auq_context_msgs, (
+            "_auq_context_msgs must clear on tool_use_id rotation — "
+            "leaving the stale record would let maybe_upgrade edit "
+            "the OLD message_ids with the NEW question's text"
+        )
+        # The new lifecycle's cache is in place.
+        assert iui._last_auq_tool_use_id["@5"] == "toolu_NEW"

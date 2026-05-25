@@ -114,6 +114,13 @@ class SessionMonitor:
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
         self._event_callback: Callable[[TranscriptEvent], Awaitable[None]] | None = None
+        # Optional bot reference, set via ``set_bot`` from ``bot.post_init``.
+        # Used by ``_hydrate_ask_tool_input_cache`` to trigger
+        # ``maybe_upgrade_auq_context_message`` when a buffered AUQ is
+        # discovered post-restart and a form-source context message was
+        # persisted pre-restart — without this hook the descriptions
+        # never get edited in after the bot comes back up.
+        self._bot: Any = None
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
@@ -126,6 +133,10 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_bot(self, bot: Any) -> None:
+        """Store a bot reference for hydrate-time AUQ context upgrades."""
+        self._bot = bot
 
     def set_event_callback(
         self, callback: Callable[[TranscriptEvent], Awaitable[None]]
@@ -890,7 +901,10 @@ class SessionMonitor:
         """
         # Deferred import to avoid the circular: interactive_ui imports
         # terminal_parser which imports session_monitor indirectly.
-        from .handlers.interactive_ui import remember_ask_tool_input
+        from .handlers.interactive_ui import (
+            maybe_upgrade_auq_context_message,
+            remember_ask_tool_input,
+        )
 
         if not current_map:
             return
@@ -949,6 +963,28 @@ class SessionMonitor:
                         else 0,
                         jsonl_path.name,
                     )
+                    # Codex P2 round 3 #3 (2026-05-25): a form-source
+                    # context message persisted pre-restart only gets
+                    # its descriptions edited in if maybe_upgrade
+                    # fires for this window. The normal bot.handle_new_message
+                    # hook (bot.py:861) won't fire — that path runs
+                    # on NEW JSONL lines emitted by the polling loop;
+                    # the buffered AUQ is already past the offset.
+                    # Trigger the upgrade explicitly from the hydrate
+                    # path. ``_bot`` is set by bot.post_init via
+                    # ``set_bot``; skip silently if absent (e.g. tests
+                    # that exercise the hydrate path without a bot).
+                    if self._bot is not None:
+                        try:
+                            await maybe_upgrade_auq_context_message(
+                                self._bot, window_id
+                            )
+                        except Exception as upgrade_exc:  # pragma: no cover
+                            logger.warning(
+                                "AUQ hydrate-time upgrade raised (window=%s): %s",
+                                window_id,
+                                upgrade_exc,
+                            )
 
     async def _find_latest_pending_auq(self, jsonl_path: Path) -> dict | None:
         """Return ``{"id": tool_use_id, "input": tool_input}`` for the most
