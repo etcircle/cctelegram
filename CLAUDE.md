@@ -36,7 +36,14 @@ cc-telegram hook --install            # Auto-install Claude Code SessionStart ho
 
 - Config directory: `~/.cc-telegram/` by default, override with `CC_TELEGRAM_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
-- State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets).
+- State files:
+  - `state.json` (thread bindings, window states, display names, read offsets)
+  - `session_map.json` (hook-generated `window_id → session` mapping)
+  - `monitor_state.json` (JSONL byte offsets per tracked session)
+  - `interactive_state.json` (persisted picker msg ids + AUQ context markers; survives `launchctl kickstart`)
+  - `auq_pending/<session_id>.json` (`PreToolUse` side files; one per active AUQ; mode `0600` under directory mode `0700`; auto-GC'd on startup + on pick)
+  - `message_refs.db` (SQLite provenance index; path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`)
+  - `log-archive/` (gzipped log rotations; only if the rotation LaunchAgent is installed)
 
 ## Hook Configuration
 
@@ -50,10 +57,24 @@ Or manually in `~/.claude/settings.json`:
       {
         "hooks": [{ "type": "command", "command": "cc-telegram hook", "timeout": 5 }]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [{ "type": "command", "command": "cc-telegram hook", "timeout": 2 }]
+      }
     ]
   }
 }
 ```
+
+`SessionStart` writes `session_map.json` (window ↔ session resolution). `PreToolUse` (matcher `AskUserQuestion`) captures the structured `tool_input` to `~/.cc-telegram/auq_pending/<session_id>.json` so the bot can render each option's full description in the Telegram picker at first render. The bot logs a one-time startup warning if `PreToolUse` is missing; re-run `cc-telegram hook --install` to repair.
+
+## Documentation conventions
+
+### README sync rule
+
+Any change that adds **a hook** (SessionStart / PreToolUse / Stop / SubagentStop / etc.), **an env var** (`CC_TELEGRAM_*` or external config dependency), **a state file or directory** (under `~/.cc-telegram/` or `~/.claude/`), or **a new external config dependency** (launchd plist, log-rotate agent, etc.) MUST update `README.md` in the same PR — touching at minimum the relevant section among "What it does", "Configure", "Install the Claude Code hook", "State files", "Log rotation", or "Repository layout". Architecture-relevant changes must also update `.claude/rules/architecture.md`. Stale README is a P2 finding in `/codex` and `/hermes` review.
 
 ## Architecture Details
 

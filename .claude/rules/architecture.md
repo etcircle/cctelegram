@@ -49,22 +49,22 @@
 └────────────────────────┘                      ▼
                                     ┌────────────────────────┐
 ┌────────────────────────┐         │  Hook (hook.py)        │
-│  SessionManager        │◄────────│  - Receive hook stdin  │
-│  (session.py)          │  reads  │  - Write session_map   │
-│  - Window ↔ Session    │  map    │    .json               │
-│    resolution          │         └────────────────────────┘
-│  - Thread bindings     │
-│    (topic → window)    │         ┌────────────────────────┐
-│  - Message history     │────────►│  Claude Sessions       │
-│    retrieval           │  reads  │  ~/.claude/projects/   │
-└────────────────────────┘  JSONL  │  - sessions-index      │
-                                   │  - *.jsonl files       │
-┌────────────────────────┐         └────────────────────────┘
-│  MonitorState          │
-│  (monitor_state.py)    │
-│  - Track byte offset   │
-│  - Prevent duplicates  │
-│    after restart       │
+│  SessionManager        │◄────────│  - Dispatch by         │
+│  (session.py)          │  reads  │    hook_event_name:    │
+│  - Window ↔ Session    │  map    │    SessionStart →      │
+│    resolution          │         │      write session_map │
+│  - Thread bindings     │         │    PreToolUse(AUQ) →   │
+│    (topic → window)    │         │      write auq_pending │
+│  - Message history     │────────►│      side file         │
+│    retrieval           │  reads  │  - Receive hook stdin  │
+└────────────────────────┘  JSONL  └────────────────────────┘
+
+┌────────────────────────┐         ┌────────────────────────┐
+│  MonitorState          │         │  Claude Sessions       │
+│  (monitor_state.py)    │         │  ~/.claude/projects/   │
+│  - Track byte offset   │         │  - sessions-index      │
+│  - Prevent duplicates  │         │  - *.jsonl files       │
+│    after restart       │         └────────────────────────┘
 └────────────────────────┘
 
 Additional modules:
@@ -92,9 +92,16 @@ Handler modules (handlers/):
   callback_data.py    ─ Callback data constants
 
 State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
-  state.json         ─ thread bindings + window states + display names + read offsets
-  session_map.json   ─ hook-generated window_id→session mapping
-  monitor_state.json ─ poll progress (byte offset) per JSONL file
+  state.json             ─ thread bindings + window states + display names + read offsets
+  session_map.json       ─ hook-generated window_id→session mapping (SessionStart)
+  monitor_state.json     ─ poll progress (byte offset) per JSONL file
+  interactive_state.json ─ persisted picker msg ids + AUQ context markers
+                           (survives launchctl kickstart)
+  auq_pending/<sid>.json ─ PreToolUse side files for AskUserQuestion;
+                           captures tool_input before Claude renders picker;
+                           dir mode 0700, files mode 0600; auto-GC'd
+  message_refs.db        ─ SQLite provenance index for reply-context resolution
+  log-archive/           ─ gzipped rotations (only if rotation LaunchAgent installed)
 ```
 
 ## Key Design Decisions
@@ -102,6 +109,7 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
 - **Topic-centric** — Each Telegram topic binds to one tmux window. No centralized session list; topics *are* the session list.
 - **Window ID-centric** — All internal state keyed by tmux window ID (e.g. `@0`, `@12`), not window names. Window IDs are guaranteed unique within a tmux server session. Window names are kept as display names via `window_display_names` map. Same directory can have multiple windows.
 - **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; monitor reads it each poll cycle to auto-detect session changes.
+- **PreToolUse(AskUserQuestion) side files** — the `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured `tool_input` to `auq_pending/<session_id>.json` before Claude renders the picker. The bot reads the side file at picker render time so each option's full description is visible in the Telegram context message immediately, not after the user picks. Side files are mode 0600 under a 0700 directory; auto-cleaned on pick and via startup GC. Bot logs a one-time warning if `PreToolUse` is missing from `~/.claude/settings.json`; `cc-telegram hook --install` reinstalls both hooks.
 - **Tool use ↔ tool result pairing** — `tool_use_id` tracked across poll cycles; tool result edits the original tool_use Telegram message in-place.
 - **MarkdownV2 with fallback** — All messages go through `safe_reply`/`safe_edit`/`safe_send` which convert via `telegramify-markdown` and fall back to plain text on parse failure.
 - **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.

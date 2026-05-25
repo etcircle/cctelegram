@@ -8,6 +8,7 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 
 - **Topic-based sessions** — one Telegram topic = one tmux window = one Claude session.
 - **Hook-based session tracking** — Claude Code `SessionStart` writes `session_map.json`, so `/clear` and resumed sessions stay attached to the right topic.
+- **AskUserQuestion descriptions at pick-time** — a `PreToolUse` hook captures the structured `AskUserQuestion` payload before Claude renders the picker, so each option's full description shows in the Telegram context message right away (not after the user picks).
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
 - **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
@@ -92,6 +93,20 @@ Useful behavior knobs:
 - `CC_TELEGRAM_MESSAGE_REFS_DB_PATH` — SQLite path; default `$CC_TELEGRAM_DIR/message_refs.db`.
 - `CC_TELEGRAM_MESSAGE_REF_TEXT_MAX_CHARS` — stored body cap; default `4000`.
 
+### State files
+
+Under `$CC_TELEGRAM_DIR` (default `~/.cc-telegram/`):
+
+- `state.json` — thread bindings, window states, display names, read offsets.
+- `session_map.json` — hook-generated `window_id → session` mapping (written by the `SessionStart` hook).
+- `monitor_state.json` — JSONL byte offsets per tracked session (incremental-read progress).
+- `interactive_state.json` — persisted picker message ids + AUQ context markers (survives bot restart so a `launchctl kickstart` doesn't lose interactive state).
+- `auq_pending/<session_id>.json` — `PreToolUse` side files (one per active AUQ; auto-cleaned after pick; mode `0600` under directory mode `0700`).
+- `message_refs.db` — SQLite provenance index for safer reply-context resolution (path overridable via `CC_TELEGRAM_MESSAGE_REFS_DB_PATH`).
+- `log-archive/` — gzipped log rotations (only present if the rotation LaunchAgent is installed; see "Log rotation").
+
+All state files are safe to delete — the bot re-creates what it needs on next start (you will lose interactive picker continuity and bound topic mappings).
+
 ## Voice transcription
 
 Voice notes are transcribed via a standard OpenAI `POST $OPENAI_BASE_URL/audio/transcriptions` call with `Authorization: Bearer $OPENAI_API_KEY`. Point `OPENAI_BASE_URL` at anything that speaks that shape:
@@ -108,7 +123,7 @@ If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whispe
 uv run cc-telegram hook --install
 ```
 
-This writes/updates `~/.claude/settings.json` with:
+This writes/updates `~/.claude/settings.json` with two managed hook entries:
 
 ```json
 {
@@ -119,10 +134,37 @@ This writes/updates `~/.claude/settings.json` with:
           { "type": "command", "command": "cc-telegram hook", "timeout": 5 }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          { "type": "command", "command": "cc-telegram hook", "timeout": 2 }
+        ]
+      }
     ]
   }
 }
 ```
+
+The `SessionStart` hook writes `session_map.json` so the bot can route messages back to the right tmux window. The `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured question payload before Claude renders the picker — see the next section.
+
+### AskUserQuestion (AUQ) descriptions
+
+When Claude Code calls `AskUserQuestion`, the option descriptions are not visible in the terminal pane until the user picks an option (Claude Code buffers `tool_use` until `tool_result`). The PreToolUse hook captures the structured `tool_input` and writes it to:
+
+```
+<CC_TELEGRAM_DIR>/auq_pending/<session_id>.json   (mode 0600; directory mode 0700)
+```
+
+The bot reads the side file at picker render time so the Telegram context message shows each option's full description right away, not after-the-fact. Side files are:
+
+- Auto-created on each AUQ; the directory and files are mode `0700`/`0600`.
+- Cleaned up after the user picks an option.
+- Garbage-collected on bot startup (any stale entries older than the TTL).
+- Safe to delete the directory at any time; it is re-created on the next AUQ.
+
+If the PreToolUse hook entry is missing from `~/.claude/settings.json`, the bot logs a one-time startup warning and falls back to pane-only descriptions. Re-run `cc-telegram hook --install` to repair.
 
 ## Run
 
