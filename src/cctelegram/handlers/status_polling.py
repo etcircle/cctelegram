@@ -331,10 +331,9 @@ async def update_status_message(
         # the eventual card send would clear the just-published mode with
         # ``msg_id=None`` and drop the card to plain-text fallback. Skip this
         # cycle until the render has actually published a message id.
-        # PR 3: gate on ``has_interactive_surface`` (covers both
-        # single-card ``_interactive_msgs`` and multi-tab
-        # ``_multi_tab_sessions``). ``get_interactive_msg_id`` alone
-        # missed multi-tab sessions and left their cards orphaned.
+        # Gate on ``has_interactive_surface`` rather than
+        # ``get_interactive_msg_id`` so callers reason in terms of
+        # route-owns-a-card semantics.
         if not has_interactive_surface(user_id, thread_id):
             # Publish race: mode set but no card yet. Drop any leftover
             # streak so the new lifecycle starts from zero once published.

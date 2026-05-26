@@ -1,7 +1,8 @@
 """Interactive UI handling for Claude Code prompts.
 
 Handles interactive terminal UIs displayed by Claude Code:
-  - AskUserQuestion: Multi-choice question prompts (single + multi-tab)
+  - AskUserQuestion: Multi-choice question prompts (one rolling card per
+    route; multi-question forms are walked tab-by-tab in the same card).
   - ExitPlanMode: Plan mode exit confirmation
   - Permission Prompt: Tool permission requests
   - RestoreCheckpoint: Checkpoint restoration selection
@@ -10,9 +11,6 @@ Provides:
   - Keyboard navigation (up/down/left/right/enter/esc)
   - Terminal capture and display
   - Interactive mode tracking per user and thread
-  - Multi-tab AskUserQuestion state machine: one Telegram card per
-    question, edit on tab advance, generation-guarded cleanup with
-    orphan rollback.
 
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
@@ -25,7 +23,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -66,7 +64,6 @@ from .message_sender import (
     safe_answer,
     topic_delete,
     topic_edit,
-    topic_edit_reply_markup,
     topic_send,
 )
 
@@ -1107,7 +1104,7 @@ def _record_consistent_with_pane(
 
     Acceptance is structural — NOT digest equality. We compare projected
     fields one at a time so each edge case (title-missing,
-    walkback-only-title, multi-tab subset) has a principled answer.
+    walkback-only-title, multi-question subset) has a principled answer.
     NEVER computes ``AskUserQuestionForm.fingerprint()`` here — that
     includes cursor/recommended/tab state and would reject valid records.
     """
@@ -1137,8 +1134,8 @@ def _record_consistent_with_pane(
                 break
 
     if candidate is None:
-        # Multi-tab fallthrough (current_tab_inferred=False, or no title
-        # match): accept the FIRST question whose labels match the
+        # Multi-question fallthrough (current_tab_inferred=False, or no
+        # title match): accept the FIRST question whose labels match the
         # visible labels as a subsequence.
         for q in raw_questions:
             if not isinstance(q, dict):
@@ -1300,42 +1297,44 @@ def _ask_tool_input_digest(payload: dict | None) -> str | None:
 
 # ── Per-route asyncio.Lock ───────────────────────────────────────────────
 #
-# Lock contract (rewritten for P2.1 — honest version after multi-tab was
-# disabled in PR #14; the original aspirational contract claimed coverage
-# the actual single-card code never honoured):
+# Lock contract — what the route lock actually does today:
 #
-#   ACTUALLY PROTECTED by ``_get_route_lock`` today:
-#     * ``_multi_tab_sessions`` — dormant infra (multi-tab dispatch is
-#       gate-off in ``handle_interactive_ui``). The lock matters here only
-#       because in-flight render coroutines re-check generation under it.
+#   PROTECTED by ``_get_route_lock`` (state held atomically across the
+#   relevant work):
 #     * ``_pick_token_cache`` / ``_pick_tokens`` — pruned under the lock in
-#       ``clear_interactive_msg`` (P2.2) so a concurrent ``handle_interactive_ui``
-#       (which awaits between pane capture and mint) can't post a card whose
-#       tokens point at a cache row the cleanup just dropped.
+#       ``clear_interactive_msg``'s Phase 1 so a concurrent
+#       ``handle_interactive_ui`` (which awaits between pane capture and
+#       mint) can't post a card whose tokens point at a cache row the
+#       cleanup just dropped.
+#     * The AUQ render path in ``handle_interactive_ui`` — context-post +
+#       picker send/edit + attention fallback all run inside the same
+#       ``async with lock`` block. Holding the lock across this Telegram
+#       I/O is intentional: it guarantees that on a single route the
+#       context message lands before the picker, and that two concurrent
+#       callers (status_polling tick vs JSONL-dispatched render) don't
+#       interleave two pickers / two context posts. Cross-route concurrency
+#       is preserved because the lock is per (user_id, thread_id_or_0).
 #
-#   NOT PROTECTED today (single-producer in practice, single-event-loop
-#   means sync dict writes don't interleave with other coroutines'
-#   sync dict writes):
-#     * ``_interactive_msgs`` — written by ``handle_interactive_ui`` and
-#       ``clear_interactive_msg``; the read-then-write inside
-#       ``handle_interactive_ui`` happens after the last await, so a
-#       concurrent clear can't tear it.
-#     * ``_interactive_mode`` — same shape as ``_interactive_msgs``.
+#   NOT PROTECTED (single-event-loop means sync dict writes don't
+#   interleave with other coroutines' sync dict writes):
+#     * ``_interactive_mode`` — written by ``handle_interactive_ui`` and
+#       ``clear_interactive_msg``; dict ops are atomic and the only
+#       observable ordering is the one the lock above already enforces
+#       for the AUQ render path.
 #     * ``_last_completed_ask_tool_input`` — replay cache written by
 #       ``session_monitor`` (single writer) and read everywhere; dict ops
 #       are atomic enough. It is not a live pending-AUQ source.
 #
-#   RELEASED across Telegram I/O awaits — serializing those would stall
-#   multi-route concurrency.
+#   RELEASED between phases:
+#     * ``clear_interactive_msg`` runs Phase 1 (snapshot + drop state +
+#       prune pick-tokens) inside the lock, then releases before Phase 2
+#       (Telegram deletes / tombstone edit / attention dismiss). Phase 2
+#       I/O failures can't strand in-memory state because the drop already
+#       committed.
 #
 #   Non-reentrant: the pick-token callback handler MUST NOT hold the lock
 #   across ``await handle_interactive_ui(...)``. Validate, release, then
 #   call.
-#
-# TO RE-ENABLE MULTI-TAB: re-wrap ``_interactive_msgs`` / ``_interactive_mode``
-# reads/writes in this lock — single-producer assumption breaks once a form
-# has N cards across N tabs in flight. The original contract above is the
-# target shape; git blame this comment for the pre-PR-#14 history.
 #
 # ``_route_locks`` are created on demand and never cleaned up. The keyspace
 # is bounded by (user_id × thread_id) pairs the bot has seen — small in
@@ -1344,61 +1343,24 @@ _route_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
 
 def _get_route_lock(user_id: int, thread_id: int | None) -> asyncio.Lock:
-    """Get or create the per-route lock used by the multi-tab state machine."""
+    """Get or create the per-route lock for AUQ context-post + cleanup ordering."""
     key = (user_id, thread_id or 0)
     if key not in _route_locks:
         _route_locks[key] = asyncio.Lock()
     return _route_locks[key]
 
 
-@dataclass
-class _MultiTabSession:
-    """In-memory state for a live multi-question AskUserQuestion form.
-
-    One session per route. Mutually exclusive with ``_interactive_msgs[key]``
-    — the first-time multi-tab render clears the single-card entry, and
-    cleanup drops both maps atomically.
-
-    ``message_ids`` is a fixed-size list aligned with the questions
-    matrix: ``message_ids[i]`` is the Telegram message_id for tab ``i``,
-    or ``None`` when that tab's card failed to send (partial bundle).
-    PR 3.2 changed this from append-only to fixed-size to fix the
-    index-misalignment bug: if Q1's send failed and Q2's succeeded,
-    the append-only list put Q2's id at message_ids[0], and
-    ``edit_advance`` then targeted the wrong message.
-    """
-
-    window_id: str
-    shape_digest: str  # sha1 over titles + ordered labels + counts
-    message_ids: list[int | None] = field(default_factory=list)
-    current_tab_idx: int = 0
-    # Incremented by cleanup. In-flight render/edit coroutines re-acquire
-    # the lock, compare their captured ``generation_at_entry`` against the
-    # current value, and roll back any side-effects they produced on
-    # mismatch.
-    generation: int = 0
-
-
-_multi_tab_sessions: dict[tuple[int, int], _MultiTabSession] = {}
-
-
-class _RenderCancelled(Exception):
-    """Raised inside a multi-tab render when the route's generation has
-    been bumped (i.e. cleanup fired). Caller catches and rolls back any
-    orphan message IDs produced before the cancellation point.
-    """
-
-
 def has_interactive_surface(user_id: int, thread_id: int | None) -> bool:
-    """True if the route currently owns interactive cards (single OR multi-tab).
+    """True if the route currently owns an interactive card.
 
     Callers in ``bot.py`` (tool_result path) and ``status_polling.py``
     (UI-gone path) gate cleanup on this predicate instead of
-    ``get_interactive_msg_id`` alone, which would miss multi-tab sessions
-    (those don't populate ``_interactive_msgs``).
+    ``get_interactive_msg_id`` alone, because ``get_interactive_msg_id``
+    returns the raw int message_id (which would be a truthy int even if
+    zero) while callers want a clean route-owns-surface predicate.
     """
     key = (user_id, thread_id or 0)
-    return key in _interactive_msgs or key in _multi_tab_sessions
+    return key in _interactive_msgs
 
 
 # ── PR 2b: structured option-pick callback tokens ────────────────────────
@@ -1814,8 +1776,7 @@ _DESCRIPTION_CHAR_CAP = 250
 
 # Hard cap on rendered card body. Matches the message_queue.py merge limit
 # so the renderer can never produce a body that the send layer would have
-# to split (we don't split interactive cards — splitting breaks the
-# message_ids list invariant the multi-tab state machine relies on).
+# to split — interactive cards are one Telegram message per AUQ.
 _CARD_BODY_CHAR_CAP = 3800
 
 
@@ -2665,8 +2626,8 @@ def _build_pick_button_rows(
     Returns an empty list when the form has no options — caller drops the
     structured-pick row and falls back to the keystroke keyboard only.
 
-    PR 3 gates (plan v5):
-      * FA5+ safety — for multi-tab forms (``len(form.questions) > 1``),
+    Gates:
+      * FA5+ safety — for multi-question forms (``len(form.questions) > 1``),
         return [] when ``form.current_tab_inferred == False``. The
         keystroke fallback still lets the user navigate; we MUST NOT
         mint pick buttons because the dispatched digit could answer the
@@ -2699,7 +2660,7 @@ def _build_pick_button_rows(
         )
         return []
 
-    # FA5+: multi-tab form without confirmed current-tab inference.
+    # FA5+: multi-question form without confirmed current-tab inference.
     # Suppress pick buttons entirely — keystroke nav remains.
     # Exception: review screens (Submit/Cancel confirmation) are
     # pane-authoritative — the options come directly from the live
@@ -2907,527 +2868,10 @@ def _build_interactive_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-# ── PR 3: multi-tab AskUserQuestion state machine ───────────────────────
-
-
-def _render_multi_tab_card_body(
-    form: AskUserQuestionForm,
-    tab_idx: int,
-    tab_count: int,
-) -> str:
-    """Render one tab's card body for a multi-question form.
-
-    Builds a synthetic single-question AskUserQuestionForm holding just
-    this tab's data (title, options with descriptions) and feeds it
-    through ``_render_ask_user_question`` so the layout matches the
-    single-card path. A "Qi / N · title" header is prepended so the user
-    can correlate cards.
-    """
-    if tab_idx < 0 or tab_idx >= len(form.questions):
-        return ""
-    q = form.questions[tab_idx]
-    synthetic = AskUserQuestionForm(
-        tabs=(),
-        current_question_title=q.title or None,
-        options=q.options,
-        is_review_screen=False,
-        is_free_text=False,
-        pane_excerpt="",
-        # Empty questions tuple = single-card render path for the layout
-        # (no QS:/INF: fingerprint lines on the synthetic form; we don't
-        # use its fingerprint anyway — the parent multi-tab form's
-        # fingerprint is what binds the pick tokens).
-        questions=(),
-    )
-    body = _render_ask_user_question(synthetic)
-    if not body:
-        return ""
-    header = f"Q{tab_idx + 1} / {tab_count}"
-    return f"{header}\n\n{body}"
-
-
-async def _multi_tab_teardown(
-    bot: Bot,
-    *,
-    user_id: int,
-    chat_id: int,
-    thread_id: int | None,
-    window_id: str,
-    session: _MultiTabSession,
-) -> None:
-    """Best-effort delete every message in a multi-tab session.
-
-    Called by ``clear_interactive_msg`` and by the post-N path when a
-    shape mutation forces teardown. Failures are logged but never
-    raised — a Telegram outage during cleanup leaves visible orphans
-    that the user can dismiss manually; the in-memory state is already
-    correct.
-    """
-    for msg_id in session.message_ids:
-        if msg_id is None:
-            continue  # PR 3.2: tabs that failed to post leave None slots
-        try:
-            await topic_delete(
-                bot,
-                op="interactive",
-                user_id=user_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                window_id=window_id,
-                message_id=msg_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Multi-tab teardown: topic_delete failed for msg=%d (user=%d window=%s): %s",
-                msg_id,
-                user_id,
-                window_id,
-                exc,
-            )
-
-
-async def _handle_multi_tab_ask(
-    bot: Bot,
-    *,
-    user_id: int,
-    thread_id: int | None,
-    chat_id: int,
-    window_id: str,
-    form: AskUserQuestionForm,
-    ui_name: str,
-    rerender_guard: object,
-) -> bool:
-    """State machine for multi-question AskUserQuestion forms.
-
-    Behaviour by entry state:
-
-      * No existing session (first render): post one card per tab; only
-        the inferred current tab carries the option-pick keyboard +
-        keystroke nav. If ``current_tab_inferred`` is False, no card
-        carries pick buttons — keystroke nav only on card 0.
-      * Existing session, same shape_digest (tab advance): edit existing
-        cards in place via ``topic_edit_reply_markup`` (markup-only,
-        body unchanged). Strip keyboard from old current card, attach to
-        new current card.
-      * Existing session, different shape_digest (Claude redrew with new
-        questions): teardown old cards, post fresh N.
-
-    Lock contract: state mutations under ``_get_route_lock``; Telegram
-    I/O outside the lock. Generation captured on entry; mismatch on
-    reacquire = ``_RenderCancelled`` → roll back orphan message IDs.
-    """
-    from ..terminal_parser import _questions_digest
-
-    ikey = (user_id, thread_id or 0)
-    lock = _get_route_lock(user_id, thread_id)
-    shape_digest = _questions_digest(form.questions)
-    tab_count = len(form.questions)
-    current_idx = _find_current_tab_idx(form)
-
-    # ── Phase 1: decide action under lock ────────────────────────────
-    teardown_session: _MultiTabSession | None = None
-    teardown_single_msg_id: int | None = None
-    action: str  # "post_n" or "edit_advance" or "noop"
-    session: _MultiTabSession
-    generation_at_entry: int
-
-    async with lock:
-        # Re-render guard: if the JSONL cache moved on between caller's
-        # release and our entry, abort. Single point that distinguishes
-        # the callback path from the monitor path.
-        if rerender_guard is not _NO_GUARD:
-            current_digest = _ask_tool_input_digest(
-                _last_completed_ask_tool_input.get(window_id)
-            )
-            if current_digest != rerender_guard:
-                logger.info(
-                    "Multi-tab re-render guard tripped (user=%d window=%s): cache changed since callback exit",
-                    user_id,
-                    window_id,
-                )
-                return False
-
-        existing = _multi_tab_sessions.get(ikey)
-        if existing is None:
-            # First-time multi-tab render. If a single-card session exists
-            # for this route, schedule it for deletion (mutual exclusion
-            # — at most one of _interactive_msgs/_multi_tab_sessions is
-            # set per route).
-            teardown_single_msg_id = _clear_interactive_msg(ikey)
-            # PR 3.2: pre-size message_ids to tab_count so indices align
-            # with the questions matrix (was: append-only, broke on
-            # partial bundles).
-            session = _MultiTabSession(
-                window_id=window_id,
-                shape_digest=shape_digest,
-                message_ids=[None] * tab_count,
-                current_tab_idx=current_idx,
-                generation=0,
-            )
-            _multi_tab_sessions[ikey] = session
-            generation_at_entry = session.generation
-            action = "post_n"
-        elif existing.shape_digest != shape_digest:
-            # Shape mutation. Tear down old cards and post fresh N.
-            teardown_session = existing
-            session = _MultiTabSession(
-                window_id=window_id,
-                shape_digest=shape_digest,
-                message_ids=[None] * tab_count,
-                current_tab_idx=current_idx,
-                # Bump generation so any in-flight edit on the old session
-                # rolls back its work.
-                generation=existing.generation + 1,
-            )
-            _multi_tab_sessions[ikey] = session
-            generation_at_entry = session.generation
-            action = "post_n"
-        elif existing.current_tab_idx == current_idx:
-            # Same form, same tab — nothing to do.
-            session = existing
-            generation_at_entry = existing.generation
-            action = "noop"
-        else:
-            # Same form, tab advance.
-            session = existing
-            generation_at_entry = existing.generation
-            action = "edit_advance"
-
-        _interactive_mode[ikey] = window_id
-
-    # ── Phase 2: do Telegram I/O outside the lock ────────────────────
-    if action == "noop":
-        return True
-
-    if teardown_single_msg_id is not None:
-        try:
-            await topic_delete(
-                bot,
-                op="interactive",
-                user_id=user_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                window_id=window_id,
-                message_id=teardown_single_msg_id,
-            )
-        except Exception as exc:
-            logger.debug("Single-card teardown failed (benign): %s", exc)
-
-    if teardown_session is not None:
-        await _multi_tab_teardown(
-            bot,
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            session=teardown_session,
-        )
-
-    if action == "post_n":
-        return await _multi_tab_post_n(
-            bot,
-            user_id=user_id,
-            thread_id=thread_id,
-            chat_id=chat_id,
-            window_id=window_id,
-            form=form,
-            ui_name=ui_name,
-            current_idx=current_idx,
-            tab_count=tab_count,
-            generation_at_entry=generation_at_entry,
-        )
-    # action == "edit_advance"
-    return await _multi_tab_edit_advance(
-        bot,
-        user_id=user_id,
-        thread_id=thread_id,
-        chat_id=chat_id,
-        window_id=window_id,
-        form=form,
-        ui_name=ui_name,
-        new_current_idx=current_idx,
-        generation_at_entry=generation_at_entry,
-    )
-
-
-def _find_current_tab_idx(form: AskUserQuestionForm) -> int:
-    """The current-tab index a multi-tab form is presenting.
-
-    ``resolve_ask_form`` sets the form's ``current_question_title`` /
-    ``options`` to match the inferred current tab. Recover the index by
-    matching the title against the questions matrix; fall through to 0
-    when matching fails (defensive — matches the FA5+ default behaviour).
-    """
-    title = (form.current_question_title or "").strip()
-    if title:
-        for i, q in enumerate(form.questions):
-            if q.title.strip() == title:
-                return i
-    return 0
-
-
-async def _multi_tab_post_n(
-    bot: Bot,
-    *,
-    user_id: int,
-    thread_id: int | None,
-    chat_id: int,
-    window_id: str,
-    form: AskUserQuestionForm,
-    ui_name: str,
-    current_idx: int,
-    tab_count: int,
-    generation_at_entry: int,
-) -> bool:
-    """Post one Telegram card per tab; record message_ids in the session.
-
-    Pick buttons attach to the current tab's card only — and only when
-    ``form.current_tab_inferred`` is True (FA5+ safety). On generation
-    mismatch (cleanup fired mid-post), raise ``_RenderCancelled`` and
-    roll back orphan message IDs.
-    """
-    ikey = (user_id, thread_id or 0)
-    lock = _get_route_lock(user_id, thread_id)
-    orphans: list[int] = []
-
-    # Anchor the first card to the user's prompt message when available.
-    anchor: ReplyParameters | None = None
-    if config.reply_context_enabled:
-        from .message_queue import peek_route_last_user_message
-
-        anchor_id = peek_route_last_user_message(user_id, thread_id, window_id)
-        if anchor_id is not None:
-            anchor = ReplyParameters(message_id=anchor_id)
-    interactive_session_id = session_id_for_window(window_id)
-
-    # Partial-bundle policy (PR 3.2, revised after live testing exposed
-    # PR 3.1 regressions):
-    #
-    # The append-only message_ids list in PR 3.1 broke index alignment:
-    # if Q1's send failed and Q2's succeeded, message_ids became [Q2_id]
-    # and edit_advance treated index 0 as Q1, dispatching keystrokes to
-    # the wrong card. PR 3.2 makes message_ids fixed-size and writes
-    # by tab index, preserving alignment under partial bundles.
-    #
-    # The current-tab card is special: if its send fails, NO card has
-    # the pick keyboard and the user can't click anything. Tear down
-    # the session in that case so the next render starts clean. Other
-    # tabs' failures are non-fatal — the user can still click the
-    # current tab's button and proceed.
-    current_tab_failed = False
-    try:
-        for idx in range(tab_count):
-            body = _render_multi_tab_card_body(form, idx, tab_count)
-            if not body:
-                continue
-
-            # Pick keyboard only on current tab, and only if inference
-            # succeeded (FA5+). Other tabs render with no markup.
-            if idx == current_idx:
-                if form.current_tab_inferred:
-                    pick_rows = _build_pick_button_rows(
-                        user_id, thread_id, window_id, form
-                    )
-                else:
-                    pick_rows = None
-                keyboard = _build_interactive_keyboard(
-                    window_id, ui_name=ui_name, pick_rows=pick_rows
-                )
-            else:
-                keyboard = None
-
-            send_kwargs: dict = dict(
-                op="interactive",
-                user_id=user_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                window_id=window_id,
-                text=body,
-                plain=True,
-                reply_markup=keyboard,
-                role="tool",
-                content_type="tool_use",
-                session_id=interactive_session_id,
-            )
-            # Anchor only on the very first card.
-            if idx == 0 and anchor is not None:
-                send_kwargs["reply_parameters"] = anchor
-
-            sent, _outcome = await topic_send(bot, **send_kwargs)
-            if sent is None:
-                if idx == current_idx:
-                    logger.warning(
-                        "Multi-tab CURRENT-TAB card send failed at idx=%d (user=%d window=%s); tearing down — no card has the keyboard",
-                        idx,
-                        user_id,
-                        window_id,
-                    )
-                    current_tab_failed = True
-                    raise _RenderCancelled()
-                logger.warning(
-                    "Multi-tab non-current card send failed at idx=%d (user=%d window=%s); leaving slot empty",
-                    idx,
-                    user_id,
-                    window_id,
-                )
-                continue
-
-            # Commit the message_id under the lock, with the generation
-            # re-check. If cleanup bumped the generation between the
-            # send and this point, this id is an orphan. Write by index
-            # — message_ids is pre-sized so this preserves alignment
-            # with the questions matrix.
-            async with lock:
-                current = _multi_tab_sessions.get(ikey)
-                if current is None or current.generation != generation_at_entry:
-                    orphans.append(sent.message_id)
-                    raise _RenderCancelled()
-                current.message_ids[idx] = sent.message_id
-    except _RenderCancelled:
-        # Generation guard fired OR current-tab failed. Roll back any
-        # orphans (committed-then-stranded message_ids from the slots
-        # we did write) AND any non-current cards we already posted in
-        # this bundle (they belong to a torn-down session).
-        all_to_delete = list(orphans)
-        async with lock:
-            current = _multi_tab_sessions.get(ikey)
-            if current is not None and current.generation == generation_at_entry:
-                # Collect what we did write before the failure.
-                for mid in current.message_ids:
-                    if mid is not None:
-                        all_to_delete.append(mid)
-                # Drop the session — caller should not see a half-built
-                # state as a live surface.
-                _multi_tab_sessions.pop(ikey, None)
-        for msg_id in all_to_delete:
-            try:
-                await topic_delete(
-                    bot,
-                    op="interactive",
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    window_id=window_id,
-                    message_id=msg_id,
-                )
-            except Exception as exc:
-                logger.debug("Orphan rollback delete failed (benign): %s", exc)
-        return False
-
-    # Total failure (every send returned None somehow without raising)?
-    # Drop the empty session.
-    async with lock:
-        current = _multi_tab_sessions.get(ikey)
-        landed = (
-            sum(1 for m in current.message_ids if m is not None)
-            if current is not None
-            else 0
-        )
-        if landed == 0:
-            existing_for_cleanup = _multi_tab_sessions.get(ikey)
-            if (
-                existing_for_cleanup is not None
-                and existing_for_cleanup.generation == generation_at_entry
-            ):
-                _multi_tab_sessions.pop(ikey, None)
-            return False
-    _ = current_tab_failed  # reserved for diagnostic surfacing later
-    return True
-
-
-async def _multi_tab_edit_advance(
-    bot: Bot,
-    *,
-    user_id: int,
-    thread_id: int | None,
-    chat_id: int,
-    window_id: str,
-    form: AskUserQuestionForm,
-    ui_name: str,
-    new_current_idx: int,
-    generation_at_entry: int,
-) -> bool:
-    """Move the option-pick keyboard between per-tab cards on a tab advance.
-
-    Body text is unchanged (each card already shows its own question's
-    full content); only ``reply_markup`` moves. ``topic_edit_reply_markup``
-    is the markup-only edit API so we never trigger MESSAGE_NOT_MODIFIED
-    on the body.
-    """
-    ikey = (user_id, thread_id or 0)
-    lock = _get_route_lock(user_id, thread_id)
-
-    # Snapshot the old current index under the lock. PR 3.2: message_ids
-    # is now a fixed-size list[int | None] aligned with the questions
-    # matrix; indices are stable, None means that tab's card failed to
-    # send during post_n.
-    async with lock:
-        session = _multi_tab_sessions.get(ikey)
-        if session is None or session.generation != generation_at_entry:
-            return False
-        old_idx = session.current_tab_idx
-        old_msg_id = (
-            session.message_ids[old_idx]
-            if 0 <= old_idx < len(session.message_ids)
-            else None
-        )
-        new_msg_id = (
-            session.message_ids[new_current_idx]
-            if 0 <= new_current_idx < len(session.message_ids)
-            else None
-        )
-
-    if old_msg_id is None or new_msg_id is None:
-        # Partial bundle (some cards failed to post). Session is still
-        # live; keystroke nav continues to work. Return True so the
-        # caller doesn't tear down the surviving cards via
-        # ``has_interactive_surface`` cleanup chain.
-        logger.warning(
-            "Multi-tab edit_advance: missing message_ids (old=%s new=%s); keeping partial session live",
-            old_msg_id,
-            new_msg_id,
-        )
-        return True
-
-    # Build the new keyboard for the new current tab (outside the lock).
-    if form.current_tab_inferred:
-        pick_rows = _build_pick_button_rows(user_id, thread_id, window_id, form)
-    else:
-        pick_rows = None
-    new_keyboard = _build_interactive_keyboard(
-        window_id, ui_name=ui_name, pick_rows=pick_rows
-    )
-
-    # Strip the old current card's keyboard first, then attach the new one.
-    await topic_edit_reply_markup(
-        bot,
-        op="interactive",
-        user_id=user_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        message_id=old_msg_id,
-        reply_markup=None,
-    )
-    await topic_edit_reply_markup(
-        bot,
-        op="interactive",
-        user_id=user_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        message_id=new_msg_id,
-        reply_markup=new_keyboard,
-    )
-
-    # Commit new index.
-    async with lock:
-        session = _multi_tab_sessions.get(ikey)
-        if session is None or session.generation != generation_at_entry:
-            return False
-        session.current_tab_idx = new_current_idx
-
-    return True
+# The per-tab card state machine (PRs #11/12/13) was retired in Wave 2 —
+# git history pre-2026-05-26 has the deleted implementation. Multi-question
+# AskUserQuestion forms are now handled by the single-card path below,
+# which walks tabs in place by editing body+keyboard as the picker advances.
 
 
 async def handle_interactive_ui(
@@ -3526,15 +2970,14 @@ async def handle_interactive_ui(
     # narrows on declarations, not control flow across blocks).
     form: AskUserQuestionForm | None = None
     if content.name == "AskUserQuestion":
-        # Unified resolver (PR 1) feeds both render and validate paths the
-        # same form. Combines JSONL tool_input (full option list with
+        # Unified resolver feeds both render and validate paths the same
+        # form. Combines JSONL tool_input (full option list with
         # descriptions, plus the multi-question matrix) with pane state
         # (cursor / free-text / review-screen flags + current-tab
-        # inference). On multi-tab forms the resolver tracks
-        # ``current_tab_inferred``; if False, PR 3 will gate pick buttons.
-        # For PR 2 the render path is still single-card only, so the flag
-        # is informational here — multi-question pick buttons stay
-        # disabled until PR 3 ships the multi-tab state machine.
+        # inference). For multi-question forms the resolver tracks
+        # ``current_tab_inferred``; the FA5+ guard in
+        # ``_build_pick_button_rows`` suppresses pick buttons when False so
+        # we don't dispatch a digit against the wrong tab.
         resolved_input = _resolve_ask_tool_input(window_id, tool_input)
         form = resolve_ask_form(resolved_input, pane_text)
         if form is None:
@@ -3580,24 +3023,6 @@ async def handle_interactive_ui(
             # agree regardless of cache freshness. Suppressing on
             # stale_fallback alone dropped buttons on legitimate complete
             # contiguous pickers when an earlier AUQ sat in the cache.
-        # Multi-tab dispatch DISABLED at user request (2026-05-15):
-        # PRs #11/12/13 shipped a per-tab card state machine. Live
-        # testing surfaced enough rough edges (timeout cascades,
-        # fingerprint drift, partial-bundle alignment) that the user
-        # explicitly preferred the legacy single-card behaviour, which
-        # they confirmed "works much better" — one rolling card that
-        # updates body+keyboard as the picker advances tab-by-tab.
-        #
-        # The multi-tab state-machine code (``_handle_multi_tab_ask``
-        # and friends) stays in place as dormant infrastructure but is
-        # never reached. Single-card flow below handles every variant,
-        # including multi-question forms: ``resolve_ask_form`` populates
-        # ``current_question_title`` + ``options`` from the inferred
-        # current tab, ``_render_ask_user_question`` renders that tab's
-        # descriptions, and pick buttons + keystroke nav let the user
-        # walk through tabs. To re-enable multi-tab, restore the
-        # ``_handle_multi_tab_ask`` dispatch here after addressing the
-        # live-testing issues.
         if form is not None:
             structured = _render_ask_user_question(form)
             if structured:
@@ -3616,29 +3041,7 @@ async def handle_interactive_ui(
     )
 
     chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
-
-    # PR 3: if we're rendering a single card but an active multi-tab
-    # session exists for this route, the form has changed shape (e.g.
-    # the user reached the review screen, or Claude redrew with a single
-    # question after a multi-tab phase). Tear down the multi-tab cards
-    # before posting / editing the single card so the user doesn't see
-    # both surfaces at once.
-    multi_tab_session_to_clear: _MultiTabSession | None = None
     lock = _get_route_lock(user_id, thread_id)
-    async with lock:
-        existing_multi = _multi_tab_sessions.pop(ikey, None)
-        if existing_multi is not None:
-            existing_multi.generation += 1  # cancel any in-flight edits
-            multi_tab_session_to_clear = existing_multi
-    if multi_tab_session_to_clear is not None:
-        await _multi_tab_teardown(
-            bot,
-            user_id=user_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            window_id=window_id,
-            session=multi_tab_session_to_clear,
-        )
 
     # AUQ context message — posted ONCE per (window_id, tool_use_id)
     # when at least one option description would be truncated by the
@@ -3951,11 +3354,10 @@ async def clear_interactive_msg(
     session_mgr=None,
     tombstone: bool = False,
 ) -> None:
-    """Clear tracked interactive surfaces (single card + multi-tab session).
+    """Clear the tracked interactive single-card surface for this route.
 
-    PR 3: walks both ``_interactive_msgs`` and ``_multi_tab_sessions``.
-    State mutations under the route lock (snapshot + drop + bump
-    generation), Telegram deletes outside the lock.
+    State mutations under the route lock (snapshot + drop), Telegram
+    deletes outside the lock.
 
     ``tombstone``: when ``True`` and a single-card msg_id is tracked,
     edit that message into a non-actionable tombstone (text replaced,
@@ -3964,8 +3366,7 @@ async def clear_interactive_msg(
     never picked an option (no Telegram callback consumed) but Claude
     Code moved past the AUQ on its own (e.g. bypassPermissions
     auto-resolution). Without the tombstone the user would wake up to
-    a chat with no record of the question. Multi-tab sessions still
-    delete (lower-priority follow-up — multi-tab stale-clear is rare).
+    a chat with no record of the question.
     """
     if session_mgr is None:
         session_mgr = session_manager
@@ -3982,14 +3383,6 @@ async def clear_interactive_msg(
         # avoid touching unrelated routes that share a (user, thread)
         # key in ``_pick_tokens``.
         cleared_window_id = _interactive_mode.pop(ikey, None)
-        multi_session = _multi_tab_sessions.pop(ikey, None)
-        if multi_session is not None:
-            # Bump generation so any in-flight render coroutine fails its
-            # re-check and rolls back its orphans.
-            multi_session.generation += 1
-            multi_msg_ids = list(multi_session.message_ids)
-        else:
-            multi_msg_ids = []
 
         # P2.2: prune pick-tokens for this route. Without this, a deleted
         # interactive card leaves its tokens live until the 5-minute TTL,
@@ -4023,11 +3416,10 @@ async def clear_interactive_msg(
                 _pick_token_cache.pop(key, None)
 
     logger.debug(
-        "Clear interactive: user=%d thread=%s single=%s multi_count=%d",
+        "Clear interactive: user=%d thread=%s single=%s",
         user_id,
         thread_id,
         single_msg_id,
-        len(multi_msg_ids),
     )
 
     # Fire lifecycle-end hooks BEFORE Telegram I/O so subscribers (e.g.
@@ -4071,27 +3463,6 @@ async def clear_interactive_msg(
                 thread_id=thread_id,
                 window_id=cleared_window_id,
                 message_id=single_msg_id,
-            )
-
-    for msg_id in multi_msg_ids:
-        if msg_id is None:
-            continue  # PR 3.2: tabs that failed to post leave None slots
-        try:
-            await topic_delete(
-                bot,
-                op="interactive",
-                user_id=user_id,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                window_id=cleared_window_id,
-                message_id=msg_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "clear_interactive_msg: topic_delete failed for msg=%d (user=%d): %s",
-                msg_id,
-                user_id,
-                exc,
             )
 
     await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)

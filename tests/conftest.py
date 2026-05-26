@@ -656,7 +656,6 @@ def _reset_interactive_ui() -> None:
     iu = interactive_ui
     for name in (
         "_interactive_msg_ids",
-        "_interactive_multi_tab_msg_ids",
         "_interactive_modes",
         "_ask_tool_inputs",
         "_aqp_tokens",

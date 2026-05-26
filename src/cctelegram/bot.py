@@ -904,10 +904,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 # UI not rendered — clear the early-set mode
                 clear_interactive_mode(user_id, thread_id)
 
-        # Any non-interactive message means the interaction is complete — delete
-        # all UI cards (single OR multi-tab). PR 3 added ``has_interactive_surface``
-        # to cover both maps; ``get_interactive_msg_id`` alone missed multi-tab
-        # sessions and left their cards orphaned in chat.
+        # Any non-interactive message means the interaction is complete —
+        # delete the UI card. ``has_interactive_surface`` is the bool
+        # predicate the cleanup gate is written against.
         if has_interactive_surface(user_id, thread_id):
             await clear_interactive_msg(
                 user_id, bot, thread_id, session_mgr=session_manager
