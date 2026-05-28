@@ -24,7 +24,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -394,8 +394,11 @@ _RE_TAB_HEADER = re.compile(r"^\s*←\s+(?P<body>.*?)\s*→\s*$")
 # Matches a numbered option: ``❯ 1. Some option label`` or ``  2. Another``.
 # Cursor markers Claude Code uses: ❯, ›, ▶, * .
 _RE_NUMBERED_OPTION = re.compile(
-    r"^(?P<cursor>[❯›▶*)>]\s*|\s+)(?P<num>\d+)\.\s+(?P<label>.+?)\s*$"
+    r"^\s*(?P<cursor>[❯›▶*)>↓]?)\s*(?P<num>\d+)\.\s+(?P<label>.+?)\s*$"
 )
+
+# Option-row checkbox — ASCII brackets, NOT ☐/☒ (those are tab-header only).
+_RE_OPTION_CHECKBOX = re.compile(r"^\s*[❯›▶*)>↓\s]?\s*\d+\.\s+\[(?P<mark>[ ✔xX])\]\s")
 
 # Matches the picker's "Enter to select / Tab / Esc" footer.
 _RE_PICKER_FOOTER = re.compile(r"Enter to select")
@@ -430,6 +433,11 @@ class AskOption:
     # under each label. Excluded from the fingerprint canonical (descriptions
     # can vary cosmetically across redraws and shouldn't invalidate tokens).
     description: str = ""
+    # Multi-select display state from pane checkbox glyphs. True = [✔]/[x]/[X],
+    # False = [ ], None = unknown/off-screen/non-checkbox single-select.
+    # Excluded from equality/canonical/fingerprint: toggles must not stale
+    # sibling tokens, and off-screen unknown must not collapse to False.
+    selected: bool | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -444,6 +452,7 @@ class AskQuestion:
     title: str  # the human-readable question text (``question`` field in JSONL)
     header: str  # short label used for tab cells (``header`` field in JSONL)
     options: tuple[AskOption, ...]
+    multi_select: bool = False
 
 
 @dataclass(frozen=True)
@@ -617,6 +626,7 @@ class AskUserQuestionForm:
     # pane parse and JSONL render share the same defaulted state, fingerprint
     # parity would pass, and dispatching a digit could answer the wrong tab.
     current_tab_inferred: bool = True
+    select_mode: Literal["single", "multi", "unknown"] = "single"
     # Source-of-truth fields used in fingerprinting are above this line.
     # Anything appended below MUST be excluded from ``_canonical_repr`` so
     # adding diagnostic state doesn't break callback tokens minted by
@@ -636,6 +646,7 @@ class AskUserQuestionForm:
     # against a JSONL question would mis-overlay stale labels onto a
     # live pane (wrong-action class bug).
     pane_walkback_title: str | None = field(default=None, compare=False)
+    options_complete: bool = field(default=False, compare=False)
 
     def _canonical_repr(self) -> str:
         """Stable string form used by ``fingerprint``.
@@ -671,6 +682,8 @@ class AskUserQuestionForm:
             f"RVW:{'1' if self.is_review_screen else '0'}",
             f"FT:{'1' if self.is_free_text else '0'}",
         ]
+        if self.select_mode != "single":
+            lines.append(f"SEL:{self.select_mode}")
         if len(self.questions) > 1:
             lines.append(f"QS:{_questions_digest(self.questions)}")
             lines.append(f"INF:{'1' if self.current_tab_inferred else '0'}")
@@ -728,6 +741,90 @@ def _parse_tab_header(line: str) -> tuple[AskTab, ...] | None:
     return tuple(cells)
 
 
+def _checkbox_selected_from_line(line: str) -> bool | None:
+    """Return checkbox selected state for an option row, or None if absent."""
+    match = _RE_OPTION_CHECKBOX.match(line)
+    if match is None:
+        return None
+    mark = match.group("mark")
+    return mark in ("✔", "x", "X")
+
+
+def _strip_option_checkbox(label: str) -> str:
+    """Remove a leading ``[ ]`` / ``[✔]`` checkbox from a parsed option label."""
+    return re.sub(r"^\[[ ✔xX]\]\s+", "", label, count=1)
+
+
+def _pane_glyph_signal(lines: list[str]) -> Literal["single", "multi", "unknown"]:
+    """Classify pane option rows by checkbox glyph presence."""
+    option_rows = []
+    for line in lines:
+        match = _RE_NUMBERED_OPTION.match(line)
+        if match is None:
+            continue
+        label = _strip_option_checkbox(match.group("label").strip())
+        if label == "Chat about this":
+            continue
+        option_rows.append(line)
+    if not option_rows:
+        return "unknown"
+    with_checkbox = sum(1 for line in option_rows if _RE_OPTION_CHECKBOX.match(line))
+    if with_checkbox == len(option_rows):
+        return "multi"
+    if with_checkbox == 0:
+        return "single"
+    return "unknown"
+
+
+_WARNED_MALFORMED_MULTISELECT = False
+
+
+def _warn_malformed_multiselect_once() -> None:
+    """Warn once for malformed JSONL ``multiSelect`` values."""
+    global _WARNED_MALFORMED_MULTISELECT  # noqa: PLW0603
+    if _WARNED_MALFORMED_MULTISELECT:
+        return
+    _WARNED_MALFORMED_MULTISELECT = True
+    logger.warning("AskUserQuestion multiSelect must be boolean when present")
+
+
+def _tool_input_select_mode(
+    tool_input: dict[str, Any],
+) -> Literal["single", "multi", "unknown"]:
+    """Resolve JSONL/side-file select mode from question.multiSelect fields."""
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list):
+        return "single"
+    saw_multi = False
+    for question in questions:
+        if not isinstance(question, dict) or "multiSelect" not in question:
+            continue
+        value = question.get("multiSelect")
+        if not isinstance(value, bool):
+            _warn_malformed_multiselect_once()
+            return "unknown"
+        saw_multi = saw_multi or value
+    return "multi" if saw_multi else "single"
+
+
+def _resolve_select_mode(
+    source_mode: Literal["single", "multi", "unknown"] | None,
+    pane_signal: Literal["single", "multi", "unknown"],
+    *,
+    is_review_screen: bool,
+) -> Literal["single", "multi", "unknown"]:
+    """Apply the PR-B source-vs-pane select-mode decision table."""
+    if is_review_screen:
+        return "single"
+    if source_mode == "unknown" or pane_signal == "unknown":
+        return "unknown" if source_mode is not None else pane_signal
+    if source_mode is None:
+        return pane_signal
+    if source_mode != pane_signal:
+        return "unknown"
+    return source_mode
+
+
 def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
     """Walk lines top-down collecting consecutive numbered options.
 
@@ -760,7 +857,9 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
         except ValueError:
             return ()
         label = m.group("label").strip()
-        cursor = m.group("cursor").strip() in ("❯", "›", "▶", "*")
+        selected = _checkbox_selected_from_line(line)
+        label = _strip_option_checkbox(label)
+        cursor = m.group("cursor").strip() in ("❯", "›", "▶", "*", "↓")
         recommended = bool(_RE_RECOMMENDED.search(label))
         if recommended:
             label = _RE_RECOMMENDED.sub("", label).rstrip()
@@ -770,6 +869,7 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
                 recommended=recommended,
                 cursor=cursor,
                 number=num,
+                selected=selected,
             )
         )
     # Contiguity guard: keep only the longest monotonic +1 prefix starting at
@@ -810,6 +910,7 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
                     cursor=False,
                     number=opt.number,
                     description=opt.description,
+                    selected=opt.selected,
                 )
         if cleared_recommended_idx and not any(o.cursor for o in kept):
             restore_at = cleared_recommended_idx[-1]
@@ -820,6 +921,7 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
                 cursor=True,
                 number=opt.number,
                 description=opt.description,
+                selected=opt.selected,
             )
     return tuple(kept)
 
@@ -858,6 +960,7 @@ def _parse_question_options(options_input: Any) -> tuple[AskOption, ...]:
                 cursor=False,
                 number=idx,
                 description=description.strip(),
+                selected=None,
             )
         )
     return tuple(options)
@@ -906,6 +1009,10 @@ def build_form_from_tool_input(
         return None
 
     parsed_questions: list[AskQuestion] = []
+    multiselect_present = any(
+        isinstance(q, dict) and "multiSelect" in q for q in questions_raw
+    )
+    select_mode = _tool_input_select_mode(tool_input)
     for q in questions_raw:
         if not isinstance(q, dict):
             continue
@@ -923,6 +1030,7 @@ def build_form_from_tool_input(
                 title=title.strip() if isinstance(title, str) else "",
                 header=header.strip() if isinstance(header, str) else "",
                 options=options,
+                multi_select=q.get("multiSelect") is True,
             )
         )
 
@@ -944,6 +1052,9 @@ def build_form_from_tool_input(
         # default to True for back-compat with the single-question render
         # path (which never gates on this flag).
         current_tab_inferred=True,
+        select_mode=select_mode,
+        options_complete=True,
+        _meta={"multiselect_present": "1" if multiselect_present else "0"},
     )
 
 
@@ -1102,6 +1213,12 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         options_region = recent_tail
 
     options = _parse_numbered_options(options_region)
+    pane_signal = _pane_glyph_signal(options_region)
+    select_mode = _resolve_select_mode(
+        None,
+        pane_signal,
+        is_review_screen=is_review,
+    )
 
     # Multi-tab in-region title scan — sets the authoritative
     # ``current_question_title`` for layouts where Claude Code prints
@@ -1170,6 +1287,8 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
         is_free_text=is_free_text,
         pane_excerpt=pane_excerpt,
         pane_walkback_title=pane_walkback_title,
+        select_mode=select_mode,
+        options_complete=False,
     )
 
 
@@ -1345,6 +1464,8 @@ def resolve_ask_form(
                 pane_excerpt=pane_form.pane_excerpt,
                 questions=jsonl_form.questions,
                 current_tab_inferred=False,
+                select_mode="single",
+                options_complete=True,
             )
         # Single-question: keep the JSONL-derived shape but graft live pane
         # state (cursor on the right option, free-text / review-screen
@@ -1360,6 +1481,8 @@ def resolve_ask_form(
                 pane_excerpt=pane_form.pane_excerpt,
                 questions=jsonl_form.questions,
                 current_tab_inferred=True,
+                select_mode=_jsonl_resolved_select_mode(jsonl_form, pane_form),
+                options_complete=True,
             )
         return jsonl_form
 
@@ -1383,6 +1506,8 @@ def resolve_ask_form(
             # mislabel the Submit/Cancel buttons against JSONL labels; the
             # keystroke nav keyboard still lets the user submit / cancel.
             current_tab_inferred=False,
+            select_mode="single",
+            options_complete=True,
         )
 
     # Multi-question: infer the current tab from pane content.
@@ -1434,6 +1559,8 @@ def resolve_ask_form(
         pane_excerpt=pane_form.pane_excerpt if pane_form is not None else "",
         questions=jsonl_form.questions,
         current_tab_inferred=inferred,
+        select_mode=_jsonl_resolved_select_mode(jsonl_form, pane_form),
+        options_complete=True,
     )
 
 
@@ -1473,33 +1600,24 @@ def _strong_match(q: AskQuestion, pane_form: AskUserQuestionForm) -> bool:
     return overlap * 2 >= len(pane_labels)
 
 
-def _overlay_cursor(
+def _overlay_cursor_and_selection(
     jsonl_options: tuple[AskOption, ...],
     pane_options: tuple[AskOption, ...],
 ) -> tuple[AskOption, ...]:
-    """Apply the pane's cursor signal to the JSONL options by index.
+    """Apply pane cursor and visible checkbox selection to JSONL options by number.
 
-    The JSONL payload doesn't carry cursor state; the pane parse does.
-    When the pane has options at the same numeric positions, copy the
-    cursor flag onto the JSONL option so the renderer can highlight the
-    selected row. Labels stay from JSONL (authoritative for order /
-    spelling); cursor flips per pane.
-
-    When the pane scrape detected NO cursor on any option (e.g. the
-    cursor row scrolled out of the captured visible region for a
-    long-description AUQ, or a Claude Code variant uses ANSI inverse-
-    video on the row instead of a literal ``❯``), default the cursor
-    to the first JSONL option. That matches Claude Code's fresh-AUQ
-    behaviour (cursor starts on option 1) and ensures the renderer
-    always shows the user where they are. Pick buttons dispatch by
-    literal number, so a stale-but-visible cursor marker can never
-    mis-route input.
+    Cursor follows the existing overlay rule: if no cursor is visible, default
+    to option 1. Selection is stricter: only visible pane rows are known; JSONL
+    options not present in the pane get ``selected=None`` rather than False.
     """
     cursor_at: int | None = None
+    selected_by_num: dict[int, bool | None] = {}
     for opt in pane_options:
-        if opt.cursor and opt.number is not None:
+        if opt.number is None:
+            continue
+        selected_by_num[opt.number] = opt.selected
+        if opt.cursor and cursor_at is None:
             cursor_at = opt.number
-            break
     if cursor_at is None and jsonl_options:
         cursor_at = jsonl_options[0].number
     if cursor_at is None:
@@ -1511,8 +1629,34 @@ def _overlay_cursor(
             cursor=(o.number == cursor_at),
             number=o.number,
             description=o.description,
+            selected=selected_by_num.get(o.number) if o.number is not None else None,
         )
         for o in jsonl_options
+    )
+
+
+def _overlay_cursor(
+    jsonl_options: tuple[AskOption, ...],
+    pane_options: tuple[AskOption, ...],
+) -> tuple[AskOption, ...]:
+    """Backward-compatible cursor overlay helper."""
+    return _overlay_cursor_and_selection(jsonl_options, pane_options)
+
+
+def _jsonl_resolved_select_mode(
+    jsonl_form: AskUserQuestionForm,
+    pane_form: AskUserQuestionForm | None,
+) -> Literal["single", "multi", "unknown"]:
+    """Resolve select mode when a JSONL/side-file source is present."""
+    if pane_form is None:
+        return jsonl_form.select_mode
+    source_mode: Literal["single", "multi", "unknown"] | None = jsonl_form.select_mode
+    if jsonl_form._meta.get("multiselect_present") == "0":
+        source_mode = None
+    return _resolve_select_mode(
+        source_mode,
+        pane_form.select_mode,
+        is_review_screen=pane_form.is_review_screen,
     )
 
 

@@ -2632,3 +2632,197 @@ class TestDigestSymmetryToolInputVsForm:
             )
         else:
             assert input_pairs[0][1] == form_pairs[0][1]  # labels equal
+
+
+# ── PR-B multi-select detection (plan v7 §9.1) ───────────────────────────
+
+from pathlib import Path  # noqa: E402
+
+from cctelegram.terminal_parser import (  # noqa: E402
+    _overlay_cursor_and_selection,
+    _pane_glyph_signal,
+)
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fixture(name: str) -> str:
+    return (_FIXTURES / name).read_text()
+
+
+class TestPrBMultiSelectDetection:
+    def test_fresh_fixture_detects_multi_unselected_cursor_and_tabs(self):
+        form = parse_ask_user_question(
+            _fixture("auq_multiselect_fresh_tmux_capture.txt")
+        )
+        assert form is not None
+        assert form.select_mode == "multi"
+        assert form.options_complete is False
+        assert form.options[0].cursor is True
+        assert [o.selected for o in form.options[:4]] == [False, False, False, False]
+        assert {t.label for t in form.tabs} >= {"Safeguards", "Submit"}
+
+    def test_two_toggled_fixture_detects_selected_and_cursor(self):
+        form = parse_ask_user_question(
+            _fixture("auq_multiselect_2_toggled_tmux_capture.txt")
+        )
+        assert form is not None
+        assert form.select_mode == "multi"
+        selected = {o.number: o.selected for o in form.options}
+        assert selected[1] is True
+        assert selected[2] is True
+        assert selected[3] is False
+        assert selected[4] is False
+        assert [o.number for o in form.options if o.cursor] == [2]
+
+    def test_ready_to_submit_forces_single_review_screen(self):
+        form = parse_ask_user_question(
+            _fixture("auq_multiselect_ready_to_submit_tmux_capture.txt")
+        )
+        assert form is not None
+        assert form.is_review_screen is True
+        assert form.select_mode == "single"
+        assert [o.label for o in form.options] == ["Submit answers", "Cancel"]
+
+    def test_compressed_fixture_detects_down_cursor_multi_but_incomplete(self):
+        form = parse_ask_user_question(
+            _fixture("auq_multiselect_compressed_long_cursor_only_tmux_capture.txt")
+        )
+        assert form is not None
+        assert form.select_mode == "multi"
+        assert form.options_complete is False
+        assert [o.number for o in form.options] == [3]
+        assert form.options[0].cursor is True
+        assert form.options[0].selected is False
+
+    def test_ascii_checkbox_parsed_header_glyphs_not_option_glyphs(self):
+        pane = (
+            "←  ☐ Header  ☒ Other  ✔ Submit  →\n"
+            "Pick.\n\n"
+            "❯ 1. [ ] A\n"
+            "  2. [✔] B\n"
+            "  3. [x] C\n"
+            "  4. [X] D\n"
+            "\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert form.select_mode == "multi"
+        assert [o.label for o in form.options] == ["A", "B", "C", "D"]
+        assert [o.selected for o in form.options] == [False, True, True, True]
+        assert _pane_glyph_signal(["←  ☐ Header  ☒ Other  ✔ Submit  →"]) == "unknown"
+
+    def test_partial_glyphs_unknown(self):
+        assert _pane_glyph_signal(["❯ 1. [ ] A", "  2. B"]) == "unknown"
+        form = parse_ask_user_question(
+            "Pick.\n\n❯ 1. [ ] A\n  2. B\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        assert form is not None
+        assert form.select_mode == "unknown"
+
+    def test_legacy_single_select_canonical_byte_identical(self):
+        assert _SINGLE_QUESTION_GOLDEN_FORM._canonical_repr() == (
+            "TABS:\n"
+            "Q:Pick one.\n"
+            "OPTS:1:A) First:_:C|2:B) Second:_:_|3:C) Third:R:_\n"
+            "RVW:0\n"
+            "FT:0"
+        )
+        assert _SINGLE_QUESTION_GOLDEN_FORM.fingerprint() == "6651ea1b8174f879"
+
+    def test_selected_flip_does_not_change_canonical(self):
+        a = AskUserQuestionForm(
+            options=(AskOption("A", False, True, 1, selected=False),),
+            select_mode="multi",
+        )
+        b = AskUserQuestionForm(
+            options=(AskOption("A", False, True, 1, selected=True),),
+            select_mode="multi",
+        )
+        assert a._canonical_repr() == b._canonical_repr()
+
+    def test_options_complete_and_selected_none_excluded_from_canonical(self):
+        a = AskUserQuestionForm(
+            options=(AskOption("A", False, True, 1, selected=None),),
+            select_mode="multi",
+            options_complete=False,
+        )
+        b = AskUserQuestionForm(
+            options=(AskOption("A", False, True, 1, selected=False),),
+            select_mode="multi",
+            options_complete=True,
+        )
+        assert a._canonical_repr() == b._canonical_repr()
+
+    def test_build_form_from_tool_input_multiselect_true_is_multi_complete(self):
+        form = build_form_from_tool_input(
+            {
+                "questions": [
+                    {
+                        "question": "Pick safeguards.",
+                        "multiSelect": True,
+                        "options": [{"label": "A"}, {"label": "B"}],
+                    }
+                ]
+            }
+        )
+        assert form is not None
+        assert form.select_mode == "multi"
+        assert form.options_complete is True
+        assert form.questions[0].multi_select is True
+
+    def test_overlay_selection_by_number_and_offscreen_unknown(self):
+        side_options = tuple(
+            AskOption(f"Option {i}", False, False, i) for i in range(1, 6)
+        )
+        pane_options = (AskOption("Option 2", False, True, 2, selected=True),)
+        overlaid = _overlay_cursor_and_selection(side_options, pane_options)
+        assert [o.selected for o in overlaid] == [None, True, None, None, None]
+        assert [o.number for o in overlaid if o.cursor] == [2]
+
+    def test_source_parity_prefers_fresh_side_file_over_stale_cache(
+        self, tmp_path, monkeypatch
+    ):
+        from cctelegram.handlers import interactive_ui as iu
+
+        session_id = "12345678-1234-1234-1234-123456789abc"
+        pane = _fixture("auq_multiselect_compressed_long_cursor_only_tmux_capture.txt")
+        fresh = {
+            "questions": [
+                {
+                    "question": "Pick evidence.",
+                    "multiSelect": True,
+                    "options": [
+                        {"label": "A) Full source parity"},
+                        {"label": "B) Render/validate parity"},
+                        {"label": "C) Unknown-mode suppression"},
+                        {"label": "D) Another safeguard"},
+                    ],
+                }
+            ]
+        }
+        stale = {
+            "questions": [{"question": "Old", "options": [{"label": "Old option"}]}]
+        }
+        pending = tmp_path / "auq_pending"
+        pending.mkdir()
+        (pending / f"{session_id}.json").write_text(
+            __import__("json").dumps(
+                {
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "tool_use_id": "toolu_123",
+                    "written_at": __import__("time").time(),
+                    "tool_input": fresh,
+                }
+            )
+        )
+        monkeypatch.setattr(iu, "app_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            iu, "peek_session_id_for_window", lambda _window_id: session_id
+        )
+        iu._last_completed_ask_tool_input["@1"] = stale
+        try:
+            assert iu._resolve_auq_source("@1", None, pane) == fresh
+        finally:
+            iu._last_completed_ask_tool_input.pop("@1", None)

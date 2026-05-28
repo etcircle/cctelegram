@@ -1080,6 +1080,26 @@ def _resolve_ask_tool_input(window_id: str, explicit: dict | None) -> dict | Non
     return _last_completed_ask_tool_input.get(window_id)
 
 
+def _resolve_auq_source(
+    window_id: str,
+    explicit: dict | None,
+    pane_text: str,
+) -> dict | None:
+    """Resolve pane-aware AUQ source with render/callback parity.
+
+    Live PreToolUse side files win over stale completed-cache entries when the
+    side file validates against the current pane. Explicit JSONL input is next,
+    then the completed replay cache. PR-C wires this into render + callback.
+    """
+    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+    pretool_record = _resolve_pretool_record(window_id, pane_form)
+    if pretool_record is not None:
+        return pretool_record.tool_input
+    if explicit is not None:
+        return explicit
+    return _last_completed_ask_tool_input.get(window_id)
+
+
 # Public sibling-imported alias for use by ``bot.py`` callback handlers.
 # ``_resolve_ask_tool_input`` is module-internal by convention (underscore
 # prefix), but the pick-token callback at ``bot.py:2896`` needs the same
@@ -1353,7 +1373,7 @@ def _record_consistent_with_pane(
     #     parser's docstring — DON'T use it for acceptance)
     #   - candidate has no question title
     candidate_title = (candidate.get("question") or "").strip()
-    if pane_title and candidate_title:
+    if pane_title and candidate_title and pane_form.options_contiguous_from_one():
         if not (
             candidate_title.startswith(pane_title)
             or pane_title.startswith(candidate_title)
