@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 # Status polling interval
 STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
 
+# Best-effort ordering barrier before the poller publishes the FIRST picker for
+# a route. Keep this small: the poller runs at 1Hz, and a stuck content worker
+# must not freeze interactive detection globally. If the route queue is badly
+# backlogged, we prefer rendering late-ish context before the picker when it can
+# finish quickly, then proceed anyway on timeout.
+FIRST_PICKER_CONTENT_DRAIN_TIMEOUT = 2.0
+
 # Watchdog interval for adaptive pane capture. The 1Hz loop still ticks
 # every second so stale-binding cleanup and idle-clear delay processing
 # stay responsive, but the expensive ``capture_pane`` subprocess only
@@ -187,6 +194,29 @@ def _on_interactive_clear(
 
 
 register_clear_callback(_on_interactive_clear)
+
+
+async def _drain_content_queue_before_first_picker_publish(
+    route: tuple[int, int, str],
+) -> None:
+    """Best-effort route-local queue barrier before the first poller picker."""
+    content_queue = get_content_queue(route)
+    if content_queue is None:
+        return
+
+    try:
+        await asyncio.wait_for(
+            content_queue.join(), timeout=FIRST_PICKER_CONTENT_DRAIN_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.debug(
+            "Timed out waiting %.1fs for content queue before first picker publish "
+            "(user=%d, thread=%d, window=%s); rendering picker anyway",
+            FIRST_PICKER_CONTENT_DRAIN_TIMEOUT,
+            route[0],
+            route[1],
+            route[2],
+        )
 
 
 async def update_status_message(
@@ -407,10 +437,16 @@ async def update_status_message(
         # Tag this as the poller call path so handle_interactive_ui can
         # apply AUQ pane-only safety rules when JSONL replay data is absent
         # or stale (render immediately, but suppress unsafe pick buttons).
-        # Store the hash before the await for the same reason as above.
+        # Store the hash before any await so a concurrent tick on the same
+        # route sees it and skips duplicate publish. Only the first publish for
+        # the route waits for same-route content to drain; refreshes must stay
+        # fast so Q2→Q3 transitions do not stall every poll.
+        is_first_publish_for_route = route not in _last_published_ui_hash
         _last_published_ui_hash[route] = hashlib.sha256(
             ui_content.content.encode("utf-8")
         ).hexdigest()
+        if is_first_publish_for_route:
+            await _drain_content_queue_before_first_picker_publish(route)
         await handle_interactive_ui(
             bot, user_id, window_id, thread_id, from_poller=True
         )

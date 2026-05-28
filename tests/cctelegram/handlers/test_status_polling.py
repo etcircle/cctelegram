@@ -82,6 +82,122 @@ class TestStatusPollerSettingsDetection:
             )
 
     @pytest.mark.asyncio
+    async def test_first_picker_publish_drains_route_content_queue_before_render(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """First poller picker waits for same-route content before rendering."""
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        events: list[str] = []
+
+        async def join_content_queue() -> None:
+            events.append("join")
+
+        async def render_picker(*_args, **_kwargs) -> bool:
+            events.append("render")
+            return True
+
+        content_queue = MagicMock()
+        content_queue.join = AsyncMock(side_effect=join_content_queue)
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "get_content_queue", return_value=content_queue
+            ) as mock_get_queue,
+            patch.object(
+                status_polling,
+                "handle_interactive_ui",
+                new_callable=AsyncMock,
+                side_effect=render_picker,
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_get_queue.assert_called_once_with((1, 42, window_id))
+            content_queue.join.assert_awaited_once()
+            mock_handle_ui.assert_awaited_once_with(
+                mock_bot, 1, window_id, 42, from_poller=True
+            )
+            assert events == ["join", "render"]
+
+    @pytest.mark.asyncio
+    async def test_picker_refresh_skips_content_queue_barrier(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """Already-published picker refreshes must not drain content again."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        _interactive_mode[(1, 42)] = window_id
+        status_polling._last_published_ui_hash[route] = "old-picker-hash"
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(status_polling, "get_content_queue") as mock_get_queue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_get_queue.assert_not_called()
+            mock_handle_ui.assert_awaited_once_with(
+                mock_bot, 1, window_id, 42, from_poller=True
+            )
+
+    @pytest.mark.asyncio
+    async def test_first_picker_content_queue_timeout_still_renders(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """The first-publish barrier is bounded: timeout logs and renders anyway."""
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        content_queue = MagicMock()
+        content_queue.join = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "get_content_queue", return_value=content_queue
+            ),
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            content_queue.join.assert_awaited_once()
+            mock_handle_ui.assert_awaited_once_with(
+                mock_bot, 1, window_id, 42, from_poller=True
+            )
+
+    @pytest.mark.asyncio
     async def test_idle_clears_stale_busy_after_delay(self, mock_bot: AsyncMock):
         """Pane with no spinner: wait IDLE_CLEAR_DELAY_SECONDS, then clear once.
 
