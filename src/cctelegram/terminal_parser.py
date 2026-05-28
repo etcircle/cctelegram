@@ -410,6 +410,17 @@ _RE_SUBMIT_PROMPT = re.compile(r"^\s*Ready to submit your answers\?\s*$")
 # Matches a free-text "Type something" option (variant where the user can
 # type free text instead of picking a numbered option).
 _RE_FREE_TEXT_OPTION = re.compile(r"Type something")
+_AFFORDANCE_TRAILING_CHARS = " \t\r\n.!?…。:;,，、"
+
+
+def is_affordance_label(label: str) -> bool:
+    """True for Claude Code picker affordances that are not real options."""
+    normalized = label.strip().rstrip(_AFFORDANCE_TRAILING_CHARS).strip()
+    return (
+        bool(_RE_FREE_TEXT_OPTION.fullmatch(normalized))
+        or normalized == "Chat about this"
+    )
+
 
 # Matches ``(Recommended)`` suffix on an option label. Case-insensitive
 # because Claude Code (and skill prompts) sometimes emit the tag lowercase
@@ -763,7 +774,7 @@ def _pane_glyph_signal(lines: list[str]) -> Literal["single", "multi", "unknown"
         if match is None:
             continue
         label = _strip_option_checkbox(match.group("label").strip())
-        if label == "Chat about this":
+        if is_affordance_label(label):
             continue
         option_rows.append(line)
     if not option_rows:

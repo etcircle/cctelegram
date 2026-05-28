@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "session_id": "4766fb07-7057-4981-9832-93e524ab943e",
+  "tool_use_id": "toolu_01PAfKGvaF1BBvc4dTFggqFj",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "How much should this fix wave cover? (Full tradeoffs are in my message above \u2014 the picker won't show these descriptions, which is the bug we're capturing.)",
+        "header": "Wave scope",
+        "options": [
+          {
+            "label": "Full fix: descriptions + ordering + first-render robustness",
+            "description": "PR-1 (decouple the context-message source from the strict picker validator \u2014 the descriptions fix) + PR-2 (queue.join ordering barrier on the pane path so the summary lands before the picker) + PR-3 (source-rank dedup supersession / side-file upgrade so a first render that fell back to form self-heals when the rich source appears). Codex P1: PR-3 is correctness, not optional. PR-3 touches a locked dedup test (test_interactive_ui_context_dedup_crash.py:232) so it needs your sign-off. Recommended."
+          },
+          {
+            "label": "Descriptions + ordering only (defer the first-render backstop)",
+            "description": "PR-1 + PR-2. Fixes both bugs your screenshot shows. Defers PR-3, so first renders that hit a session-map race / hook lag / missing side file stay degraded for that AUQ with no self-heal. Smaller; does not touch the locked test."
+          },
+          {
+            "label": "Descriptions only (defer ordering too)",
+            "description": "PR-1 alone. Smallest scope. Leaves the 'picker arrives before the summary' ordering bug (the one in your Maintenance-thread screenshot) unfixed for a later wave."
+          }
+        ],
+        "multiSelect": false
+      }
+    ]
+  },
+  "written_at": 1780003067.901883,
+  "input_fingerprint": "698c623eaa43",
+  "transcript_path": "/Users/felixcardix/.claude/projects/-Users-felixcardix-dev-workspaces-cc-telegram/4766fb07-7057-4981-9832-93e524ab943e.jsonl",
+  "cwd": "/Users/felixcardix/dev-workspaces/cc-telegram"
+}

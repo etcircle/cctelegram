@@ -39,6 +39,7 @@ from ..terminal_parser import (
     AskUserQuestionForm,
     build_form_from_tool_input,
     extract_interactive_content,
+    is_affordance_label,
     parse_ask_user_question,
     resolve_ask_form,
     visible_pane_liveness,
@@ -1325,7 +1326,7 @@ def _pane_labels_match_candidate_by_number(
         return _labels_are_subsequence(pane_labels, candidate_labels)
 
     for option in pane_form.options:
-        if option.label in ("Type something", "Chat about this"):
+        if is_affordance_label(option.label):
             continue
         assert option.number is not None
         index = option.number - 1

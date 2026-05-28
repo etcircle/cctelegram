@@ -4063,6 +4063,7 @@ from cctelegram.handlers.interactive_ui import (  # noqa: E402
 from cctelegram.terminal_parser import (  # noqa: E402,F811
     AskOption,
     AskUserQuestionForm,
+    parse_ask_user_question,
     questions_content_digest,
     questions_content_pairs_from_tool_input,
 )
@@ -4303,6 +4304,39 @@ class TestRecordConsistentWithPane:
         ok, reason = _record_consistent_with_pane(rec, form)
         assert ok is True
         assert reason == "ok"
+
+    def test_single_select_affordances_do_not_block_sidefile_descriptions(self):
+        from cctelegram.handlers.interactive_ui import _format_auq_context_message
+
+        fixture_dir = _Path(__file__).parents[1] / "fixtures"
+        sidefile = _json.loads(
+            (
+                fixture_dir / "auq_single_select_with_affordances_sidefile.json"
+            ).read_text()
+        )
+        tool_input = sidefile["tool_input"]
+        pairs = questions_content_pairs_from_tool_input(tool_input)
+        assert pairs is not None
+        rec = PreToolAskRecord(
+            tool_input=tool_input,
+            session_id=sidefile["session_id"],
+            tool_use_id=sidefile["tool_use_id"],
+            written_at=sidefile["written_at"],
+            input_fingerprint=questions_content_digest(pairs),
+        )
+
+        pane_text = (
+            fixture_dir / "auq_single_select_with_affordances_pane.txt"
+        ).read_text()
+        pane_form = parse_ask_user_question(pane_text)
+        assert pane_form is not None
+
+        assert _record_consistent_with_pane(rec, pane_form) == (True, "ok")
+
+        out = _format_auq_context_message(tool_input)
+        options = tool_input["questions"][0]["options"]
+        for option in options:
+            assert option["description"] in out
 
     def test_pane_without_option_numbers_falls_back_to_subsequence(self):
         # Degenerate parser safety: if option numbers are absent, retain the

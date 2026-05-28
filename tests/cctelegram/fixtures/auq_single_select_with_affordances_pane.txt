@@ -1,0 +1,24 @@
+❯ 1. Full fix: descriptions + ordering + first-render robustness
+     PR-1 (decouple the context-message source from the strict picker validator
+     — the descriptions fix) + PR-2 (queue.join ordering barrier on the pane
+     path so the summary lands before the picker) + PR-3 (source-rank dedup
+     supersession / side-file upgrade so a first render that fell back to form
+     self-heals when the rich source appears). Codex P1: PR-3 is correctness,
+     not optional. PR-3 touches a locked dedup test
+     (test_interactive_ui_context_dedup_crash.py:232) so it needs your sign-off.
+     Recommended.
+  2. Descriptions + ordering only (defer the first-render backstop)
+     PR-1 + PR-2. Fixes both bugs your screenshot shows. Defers PR-3, so first
+     renders that hit a session-map race / hook lag / missing side file stay
+     degraded for that AUQ with no self-heal. Smaller; does not touch the locked
+     test.
+  3. Descriptions only (defer ordering too)
+     PR-1 alone. Smallest scope. Leaves the 'picker arrives before the summary'
+     ordering bug (the one in your Maintenance-thread screenshot) unfixed for a
+     later wave.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
