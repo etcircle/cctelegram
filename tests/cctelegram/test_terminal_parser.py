@@ -1371,8 +1371,8 @@ class TestParseAskUserQuestion:
     def test_bug_c_no_cursor_unchanged(self):
         # Mid-redraw: pane scrape catches a frame between cursor draws and
         # no row has ``❯``. Dedup must NOT fire (cursor_count == 0). The
-        # downstream JSONL overlay (``_overlay_cursor``) will default the
-        # cursor to the first JSONL option separately.
+        # downstream JSONL overlay (``_overlay_cursor_and_selection``) will
+        # default the cursor to the first JSONL option separately.
         pane = (
             "  1. Accept all fixes (Recommended)\n"
             "  2. Cherry-pick\n"
@@ -2000,7 +2000,7 @@ class TestResolveAskForm:
         the renderer ended up with cursor=False on every option and the
         user couldn't tell where they were.
 
-        Fix: ``_overlay_cursor`` falls through to ``cursor_at =
+        Fix: ``_overlay_cursor_and_selection`` falls through to ``cursor_at =
         jsonl_options[0].number`` when the pane reports no cursor.
         Matches Claude Code's fresh-AUQ behaviour (cursor starts on
         option 1). Pick buttons dispatch by literal number, so a stale-
