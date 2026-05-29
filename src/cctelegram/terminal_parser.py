@@ -907,55 +907,32 @@ def _parse_numbered_options(lines: list[str]) -> tuple[AskOption, ...]:
             break
         kept.append(opt)
         expected += 1
-    # Bug C dedup: Claude Code's TUI paints ``❯`` on BOTH the Recommended
-    # row (as a visual marker) and the live cursor row. Without
-    # disambiguation the parser reports multi-cursor and the renderer
-    # paints ``❯`` on every flagged row in Telegram. When the user has
-    # moved their cursor away from the Recommended option, the
-    # Recommended ``❯`` is decorative — drop it. If clearing all
-    # Recommended cursor flags would leave zero cursors on a
-    # multi-option form (theoretical: multiple Recommended rows, never
-    # observed), restore on the LAST cleared row to preserve the
-    # renderer's "≥1 cursor visible" invariant.
-    cursor_count = sum(1 for o in kept if o.cursor)
-    if cursor_count > 1:
-        cleared_recommended_idx: list[int] = []
-        for i, opt in enumerate(kept):
-            if opt.cursor and opt.recommended:
-                cleared_recommended_idx.append(i)
-                kept[i] = AskOption(
-                    label=opt.label,
-                    recommended=opt.recommended,
-                    cursor=False,
-                    number=opt.number,
-                    description=opt.description,
-                    selected=opt.selected,
-                )
-        if cleared_recommended_idx and not any(o.cursor for o in kept):
-            restore_at = cleared_recommended_idx[-1]
-            opt = kept[restore_at]
-            kept[restore_at] = AskOption(
-                label=opt.label,
-                recommended=opt.recommended,
-                cursor=True,
-                number=opt.number,
-                description=opt.description,
-                selected=opt.selected,
-            )
-
-    # Stale-scrollback dedup: a ``tmux capture-pane -S -<n>`` of a scrolled
-    # picker retains the pre-scroll top rows — INCLUDING a frozen ``❯`` on
-    # whatever option was the cursor before the viewport scrolled. That stale
-    # ``❯`` is always physically ABOVE the live cursor row (new content scrolls
-    # old rows up into history), so the live cursor is the BOTTOM-MOST ``❯``
-    # (closest to the footer). When more than one cursor still survives, keep
-    # only the last and clear the rest. Without this, a long picker reported
-    # cursor=option-1 forever and ↑/↓ never moved the rendered card
-    # (MESSAGE_NOT_MODIFIED). Validated against live 80x24 captures at cursor
-    # positions 1-5, both navigation directions. Generalizes the Bug-C
-    # recommended-row dedup above (whose decorative-``❯`` trigger no longer
-    # occurs in Claude Code v2.1.x) and runs after it so its restore invariant
-    # is preserved.
+    # Bottom-most-cursor dedup. Claude Code can leave MORE than one ``❯`` in a
+    # captured pane, from two sources that the renderer must collapse to a
+    # single live cursor:
+    #
+    #   1. Stale scrollback — a ``tmux capture-pane -S -<n>`` of a SCROLLED
+    #      picker retains the pre-scroll top rows, INCLUDING a frozen ``❯`` on
+    #      whatever option was the cursor before the viewport scrolled. (Long
+    #      AUQs need the ``-S`` capture so off-screen options are recovered.)
+    #   2. Decorative Recommended marker — older Claude Code TUIs painted a
+    #      second ``❯`` on the ``(Recommended)`` row as well as the live cursor
+    #      row (this no longer occurs in Claude Code v2.1.x, which puts the
+    #      recommendation on a description line and never decorates with ``❯``).
+    #
+    # In BOTH cases the spurious ``❯`` is physically ABOVE the live cursor row:
+    # scrollback history sits above the live viewport, and the Recommended row
+    # is reordered to the top. So the live cursor is unambiguously the
+    # BOTTOM-MOST ``❯`` (closest to the footer). When >1 cursor survives, keep
+    # only the last and clear the rest; this also satisfies the "≥1 cursor
+    # visible" renderer invariant (we never clear the sole survivor).
+    #
+    # This MUST run as the final cursor authority — an earlier recommended-only
+    # dedup would strip the live cursor when it lands on a Recommended option
+    # below a stale scrollback ``❯`` (reported the card as frozen on option 1).
+    # Validated against live 80x24 captures at cursor positions 1-5 (both nav
+    # directions) and the legacy Bug-C dual-cursor / restore cases, which all
+    # resolve to the bottom-most ``❯``.
     cursor_idxs = [i for i, o in enumerate(kept) if o.cursor]
     if len(cursor_idxs) > 1:
         for i in cursor_idxs[:-1]:

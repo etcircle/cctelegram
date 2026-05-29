@@ -5306,3 +5306,65 @@ class TestGateDedupAcrossPretoolToJsonl:
         assert claim_auq_context_post_in_memory(window_id, "toolu_jsonl_id") is None
         _auq_context_posted.pop(window_id, None)
         _auq_context_post_pending.pop(window_id, None)
+
+
+# ── Task #9 — arrow-nav card actually changes (end-to-end render seam) ──────
+#
+# Guards the literal MESSAGE_NOT_MODIFIED regression at the PRODUCTION seam:
+# resolve_ask_form(side_file_dict, pane) -> _render_ask_user_question(form).
+# Pre-fix, every arrow position rendered ❯ on option 1, so the edit was a
+# no-op and Telegram returned MESSAGE_NOT_MODIFIED. These drive the real live
+# captures through the same path the bot uses and assert the card TEXT differs
+# between cursor positions and the ❯ lands on the live option.
+
+import pathlib  # noqa: E402
+
+from cctelegram.terminal_parser import resolve_ask_form  # noqa: E402
+
+_IU_FIXTURES = pathlib.Path(__file__).resolve().parent.parent / "fixtures"
+
+# Realistic side-file dict (4 real options) for the deployment-strategy picker
+# the cursor{3,4} fixtures were captured from. Options 5/6 in the pane are
+# free-text / chat affordances and are not in the side file.
+_DEPLOY_TOOL_INPUT = {
+    "questions": [
+        {
+            "question": "Choose deployment strategy",
+            "options": [
+                {"label": "A) Blue-green rolling", "description": "two envs"},
+                {"label": "B) Direct in-place restart", "description": "downtime"},
+                {"label": "C) Feature-flag dark launch", "description": "ramp"},
+                {"label": "D) Manual staged promotion", "description": "gates"},
+            ],
+        }
+    ]
+}
+
+
+def _render_from_capture(fixture_name: str) -> str:
+    pane = (_IU_FIXTURES / fixture_name).read_text()
+    form = resolve_ask_form(_DEPLOY_TOOL_INPUT, pane)
+    assert form is not None, fixture_name
+    return _render_ask_user_question(form)
+
+
+class TestArrowNavCardChanges:
+    def test_card_text_differs_between_cursor3_and_cursor4(self):
+        card3 = _render_from_capture("auq_single_long_scrolled_cursor3_S500.txt")
+        card4 = _render_from_capture("auq_single_long_scrolled_cursor4_S500.txt")
+        # The regression: pre-fix these were byte-identical -> MESSAGE_NOT_MODIFIED.
+        assert card3 != card4
+        assert "❯ 3. C) Feature-flag dark launch" in card3
+        assert "❯ 4. D) Manual staged promotion" in card4
+        # And the OTHER option must NOT carry the cursor.
+        assert "❯ 4." not in card3
+        assert "❯ 3." not in card4
+
+    def test_every_nav_position_renders_distinct_cursor(self):
+        seen = {}
+        for tag, num in [("cursor2", 2), ("cursor3", 3), ("cursor4", 4)]:
+            card = _render_from_capture(f"auq_single_long_scrolled_{tag}_S500.txt")
+            assert f"❯ {num}." in card, (tag, card)
+            seen[tag] = card
+        # All three rendered cards are mutually distinct (cursor moved each time).
+        assert len(set(seen.values())) == 3

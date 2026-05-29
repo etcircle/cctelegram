@@ -2957,3 +2957,21 @@ class TestArrowNavStaleScrollbackCursor:
             (4, False),
             (5, False),
         ]
+
+    def test_stale_cursor_above_recommended_live_cursor_keeps_live(self):
+        # Regression for the peer-review P2: a stale scrollback ❯ on option 1
+        # sits ABOVE the live cursor, which is parked on a (Recommended) option.
+        # An earlier recommended-only dedup would strip the LIVE cursor and
+        # leave the stale one (card frozen on option 1). The unified bottom-most
+        # rule must keep the live cursor (option 2) AND preserve the rec flag.
+        pane = (
+            "Question?\n\n"
+            "❯ 1. Alpha\n"
+            "❯ 2. Beta (Recommended)\n"
+            "  3. Gamma\n"
+            "\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        assert [o.number for o in form.options if o.cursor] == [2]
+        assert next(o for o in form.options if o.number == 2).recommended is True
