@@ -62,3 +62,18 @@ CB_EFFORT = "eff:"  # eff:<level>:<window_id>  e.g. eff:xhigh:@28
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+
+def checked_callback_data(data: str) -> str:
+    """Return callback data unchanged, or raise if it exceeds Telegram's limit.
+
+    Lives in this dependency-free leaf module (not on the heavy
+    ``callback_dispatcher`` package facade) so that ``interactive_ui`` and
+    ``history`` can validate callback payloads without importing the
+    dispatcher package — which would otherwise close the
+    interactive_ui ↔ callback_dispatcher ↔ inbound_telegram import cycle.
+    Mirrors the ``INTERACTIVE_TOOL_NAMES`` relocation onto ``route_runtime``.
+    """
+    if len(data.encode("utf-8")) > 64:
+        raise RuntimeError(f"callback_data exceeds Telegram 64-byte limit: {data!r}")
+    return data

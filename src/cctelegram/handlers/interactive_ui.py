@@ -32,7 +32,6 @@ from typing import Any
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
-from ..callback_dispatcher import checked_callback_data
 from ..config import config
 from ..session import peek_session_id_for_window, session_id_for_window, session_manager
 from ..terminal_parser import (
@@ -59,6 +58,7 @@ from .callback_data import (
     CB_ASK_TAB,
     CB_ASK_TOGGLE,
     CB_ASK_UP,
+    checked_callback_data,
 )
 from .message_sender import (
     NO_LINK_PREVIEW,
@@ -1511,42 +1511,6 @@ def _resolve_pretool_record(
 
     _pretool_ask_records[window_id] = record
     return record
-
-
-# ── PR 3: rerender_guard sentinel + digest helper ────────────────────────
-#
-# Distinct sentinel object so callers can pass ``None`` to mean "guard
-# against a present-tool-input that gets cleared" (the callback path
-# captures the digest before releasing the lock; if cache is later cleared
-# or replaced, the digest mismatch aborts the re-render). ``_NO_GUARD``
-# means "don't guard, just render" — used by the monitor / JSONL dispatch
-# paths where there's no prior snapshot.
-_NO_GUARD: object = object()
-
-
-def _ask_tool_input_digest(payload: dict | None) -> str | None:
-    """Stable content digest of a cached AskUserQuestion ``tool_use.input``.
-
-    Comparison must be content-based (not object identity) because the
-    cache may return structurally-equal-but-distinct dicts across calls.
-    Used by the ``rerender_guard`` mechanism in ``handle_interactive_ui``
-    to detect "cache cleared" or "replaced with a new prompt" between
-    pick-token callback exit and re-render entry.
-
-    Returns ``None`` when the input is ``None`` so callers can distinguish
-    "cache was cleared" (digest is None) from "cache held this payload"
-    (digest is a hex string).
-    """
-    if payload is None:
-        return None
-    try:
-        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    except (TypeError, ValueError):
-        # The cache stores parsed JSON, so this branch should not fire in
-        # practice. Treat unserializable input as "no useful digest" so
-        # the guard at least doesn't crash.
-        return None
-    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
 
 
 # ── Per-route asyncio.Lock ───────────────────────────────────────────────
@@ -3281,7 +3245,6 @@ async def handle_interactive_ui(
     thread_id: int | None = None,
     *,
     tool_input: dict | None = None,
-    rerender_guard: object = _NO_GUARD,
     from_poller: bool = False,
     tmux_mgr=None,
     session_mgr=None,
@@ -3298,14 +3261,6 @@ async def handle_interactive_ui(
     line until the user answers; the tmux pane is the active source of truth.
     The pane is captured for structured AUQ parsing, verbatim text excerpt,
     and the keystroke fallback path.
-
-    ``rerender_guard`` (PR 3, plan v5 §Re-render guard) is a content digest
-    snapshot of ``_last_completed_ask_tool_input[window_id]`` taken before the
-    caller (the pick-token callback handler) released the route lock. The
-    handler compares it against the current cache value; if the cache was
-    cleared or replaced between callback exit and re-render entry, abort
-    the re-render — the world has moved on. Default ``_NO_GUARD`` means
-    "always render" (monitor / JSONL dispatch path).
     """
     if tmux_mgr is None:
         tmux_mgr = tmux_manager

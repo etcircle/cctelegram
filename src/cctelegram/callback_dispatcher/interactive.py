@@ -51,7 +51,6 @@ from . import (
 
 logger = logging.getLogger(__name__)
 resolve_ask_tool_input = interactive_ui.resolve_ask_tool_input
-_ask_tool_input_digest = interactive_ui._ask_tool_input_digest
 
 
 def _stable_key_of(entry: interactive_ui._PickTokenEntry) -> str:
@@ -845,23 +844,16 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
         await safe_answer(query, f"{entry.option_number}. {entry.option_label[:32]}")
         await asyncio.sleep(0.5)
-        # PR 3: snapshot the JSONL cache digest BEFORE re-rendering. If a
-        # concurrent ``tool_result`` clears the cache between this point
-        # and ``handle_interactive_ui`` reacquiring the route lock, the
-        # re-render sees the guard mismatch and aborts — no orphan card
-        # posted after the prompt has already advanced.
-        # Intentionally remains JSONL-cache-only: this guard prevents orphan
-        # post-answer re-renders when a completed tool_result clears/replaces
-        # the replay cache. The live PreToolUse side file is not cleared at
-        # digit dispatch time, so including it here would not strengthen that
-        # post-answer race guard.
-        rerender_guard = _ask_tool_input_digest(resolve_ask_tool_input(window_id))
+        # Re-render the picker after the digit lands so the card reflects the
+        # advanced screen (next question / review / completion). Orphan-card
+        # safety is provided by the visible-pane liveness bail inside
+        # ``handle_interactive_ui`` (it reads the live tmux pane and returns
+        # without rendering when no picker is on screen).
         await handle_interactive_ui(
             context.bot,
             user.id,
             window_id,
             thread_id,
-            rerender_guard=rerender_guard,
             tmux_mgr=tmux_manager,
             session_mgr=adapters.session_manager,
         )

@@ -19,12 +19,12 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 
-def checked_callback_data(data: str) -> str:
-    """Return callback data unchanged, or raise if it exceeds Telegram's limit."""
-    if len(data.encode("utf-8")) > 64:
-        raise RuntimeError(f"callback_data exceeds Telegram 64-byte limit: {data!r}")
-    return data
-
+# ``checked_callback_data`` now lives on the dependency-free leaf
+# ``handlers/callback_data.py`` (it was previously defined here, which dragged
+# ``interactive_ui`` into the interactive_ui ↔ callback_dispatcher ↔
+# inbound_telegram import cycle). Re-exported here so the intra-package
+# ``from . import checked_callback_data`` in ``screenshot.py`` keeps resolving.
+from cctelegram.handlers.callback_data import checked_callback_data  # noqa: F401
 
 from cctelegram.handlers.directory_browser import (  # noqa: E402
     STATE_KEY,

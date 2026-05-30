@@ -2206,39 +2206,7 @@ class TestCallbackValidatorParityRender:
             forget_ask_tool_input("@99")
 
 
-# ── lock + rerender_guard + FA5+ pick-button safety ─────────────────────
-
-
-class TestAskToolInputDigest:
-    def test_none_returns_none(self):
-        from cctelegram.handlers.interactive_ui import _ask_tool_input_digest
-
-        assert _ask_tool_input_digest(None) is None
-
-    def test_content_based_equality(self):
-        from cctelegram.handlers.interactive_ui import _ask_tool_input_digest
-
-        # Structurally equal but distinct dict objects must produce equal
-        # digests. Without content-based comparison the rerender_guard
-        # would false-positive on every cache read.
-        a = {"questions": [{"question": "Q", "options": [{"label": "A"}]}]}
-        b = {"questions": [{"question": "Q", "options": [{"label": "A"}]}]}
-        assert a is not b  # sanity — distinct objects
-        assert _ask_tool_input_digest(a) == _ask_tool_input_digest(b)
-
-    def test_content_changes_produce_different_digests(self):
-        from cctelegram.handlers.interactive_ui import _ask_tool_input_digest
-
-        a = {"questions": [{"question": "Q1", "options": [{"label": "A"}]}]}
-        b = {"questions": [{"question": "Q2", "options": [{"label": "A"}]}]}
-        assert _ask_tool_input_digest(a) != _ask_tool_input_digest(b)
-
-    def test_no_guard_sentinel_distinct_from_none(self):
-        from cctelegram.handlers.interactive_ui import _NO_GUARD
-
-        # ``None`` is a real value (= "cache was cleared") and must be
-        # distinguishable from ``_NO_GUARD`` (= "don't guard at all").
-        assert _NO_GUARD is not None
+# ── lock + FA5+ pick-button safety ──────────────────────────────────────
 
 
 class TestHasInteractiveSurface:
