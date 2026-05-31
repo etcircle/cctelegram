@@ -1319,33 +1319,10 @@ async def _notify_waiting_dm(
         logger.debug("Failed to send interactive waiting DM to %d: %s", user_id, e)
 
 
-# Per-option description cap. The plan (v5 §Card layout) sets 250 chars so
-# the worst-case 6-option × 6-tab body stays comfortably under 4096 even
-# with header / labels / footer. Truncation is hard with a trailing
-# ellipsis so the reader knows there's more.
-_DESCRIPTION_CHAR_CAP = 250
-
 # Hard cap on rendered card body. Matches the message_queue.py merge limit
 # so the renderer can never produce a body that the send layer would have
 # to split — interactive cards are one Telegram message per AUQ.
 _CARD_BODY_CHAR_CAP = 3800
-
-
-def _truncate_description(description: str) -> str:
-    """Shorten a per-option description for inline display.
-
-    Hard cap at ``_DESCRIPTION_CHAR_CAP`` chars; collapse multi-line
-    descriptions to a single line so the cap is meaningful. Returns an
-    empty string for empty input so callers can skip the indent line.
-    """
-    if not description:
-        return ""
-    # Collapse internal newlines + runs of whitespace so the cap counts
-    # against visible characters, not layout noise.
-    flat = " ".join(description.split())
-    if len(flat) <= _DESCRIPTION_CHAR_CAP:
-        return flat
-    return flat[: _DESCRIPTION_CHAR_CAP - 1].rstrip() + "…"
 
 
 def _should_post_auq_context(source: dict | AskUserQuestionForm | None) -> bool:
@@ -2057,10 +2034,11 @@ async def maybe_upgrade_auq_context_message(
 def _clip_card_body(body: str) -> str:
     """Hard-clip rendered card body to ``_CARD_BODY_CHAR_CAP`` chars.
 
-    Defense in depth: ``_truncate_description`` keeps individual options
-    short, but a question with many options + very long question text
-    could still push the body over the cap. We clip on a line boundary
-    so the truncation doesn't land mid-sentence; final line marks the cut.
+    Defense in depth: the picker card renders option labels only (full
+    descriptions live in the separate context message), but a question with
+    many options + very long question text could still push the body over the
+    cap. We clip on a line boundary so the truncation doesn't land
+    mid-sentence; final line marks the cut.
     """
     if len(body) <= _CARD_BODY_CHAR_CAP:
         return body
@@ -2153,9 +2131,13 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
                 cursor = "❯ " if opt.cursor else "  "
                 rec = " (Recommended)" if opt.recommended else ""
                 lines.append(f"{cursor}{glyph} {opt.number}. {opt.label}{rec}")
-                desc = _truncate_description(opt.description)
-                if desc:
-                    lines.append(f"    {desc}")
+                # Labels only — full per-option descriptions live in the
+                # separate "📋 AskUserQuestion — full details" context message,
+                # never inline in the picker card. Inlining them here
+                # (multi-select only, added 2026-05-28, asymmetric with
+                # single-select + the review screen) bloated the card and risked
+                # _clip_card_body cutting later options off when descriptions
+                # were long or numerous. Single-select renders labels only too.
             if form.is_free_text:
                 lines.append("")
                 lines.append("  (Type something — send a regular message to free-text)")
@@ -2695,9 +2677,10 @@ async def handle_interactive_ui(
     chat_id = session_mgr.resolve_chat_id(user_id, thread_id)
     lock = _get_route_lock(user_id, thread_id)
 
-    # AUQ context message — posted ONCE per (window_id, tool_use_id)
-    # when at least one option description would be truncated by the
-    # picker card's per-option cap. Held under the same per-route lock
+    # AUQ context message — posted ONCE per (window_id, tool_use_id) per
+    # ``_should_post_auq_context``. The picker card renders option labels
+    # only, so this message is where the full per-option descriptions live.
+    # Held under the same per-route lock
     # as the picker send/edit below so concurrent bot.py + status_polling
     # callers serialize on this route: the first claims the context-post
     # slot via ``claim_auq_context_post_in_memory`` (Wave 1 two-phase

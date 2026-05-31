@@ -1265,6 +1265,51 @@ class TestRenderAskUserQuestion:
         assert "X" * 40 not in out
         assert "20. Option 20" in out
 
+    def test_multi_select_descriptions_not_inlined_under_each_option(self):
+        """Multi-select picker cards stay compact too — labels + checkbox
+        glyphs only, NO per-option descriptions inline. The 2026-05-28
+        multi-select renderer used to inline truncated descriptions, which
+        bloated the card and risked _clip_card_body cutting later options off;
+        the full descriptions live in the separate context message. Mirrors
+        the single-select contract above.
+        """
+        form = AskUserQuestionForm(
+            tabs=(),
+            current_question_title="Pick lanes.",
+            select_mode="multi",
+            options_complete=True,
+            options=(
+                AskOption(
+                    label="Alpha",
+                    recommended=False,
+                    cursor=True,
+                    number=1,
+                    selected=False,
+                    description="Long alpha description that must not appear in "
+                    "the picker card body.",
+                ),
+                AskOption(
+                    label="Beta",
+                    recommended=False,
+                    cursor=False,
+                    number=2,
+                    selected=True,
+                    description="Long beta description also omitted from the card.",
+                ),
+            ),
+        )
+        out = _render_ask_user_question(form)
+        # Labels + checkbox glyphs render.
+        assert "1. Alpha" in out
+        assert "2. Beta" in out
+        assert "☑" in out  # selected
+        assert "☐" in out  # unselected
+        assert "Tap a number to toggle" in out  # multi-select footer
+        # Descriptions are NOT inlined under options.
+        assert "Long alpha description" not in out
+        assert "Long beta description" not in out
+        assert not any(line.startswith("    ") for line in out.split("\n"))
+
 
 # ── PR 2b: pick-token map + structured option keyboard ────────────────────
 
