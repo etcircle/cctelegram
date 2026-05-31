@@ -22,9 +22,8 @@ import time
 import pytest
 
 from cctelegram import bot as bot_module
-from cctelegram.handlers import auq_ledger, interactive_ui
+from cctelegram.handlers import auq_ledger, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK
-from cctelegram.handlers.interactive_ui import _PickTokenEntry, _pick_tokens
 from tests.conftest import ScenarioHarness, make_update_callback
 
 
@@ -48,7 +47,7 @@ def _seed_keyed_pick_token(
     Mirrors the production mint path in ``_build_pick_button_rows`` so the
     callback handler's parse + key reconstruction match exactly.
     """
-    entry = _PickTokenEntry(
+    entry = pick_token.PickTokenEntry(
         window_id=window_id,
         user_id=owner_id,
         thread_id=thread_id,
@@ -57,9 +56,11 @@ def _seed_keyed_pick_token(
         option_label=_LABEL,
         is_review_submit=False,
         expires_at=time.monotonic() + 300.0,
+        source_kind="pane",
+        source_fingerprint="sfp",
+        row_generation=1,
     )
-    token = "abc123def456"
-    _pick_tokens[token] = entry
+    token = pick_token.mint(entry)
     route_hash = auq_ledger.make_route_hash(owner_id, thread_id, window_id)
     fp8 = _FINGERPRINT[:8]
     callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{token}"

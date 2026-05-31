@@ -42,6 +42,7 @@ from cctelegram.handlers import (
     inbound_aggregator,
     interactive_ui,
     message_queue,
+    pick_token,
     status_polling,
 )
 
@@ -623,6 +624,7 @@ def _reset_all_handler_state() -> None:
     attention.reset_for_tests()
     message_queue.reset_for_tests()
     interactive_ui.reset_for_tests()
+    pick_token.reset_for_tests()
     auq_source.reset_for_tests()
     # Re-inject the production JSONL-cache getter (bot.post_init wires this
     # once at startup, but post_init doesn't run under test). Without it the

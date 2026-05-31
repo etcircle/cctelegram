@@ -17,7 +17,7 @@ import pytest
 
 from cctelegram import terminal_parser
 from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
-from cctelegram.handlers import auq_source, interactive_ui
+from cctelegram.handlers import auq_source, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.utils import app_dir
 from tests.conftest import ScenarioHarness, make_update_callback
@@ -192,7 +192,7 @@ async def test_single_select_side_file_fingerprint_dispatch_and_compact_card(
     picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
     assert len(picks) == 3
 
-    entry = interactive_ui.peek_pick_token(_token(picks[1]))
+    entry = pick_token.peek(_token(picks[1]))
     assert entry is not None
     resolved_input = auq_source.resolve_auq_source(wid, None, pane).payload
     current_form = terminal_parser.resolve_ask_form(resolved_input, pane)

@@ -15,7 +15,7 @@ from typing import Any
 
 import asyncio
 import logging
-from cctelegram.handlers import auq_ledger, auq_source, interactive_ui
+from cctelegram.handlers import auq_ledger, auq_source, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -34,10 +34,8 @@ from cctelegram.handlers.interactive_ui import (
     NAV_ESC_CLEAR,
     assert_nav_dispatchable,
     clear_interactive_msg,
-    consume_pick_token,
     get_interactive_window,
     handle_interactive_ui,
-    peek_pick_token,
 )
 
 from . import (
@@ -51,21 +49,6 @@ from . import (
 
 logger = logging.getLogger(__name__)
 resolve_ask_tool_input = interactive_ui.resolve_ask_tool_input
-
-
-def _stable_key_of(entry: interactive_ui._PickTokenEntry) -> str:
-    """Reconstruct the Wave 3 ledger key from a live pick-token entry.
-
-    Used by the collision-defense branch in the pick callback to decide
-    whether a live token for the clicker maps to the same ledger key the
-    callback_data carries. Mirrors the mint-side construction in
-    ``interactive_ui._build_pick_button_rows``.
-    """
-    return auq_ledger.make_ledger_key(
-        auq_ledger.make_route_hash(entry.user_id, entry.thread_id, entry.window_id),
-        entry.fingerprint[:8],
-        entry.option_number,
-    )
 
 
 async def _refresh_pick_card(
@@ -364,7 +347,7 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             )
             return
 
-        entry = peek_pick_token(token)
+        entry = pick_token.peek(token)
         if entry is None:
             await _refresh_pick_card(
                 query,
@@ -509,8 +492,8 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
 
         # Ledger lookup FIRST (restart recovery). Wave 3 §7.2 contract:
         # ledger consulted BEFORE token validate so a post-restart duplicate
-        # tap can be detected even when the in-memory _pick_tokens cache
-        # has been wiped.
+        # tap can be detected even when the in-memory pick-token store has
+        # been wiped.
         existing = auq_ledger.lookup(ledger_key)
 
         # v4 §7.2 owner-mismatch handling. Could be (a) wrong-user replay
@@ -522,12 +505,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
         # is collision → clear ledger gate for this click, fall through to
         # the in-process token path. Otherwise wrong-user → reject.
         if existing is not None and existing.user_id != user.id:
-            live = peek_pick_token(token)
+            live = pick_token.peek(token)
             is_collision = (
                 live is not None
                 and live.user_id == user.id
                 and ledger_key is not None
-                and _stable_key_of(live) == ledger_key
+                and pick_token.stable_key(live) == ledger_key
             )
             if not is_collision:
                 await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
@@ -609,16 +592,19 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 )
                 return
 
-        # CB3: peek BEFORE consume. The old consume_pick_token-only flow
-        # destroyed the token + its sibling cache row even on user-id
-        # mismatch, letting a wrong user click another user's button and
-        # burn the legitimate owner's tokens. Validate ownership first,
-        # consume only after.
-        entry = peek_pick_token(token)
-        if entry is None:
+        # R4: side-effect-free peek to read entry.window_id (and entry.user_id
+        # for the wrong-user gate). The pane capture, source/form re-resolve,
+        # and single-use consume all move INSIDE
+        # pick_token.validate_and_consume (atomic by exclusive reservation).
+        # The stale-window lease check stays here — it needs safe_answer — and
+        # fires BEFORE validate_and_consume so a stale-window tap never reserves
+        # or burns the owner's token.
+        peeked = pick_token.peek(token)
+        if peeked is None:
             # Token never existed, was already used, or has aged past the
             # 5-minute TTL. Refresh the card so the user sees the live form
-            # state and can click a fresh button.
+            # state and can click a fresh button. (The ledger gate above
+            # already answered any real SEQUENTIAL duplicate.)
             await _refresh_pick_card(
                 query,
                 context,
@@ -629,61 +615,72 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 text="Card expired, refreshing.",
             )
             return
-        thread_id = entry.thread_id
-        window_id = entry.window_id
-        # Guard ordering is intentional (R4 option a): first verify the
-        # token owner without side effects, then let the lease reject stale
-        # windows without consuming or double-answering, and only consume
-        # immediately before dispatch on a fresh owner click.
-        if not owner_matches(entry, user.id):
+        thread_id = peeked.thread_id
+        window_id = peeked.window_id
+        # Wrong-user gate, BEFORE the lease check — preserves the authorization
+        # invariant (a shared-topic intruder gets WRONG_USER_PICK_TEXT, never
+        # the option label or a stale-window message) and matches the prior
+        # owner-before-lease ordering. Side-effect-free: no reserve, no consume,
+        # so it cannot burn the owner's token. validate_and_consume's own phase
+        # (a) owner check is the authoritative, race-safe re-check.
+        if not owner_matches(peeked, user.id):
             await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
             return
         if await reject_stale_window_callback(window_id):
             return
-        consume_pick_token(token)
-        w = await tmux_manager.find_window_by_id(window_id)
-        if not w:
+
+        # Atomic validate + single-use consume. Re-resolves the AUQ source via
+        # the SAME auq_source.resolve_auq_source the minter used (measurable
+        # source parity), re-parses the live pane (fingerprint staleness), and
+        # wins-or-loses the consume by exclusive reservation — without holding
+        # the store lock across capture_pane / find_window_by_id. Capture with
+        # the SAME 500-line scrollback as the render path so the validate pane
+        # slice matches the mint pane slice (a smaller capture would shift
+        # current_tab_inferred / options and bounce long pickers).
+        async def _capture(wid: str, scrollback: int) -> str | None:
+            return await tmux_manager.capture_pane(wid, scrollback_lines=scrollback)
+
+        result = await pick_token.validate_and_consume(
+            token,
+            user.id,
+            capture_pane=_capture,
+            find_window_by_id=tmux_manager.find_window_by_id,
+        )
+        entry = result.entry
+        current_form = result.current_form
+        if result.outcome == "wrong_user":
+            await safe_answer(query, WRONG_USER_PICK_TEXT, show_alert=True)
+            return
+        if result.outcome == "already_consumed":
+            # In-flight CONCURRENT duplicate (a second tap arrived while the
+            # first held the reservation, or a losing sibling whose row was
+            # tombstoned). The sequential duplicate was already answered by the
+            # ledger gate above; this is the concurrent-race UX.
+            await safe_answer(query, "Action already received.", show_alert=False)
+            return
+        if result.outcome == "expired":
+            await _refresh_pick_card(
+                query,
+                context,
+                update,
+                user,
+                tmux_manager,
+                adapters,
+                text="Card expired, refreshing.",
+                fallback_window_id=window_id,
+            )
+            return
+        if result.outcome == "window_gone":
             await safe_answer(query, "Window not found", show_alert=True)
             return
-
-        # Staleness check: re-capture the pane and re-resolve before dispatching
-        # any key. If the form has shifted under us (user navigated, skill
-        # advanced, Claude Code redrew, /clear fired), the minted fingerprint
-        # won't match and we MUST NOT send a digit — picking "1" on a new
-        # form could submit the wrong answer.
-        #
-        # PR 2: use ``resolve_ask_form`` with the same AUQ source the render
-        # path saw (via ``auq_source.resolve_auq_source``). For live pending AUQs Claude
-        # buffers JSONL until the question is answered, so the PreToolUse side
-        # file is the authoritative dict source while the live pane remains the
-        # staleness check. Falling back to ``resolve_ask_tool_input`` here would
-        # miss that side file and mint/validate against different forms.
-        # Capture with the SAME scrollback as the render path
-        # (handlers/interactive_ui.py uses scrollback_lines=500). A
-        # smaller scrollback here produces a different pane slice from
-        # what render saw → different ``current_tab_inferred`` /
-        # ``current_question_title`` / options → fingerprint mismatch at
-        # validate vs mint, causing taps on long pickers (where options
-        # were only recoverable in the 500-line capture) to bounce with
-        # "Form changed, refreshing".
-        pane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
-        resolved_input = auq_source.resolve_auq_source(
-            window_id, None, pane or ""
-        ).payload
-        current_form = (
-            adapters.terminal_parser.resolve_ask_form(resolved_input, pane)
-            if pane
-            else None
-        )
-        if current_form is None or current_form.fingerprint() != entry.fingerprint:
+        if result.outcome in ("stale_form", "source_drift"):
             logger.info(
-                "Pick-token staleness reject: user=%d window=%s opt=%d "
-                "minted_fp=%s current_fp=%s",
+                "Pick-token %s reject: user=%d window=%s opt=%d minted_fp=%s",
+                result.outcome,
                 user.id,
                 window_id,
-                entry.option_number,
-                entry.fingerprint,
-                current_form.fingerprint() if current_form else "none",
+                peeked.option_number,
+                peeked.fingerprint,
             )
             await safe_answer(query, "Form changed, refreshing.", show_alert=False)
             await handle_interactive_ui(
@@ -694,6 +691,13 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 tmux_mgr=tmux_manager,
                 session_mgr=adapters.session_manager,
             )
+            return
+        # outcome == "ok": entry + current_form are present (validate_and_consume
+        # hands the live re-parse back on a winning consume).
+        assert entry is not None and current_form is not None
+        w = await tmux_manager.find_window_by_id(window_id)
+        if not w:
+            await safe_answer(query, "Window not found", show_alert=True)
             return
 
         # Submit-button guardrail: a click flagged ``is_review_submit`` only

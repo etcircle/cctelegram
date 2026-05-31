@@ -3,7 +3,7 @@
 Records every option-pick callback's lifecycle (``accepted`` →
 ``digit_sent`` → ``dispatched``, or one of two failure terminals) so the
 callback handler can detect duplicate taps even after a process restart.
-The in-memory pick-token table (``interactive_ui._pick_tokens``) does not
+The in-memory pick-token store (``pick_token._pick_tokens``) does not
 survive restart; this ledger does.
 
 Storage: append-only JSONL at ``<CC_TELEGRAM_DIR>/auq_action_ledger.jsonl``

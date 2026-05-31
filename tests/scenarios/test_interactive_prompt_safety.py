@@ -24,9 +24,8 @@ import time
 import pytest
 
 from cctelegram import bot as bot_module
-from cctelegram.handlers import auq_ledger, interactive_ui
+from cctelegram.handlers import auq_ledger, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK
-from cctelegram.handlers.interactive_ui import _PickTokenEntry, _pick_tokens
 from tests.conftest import ScenarioHarness, make_update_callback
 
 
@@ -54,7 +53,7 @@ def _keyed_callback(
 
 
 def _seed_pick_token(*, owner_id: int, thread_id: int, window_id: str) -> str:
-    entry = _PickTokenEntry(
+    entry = pick_token.PickTokenEntry(
         window_id=window_id,
         user_id=owner_id,
         thread_id=thread_id,
@@ -63,10 +62,11 @@ def _seed_pick_token(*, owner_id: int, thread_id: int, window_id: str) -> str:
         option_label="Yes",
         is_review_submit=False,
         expires_at=time.monotonic() + 300.0,
+        source_kind="pane",
+        source_fingerprint="sfp",
+        row_generation=1,
     )
-    token = "abc123def456"
-    _pick_tokens[token] = entry
-    return token
+    return pick_token.mint(entry)
 
 
 @pytest.mark.asyncio
@@ -89,7 +89,7 @@ async def test_wrong_user_click_is_rejected_without_consuming_token(
     answer_text = intruder_update.callback_query.answer.await_args.args[0]
     assert answer_text == "This control isn't yours."
     # Critical CB3 invariant: the wrong-user click did NOT consume the token.
-    assert token in _pick_tokens
+    assert pick_token.peek(token) is not None
     # No tmux keystroke was sent.
     assert scenario.tmux.sent_keys == []
 

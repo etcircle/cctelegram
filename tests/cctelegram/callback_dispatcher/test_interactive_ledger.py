@@ -17,7 +17,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -28,17 +28,28 @@ from cctelegram.callback_dispatcher import (
     execute,
     parse,
 )
-from cctelegram.handlers import auq_ledger, interactive_ui
+from cctelegram.handlers import auq_ledger, auq_source, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK
+from cctelegram.terminal_parser import resolve_ask_form
 
 
 _OWNER_ID = 1
 _INTRUDER_ID = 2
 _THREAD_ID = 10
 _WINDOW_ID = "@1"
-_FINGERPRINT = "ff" * 20
+
+# Real picker pane so validate_and_consume (which re-parses via the REAL parser
+# + resolver) re-resolves to the same form the token was minted against — a
+# genuine mint/validate parity round-trip rather than a faked fingerprint.
+_BASELINE_PANE = (
+    Path(__file__).parents[1] / "fixtures" / "auq-baseline-pane.txt"
+).read_text()
+_BASELINE_FORM = resolve_ask_form(None, _BASELINE_PANE)
+assert _BASELINE_FORM is not None
+_FINGERPRINT = _BASELINE_FORM.fingerprint()
+_BASELINE_SOURCE = auq_source.resolve_auq_source(_WINDOW_ID, None, _BASELINE_PANE)
 _OPT = 1
-_LABEL = "Yes"
+_LABEL = "Done navigating"  # option 1 on the baseline pane
 
 
 class FakeQuery:
@@ -72,15 +83,10 @@ class FakeTmuxManager:
         # the handler's Wave 3 return-value check doesn't short-circuit
         # tests that exercise the dispatch path.
         self.send_keys = AsyncMock(return_value=True)
-        self.capture_pane = AsyncMock(return_value="pane")
-
-
-class FakeForm:
-    is_review_screen = False
-    options: list[Any] = []
-
-    def fingerprint(self) -> str:
-        return _FINGERPRINT
+        # Real baseline pane: validate_and_consume re-parses via the real
+        # parser, so the dispatch (``ok``) path needs a pane that resolves to
+        # the minted form.
+        self.capture_pane = AsyncMock(return_value=_BASELINE_PANE)
 
 
 def _ctx(query: FakeQuery, user_id: int = _OWNER_ID) -> SimpleNamespace:
@@ -113,8 +119,10 @@ def _adapters(
         config=SimpleNamespace(
             browse_root=".",
         ),
+        # Only consumed by the toggle path; the pick path re-parses via the
+        # real parser inside validate_and_consume.
         terminal_parser=SimpleNamespace(
-            resolve_ask_form=lambda _cached_input, _pane: FakeForm()
+            resolve_ask_form=lambda _cached_input, _pane: _BASELINE_FORM
         ),
     )
 
@@ -131,12 +139,12 @@ def _build_keyed_callback(
     """Mint a pick token + build the Wave 3 keyed callback_data.
 
     Returns ``(callback_data, ledger_key)`` so tests can assert against
-    both the rendered shape and the derived ledger key.
+    both the rendered shape and the derived ledger key. The token records the
+    real baseline-pane source tags so validate_and_consume's source-parity
+    compare passes on the dispatch (``ok``) path.
     """
-    entry_cls = cast(Any, interactive_ui._PickTokenEntry)
-    mint = cast(Any, interactive_ui._mint_pick_token)
-    token = mint(
-        entry_cls(
+    token = pick_token.mint(
+        pick_token.PickTokenEntry(
             window_id=window_id,
             user_id=user_id,
             thread_id=_THREAD_ID,
@@ -145,6 +153,9 @@ def _build_keyed_callback(
             option_label=label,
             is_review_submit=is_submit,
             expires_at=time.monotonic() + 300,
+            source_kind=_BASELINE_SOURCE.kind,
+            source_fingerprint=_BASELINE_SOURCE.source_fingerprint,
+            row_generation=1,
         )
     )
     route_hash = auq_ledger.make_route_hash(user_id, _THREAD_ID, window_id)
@@ -155,15 +166,28 @@ def _build_keyed_callback(
 
 
 @pytest.fixture(autouse=True)
-def setup_state(tmp_path: Path) -> Any:
-    """Reset both the pick-token map and the ledger before/after each test."""
-    interactive_ui.reset_pick_tokens_for_tests()
+def setup_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Reset both the pick-token store and the ledger before/after each test.
+
+    Also stubs the dispatcher's post-dispatch ``handle_interactive_ui``
+    re-render to a no-op: validate_and_consume now re-parses the REAL baseline
+    pane (so the dispatch path reaches the re-render), but these tests assert
+    ledger state + the callback answer, not the re-rendered card. The
+    dispatcher binds ``handle_interactive_ui`` by name at import, so patch it on
+    the dispatcher module.
+    """
+    from cctelegram.callback_dispatcher import interactive as cb_interactive
+
+    pick_token.reset_for_tests()
     auq_ledger.reset_for_tests(
         path=tmp_path / "ledger.jsonl",
         start_time=time.time(),
     )
+    monkeypatch.setattr(
+        cb_interactive, "handle_interactive_ui", AsyncMock(return_value=True)
+    )
     yield
-    interactive_ui.reset_pick_tokens_for_tests()
+    pick_token.reset_for_tests()
     auq_ledger.reset_for_tests()
 
 
@@ -366,7 +390,7 @@ class TestOwnerSecurity:
     async def test_legitimate_collision_falls_through_to_token_dispatch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Forced true collision: monkeypatch ``_stable_key_of`` so the
+        """Forced true collision: monkeypatch ``pick_token.stable_key`` so the
         clicker's live token reconstructs the owner's ledger key. The
         handler's ``is_collision=True`` branch should clear the ledger
         gate and fall through to the in-process token path; the clicker's
@@ -378,8 +402,6 @@ class TestOwnerSecurity:
         the code under ``interactive.py``'s ``existing = None`` clear is
         actually executed.
         """
-        from cctelegram.callback_dispatcher import interactive as cb_interactive
-
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         monkeypatch.setattr(
             "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
@@ -398,11 +420,11 @@ class TestOwnerSecurity:
         # Intruder's callback data carries the OWNER'S key (collision shape).
         forced_callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{b_token}"
 
-        # Force ``_stable_key_of(live)`` to return the owner's ledger key
-        # so the collision-defense predicate is True. In production this
+        # Force ``pick_token.stable_key(live)`` to return the owner's ledger
+        # key so the collision-defense predicate is True. In production this
         # would require an actual sha1 collision; here we just make the
         # path executable.
-        monkeypatch.setattr(cb_interactive, "_stable_key_of", lambda _entry: ledger_key)
+        monkeypatch.setattr(pick_token, "stable_key", lambda _entry: ledger_key)
 
         query = FakeQuery(forced_callback_data)
         authorized = authorize_initial(

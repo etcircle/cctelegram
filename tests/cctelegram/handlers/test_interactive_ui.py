@@ -1269,93 +1269,51 @@ class TestRenderAskUserQuestion:
 # ── PR 2b: pick-token map + structured option keyboard ────────────────────
 
 
+from cctelegram.handlers import pick_token as _pick_token  # noqa: E402
+from cctelegram.handlers.auq_source import ResolvedAuqSource  # noqa: E402
 from cctelegram.handlers.interactive_ui import (  # noqa: E402
-    _PICK_TOKEN_TTL_SECONDS,
     _build_pick_button_rows,
-    _PickTokenEntry,
-    _mint_pick_token,
-    _pick_token_cache,
-    _pick_tokens,
     clear_interactive_msg,
-    consume_pick_token,
-    peek_pick_token,
-    reset_pick_tokens_for_tests,
     set_interactive_mode,
 )
+
+_PICK_TOKEN_TTL_SECONDS = _pick_token._PICK_TOKEN_TTL_SECONDS
+
+# A minimal pane-kind source for the minter tests (the store/validate-side
+# parity coverage lives in test_pick_token.py; here we only need *a* source so
+# the minter records its tags). The exact fingerprint value is irrelevant to
+# the keyboard-layout assertions below.
+_TEST_SOURCE = ResolvedAuqSource(kind="pane", payload=None, source_fingerprint="fp")
+# Alias used by the gate/cap callsites further down (they call
+# ``_build_pick_button_rows`` directly with a positional source).
+_SRC = _TEST_SOURCE
+
+
+def _build_rows(*, user_id, thread_id, window_id, form):
+    return _build_pick_button_rows(user_id, thread_id, window_id, form, _TEST_SOURCE)
 
 
 @pytest.fixture
 def _clear_pick_tokens():
-    reset_pick_tokens_for_tests()
+    _pick_token.reset_for_tests()
     yield
-    reset_pick_tokens_for_tests()
-
-
-@pytest.mark.usefixtures("_clear_pick_tokens")
-class TestPickTokenMap:
-    def test_mint_and_consume_roundtrip(self):
-        entry = _PickTokenEntry(
-            window_id="@1",
-            user_id=42,
-            thread_id=7,
-            fingerprint="abc123def456",
-            option_number=2,
-            option_label="Fine",
-            is_review_submit=False,
-            expires_at=time.monotonic() + 60,
-        )
-        token = _mint_pick_token(entry)
-        # Token is short hex (12 chars) so the full ``aqp:<token>`` payload
-        # fits well under the 64-byte callback_data cap.
-        assert len(token) == 12
-        all_hex_digits = set("0123456789abcdef")
-        assert all(c in all_hex_digits for c in token)
-        # Consume returns the entry once, then None (single-use).
-        got = consume_pick_token(token)
-        assert got is entry
-        assert consume_pick_token(token) is None
-
-    def test_consume_expired_returns_none(self):
-        entry = _PickTokenEntry(
-            window_id="@1",
-            user_id=42,
-            thread_id=None,
-            fingerprint="x",
-            option_number=1,
-            option_label="A",
-            is_review_submit=False,
-            expires_at=time.monotonic() - 1,  # already past deadline
-        )
-        token = _mint_pick_token(entry)
-        # The mint itself ran a prune pass that should have dropped this
-        # token before we even tried to consume — consume sees nothing.
-        assert consume_pick_token(token) is None
-
-    def test_mint_unique_tokens(self):
-        entry_template = _PickTokenEntry(
-            window_id="@1",
-            user_id=42,
-            thread_id=None,
-            fingerprint="abc",
-            option_number=1,
-            option_label="A",
-            is_review_submit=False,
-            expires_at=time.monotonic() + 60,
-        )
-        seen = set()
-        for _ in range(20):
-            token = _mint_pick_token(entry_template)
-            assert token not in seen
-            seen.add(token)
+    _pick_token.reset_for_tests()
 
 
 @pytest.mark.usefixtures("_clear_pick_tokens")
 class TestBuildPickButtonRows:
+    """``_build_pick_button_rows`` keyboard layout + minted-entry contract.
+
+    The pick-token store + ``validate_and_consume`` moved to ``pick_token``
+    (R4); the store/reuse/peek unit tests live in ``test_pick_token.py``. This
+    class pins what stays in ``interactive_ui``: the gate chain, row layout,
+    and that each minted token resolves to an entry carrying the route fields
+    (read non-destructively via ``pick_token.peek``).
+    """
+
     def test_no_options_returns_empty(self):
         form = AskUserQuestionForm()
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@1", form=form)
         assert rows == []
 
     def test_one_button_per_numbered_option(self):
@@ -1366,9 +1324,7 @@ class TestBuildPickButtonRows:
                 AskOption(label="Good", recommended=True, cursor=False, number=3),
             ),
         )
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@9", form=form)
         # All three buttons land on a single row (cap is 5).
         assert len(rows) == 1
         assert len(rows[0]) == 3
@@ -1397,29 +1353,20 @@ class TestBuildPickButtonRows:
             ),
             is_review_screen=True,
         )
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@9", form=form)
         assert len(rows) == 1
         # The submit button reads "✅ Submit answers".
         assert rows[0][0].text.startswith("✅ ")
-        # Consume Cancel first — consuming a token now wipes its whole form
-        # generation (sibling invalidation, see TestPickTokenReuse), so we
-        # can't pop Submit then Cancel from the same render.
+        # Both tokens are live in the same render generation; peek is
+        # non-destructive so we can inspect both without burning siblings.
         # Wave 3 callback_data shape: aqp:<route_hash>:<fp8>:<opt>:<token>;
         # the token is always the last colon-separated component.
+        submit_token = rows[0][0].callback_data.split(":")[-1]
         cancel_token = rows[0][1].callback_data.split(":")[-1]
-        cancel_entry = consume_pick_token(cancel_token)
-        assert cancel_entry is not None
-        assert cancel_entry.is_review_submit is False
-        # Re-mint the form to check the Submit entry's flag.
-        rows2 = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
-        submit_token = rows2[0][0].callback_data.split(":")[-1]
-        submit_entry = consume_pick_token(submit_token)
-        assert submit_entry is not None
-        assert submit_entry.is_review_submit is True
+        submit_entry = _pick_token.peek(submit_token)
+        cancel_entry = _pick_token.peek(cancel_token)
+        assert submit_entry is not None and submit_entry.is_review_submit is True
+        assert cancel_entry is not None and cancel_entry.is_review_submit is False
 
     def test_skips_options_without_a_numeric_shortcut(self):
         # Parser may emit options with number=None for free-text rows it
@@ -1436,9 +1383,7 @@ class TestBuildPickButtonRows:
                 ),
             ),
         )
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@9", form=form)
         assert rows == []
 
     def test_six_options_split_across_two_rows(self):
@@ -1448,9 +1393,7 @@ class TestBuildPickButtonRows:
                 for i in range(1, 7)
             ),
         )
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@9", form=form)
         # Cap is 5 per row → first row has 5, second has 1.
         assert [len(r) for r in rows] == [5, 1]
 
@@ -1464,13 +1407,11 @@ class TestBuildPickButtonRows:
             current_question_title="approach?",
         )
         fp = form.fingerprint()
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@9", form=form)
         # Wave 3 callback_data shape: aqp:<route_hash>:<fp8>:<opt>:<token>;
         # the token is the last colon-separated component.
         token = rows[0][0].callback_data.split(":")[-1]
-        entry = consume_pick_token(token)
+        entry = _pick_token.peek(token)
         assert entry is not None
         # Everything the callback handler needs is on the entry.
         assert entry.window_id == "@9"
@@ -1479,6 +1420,9 @@ class TestBuildPickButtonRows:
         assert entry.fingerprint == fp
         assert entry.option_number == 1
         assert entry.option_label == "C — Parallel tracks"
+        # The minter records the resolved source tags for measurable parity.
+        assert entry.source_kind == _TEST_SOURCE.kind
+        assert entry.source_fingerprint == _TEST_SOURCE.source_fingerprint
         # Expiration roughly matches the configured TTL.
         assert entry.expires_at > time.monotonic()
         assert entry.expires_at <= time.monotonic() + _PICK_TOKEN_TTL_SECONDS + 1
@@ -1514,9 +1458,7 @@ class TestBuildPickButtonRows:
             ),
             current_tab_inferred=False,
         )
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@9", form=form
-        )
+        rows = _build_rows(user_id=42, thread_id=7, window_id="@9", form=form)
         assert len(rows) == 1
         assert len(rows[0]) == 2
         # Submit button gets the review-submit treatment.
@@ -1524,31 +1466,17 @@ class TestBuildPickButtonRows:
         # Both buttons carry aqp: pick tokens.
         assert all(b.callback_data.startswith("aqp:") for b in rows[0])
 
-
-@pytest.mark.usefixtures("_clear_pick_tokens")
-class TestPickTokenReuse:
-    """Token churn would defeat MESSAGE_NOT_MODIFIED on edit. Hermes review
-    flagged this as the load-bearing fix before PR 2b can ship: a re-render
-    of the same form (same fingerprint) MUST reuse the same callback tokens
-    so the reply_markup is byte-identical and Telegram can dedupe the edit.
-    """
-
     def test_same_fingerprint_reuses_tokens(self):
+        # MESSAGE_NOT_MODIFIED: a re-render of the same form must reuse the
+        # same callback tokens so the reply_markup is byte-identical.
         form = AskUserQuestionForm(
             options=(
                 AskOption(label="Bad", recommended=False, cursor=True, number=1),
                 AskOption(label="Fine", recommended=False, cursor=False, number=2),
             ),
         )
-        first = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form
-        )
-        second = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form
-        )
-        # Two renders against the same fingerprint must produce identical
-        # callback_data — otherwise every status-polling tick rewrites the
-        # reply_markup and Telegram never returns MESSAGE_NOT_MODIFIED.
+        first = _build_rows(user_id=42, thread_id=7, window_id="@1", form=form)
+        second = _build_rows(user_id=42, thread_id=7, window_id="@1", form=form)
         first_tokens = [b.callback_data for b in first[0]]
         second_tokens = [b.callback_data for b in second[0]]
         assert first_tokens == second_tokens
@@ -1563,97 +1491,9 @@ class TestPickTokenReuse:
                 AskOption(label="Terrible", recommended=False, cursor=True, number=1),
             ),
         )
-        a_rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form_a
-        )
-        b_rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form_b
-        )
-        a_token = a_rows[0][0].callback_data
-        b_token = b_rows[0][0].callback_data
-        assert a_token != b_token
-
-    def test_consume_invalidates_cache_for_that_generation(self):
-        form = AskUserQuestionForm(
-            options=(
-                AskOption(label="Bad", recommended=False, cursor=True, number=1),
-                AskOption(label="Fine", recommended=False, cursor=False, number=2),
-            ),
-        )
-        rows = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form
-        )
-        # Wave 3 callback_data shape: aqp:<route_hash>:<fp8>:<opt>:<token>;
-        # the token is the last colon-separated component.
-        first_token = rows[0][0].callback_data.split(":")[-1]
-        second_token = rows[0][1].callback_data.split(":")[-1]
-        # Click the first button — the cache row for this fingerprint dies,
-        # AND every sibling token in that row dies too (the form is about to
-        # advance, so a stale sibling click is a bug to prevent).
-        consumed = consume_pick_token(first_token)
-        assert consumed is not None
-        # Sibling token no longer resolves.
-        assert consume_pick_token(second_token) is None
-        # Next render against the same fingerprint mints fresh tokens — the
-        # whole callback_data changes (route_hash + fp8 + opt are stable but
-        # the token component is freshly minted).
-        rows2 = _build_pick_button_rows(
-            user_id=42, thread_id=7, window_id="@1", form=form
-        )
-        assert rows2[0][0].callback_data != rows[0][0].callback_data
-
-
-@pytest.mark.usefixtures("_clear_pick_tokens")
-class TestPeekPickTokenIsNonDestructive:
-    """CB3 — wrong-user clicks must NOT destroy the legitimate owner's token."""
-
-    def _entry(self, user_id: int = 42) -> _PickTokenEntry:
-        return _PickTokenEntry(
-            window_id="@1",
-            user_id=user_id,
-            thread_id=7,
-            fingerprint="fp1",
-            option_number=1,
-            option_label="A",
-            is_review_submit=False,
-            expires_at=time.monotonic() + 60,
-        )
-
-    def test_peek_returns_entry_without_consuming(self):
-        token = _mint_pick_token(self._entry())
-        # Peek N times → same entry every time, token still alive.
-        for _ in range(3):
-            got = peek_pick_token(token)
-            assert got is not None
-            assert got.user_id == 42
-        # The real consume still works after peeks.
-        consumed = consume_pick_token(token)
-        assert consumed is not None
-        # Now actually gone.
-        assert peek_pick_token(token) is None
-        assert consume_pick_token(token) is None
-
-    def test_peek_does_not_drop_sibling_cache(self):
-        # Mint two tokens in the same cache row (same fingerprint).
-        e1 = self._entry()
-        e2 = _PickTokenEntry(
-            window_id=e1.window_id,
-            user_id=e1.user_id,
-            thread_id=e1.thread_id,
-            fingerprint=e1.fingerprint,
-            option_number=2,
-            option_label="B",
-            is_review_submit=False,
-            expires_at=e1.expires_at,
-        )
-        t1 = _mint_pick_token(e1)
-        t2 = _mint_pick_token(e2)
-        cache_key = (e1.user_id, e1.thread_id or 0, e1.window_id, e1.fingerprint)
-        _pick_token_cache[cache_key] = [t1, t2]
-        # Peek t1 — neither t2 nor the cache row should be touched.
-        assert peek_pick_token(t1) is e1
-        assert peek_pick_token(t2) is e2
-        assert _pick_token_cache.get(cache_key) == [t1, t2]
+        a_rows = _build_rows(user_id=42, thread_id=7, window_id="@1", form=form_a)
+        b_rows = _build_rows(user_id=42, thread_id=7, window_id="@1", form=form_b)
+        assert a_rows[0][0].callback_data != b_rows[0][0].callback_data
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -1940,7 +1780,7 @@ class TestAskUserQuestionPaneOnlySafety:
             ),
         )
 
-        assert iui._build_pick_button_rows(1, 42, "@5", form) == []
+        assert iui._build_pick_button_rows(1, 42, "@5", form, _SRC) == []
 
     @pytest.mark.asyncio
     async def test_stale_cache_plus_complete_contiguous_pane_mints_pick_buttons(
@@ -2000,29 +1840,28 @@ class TestAskUserQuestionPaneOnlySafety:
 class TestClearInteractiveMsgPrunesTokens:
     """P2.2 — clear_interactive_msg must drop pick-tokens for the cleared route."""
 
+    @staticmethod
+    def _mint_one(user_id, thread_id, window_id, fingerprint):
+        return _pick_token.mint_row(
+            user_id=user_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            fingerprint=fingerprint,
+            source_kind="pane",
+            source_fingerprint="sfp",
+            specs=[_pick_token._mint_spec(1, "A", False)],
+        )[0]
+
     @pytest.mark.asyncio
     async def test_clear_drops_tokens_for_active_window(self):
         user_id, thread_id, window_id = 42, 7, "@1"
         # Set up interactive mode so clear_interactive_msg sees the route.
         set_interactive_mode(user_id, window_id, thread_id)
-        entry = _PickTokenEntry(
-            window_id=window_id,
-            user_id=user_id,
-            thread_id=thread_id,
-            fingerprint="fp1",
-            option_number=1,
-            option_label="A",
-            is_review_submit=False,
-            expires_at=time.monotonic() + 60,
-        )
-        token = _mint_pick_token(entry)
-        cache_key = (user_id, thread_id, window_id, "fp1")
-        _pick_token_cache[cache_key] = [token]
-        assert token in _pick_tokens
+        token = self._mint_one(user_id, thread_id, window_id, "fp1")
+        assert _pick_token.peek(token) is not None
         # bot=None → no Telegram I/O; the prune still runs.
         await clear_interactive_msg(user_id, bot=None, thread_id=thread_id)
-        assert token not in _pick_tokens
-        assert cache_key not in _pick_token_cache
+        assert _pick_token.peek(token) is None
 
     @pytest.mark.asyncio
     async def test_clear_leaves_other_routes_alone(self):
@@ -2030,37 +1869,13 @@ class TestClearInteractiveMsgPrunesTokens:
         user_id = 42
         set_interactive_mode(user_id, "@1", 7)
         set_interactive_mode(user_id, "@2", 8)
-        e1 = _PickTokenEntry(
-            window_id="@1",
-            user_id=user_id,
-            thread_id=7,
-            fingerprint="fp1",
-            option_number=1,
-            option_label="A",
-            is_review_submit=False,
-            expires_at=time.monotonic() + 60,
-        )
-        e2 = _PickTokenEntry(
-            window_id="@2",
-            user_id=user_id,
-            thread_id=8,
-            fingerprint="fp2",
-            option_number=1,
-            option_label="A",
-            is_review_submit=False,
-            expires_at=time.monotonic() + 60,
-        )
-        t1 = _mint_pick_token(e1)
-        t2 = _mint_pick_token(e2)
-        _pick_token_cache[(user_id, 7, "@1", "fp1")] = [t1]
-        _pick_token_cache[(user_id, 8, "@2", "fp2")] = [t2]
+        t1 = self._mint_one(user_id, 7, "@1", "fp1")
+        t2 = self._mint_one(user_id, 8, "@2", "fp2")
         # Clear thread 7 only.
         await clear_interactive_msg(user_id, bot=None, thread_id=7)
-        assert t1 not in _pick_tokens
-        assert (user_id, 7, "@1", "fp1") not in _pick_token_cache
+        assert _pick_token.peek(t1) is None
         # Thread 8 untouched.
-        assert t2 in _pick_tokens
-        assert (user_id, 8, "@2", "fp2") in _pick_token_cache
+        assert _pick_token.peek(t2) is not None
 
     @pytest.mark.asyncio
     async def test_clear_no_active_window_is_noop(self):
@@ -2274,7 +2089,7 @@ class TestPickButtonRowsFA5Gate:
         from cctelegram.handlers.interactive_ui import _build_pick_button_rows
 
         rows = _build_pick_button_rows(
-            user_id=1, thread_id=2, window_id="@1", form=self._multi_question_form(True)
+            1, 2, "@1", self._multi_question_form(True), _SRC
         )
         assert rows  # non-empty
 
@@ -2282,10 +2097,7 @@ class TestPickButtonRowsFA5Gate:
         from cctelegram.handlers.interactive_ui import _build_pick_button_rows
 
         rows = _build_pick_button_rows(
-            user_id=1,
-            thread_id=2,
-            window_id="@1",
-            form=self._multi_question_form(False),
+            1, 2, "@1", self._multi_question_form(False), _SRC
         )
         assert rows == []
 
@@ -2305,9 +2117,7 @@ class TestPickButtonRowsFA5Gate:
             questions=(),  # single-question shape
             current_tab_inferred=False,
         )
-        rows = _build_pick_button_rows(
-            user_id=1, thread_id=2, window_id="@1", form=form
-        )
+        rows = _build_pick_button_rows(1, 2, "@1", form, _SRC)
         assert rows  # still gets buttons; FA5+ doesn't apply
 
 
@@ -2334,9 +2144,7 @@ class TestPickButtonRows19Cap:
             current_question_title="Pick.",
             options=opts,
         )
-        rows = _build_pick_button_rows(
-            user_id=1, thread_id=2, window_id="@1", form=form
-        )
+        rows = _build_pick_button_rows(1, 2, "@1", form, _SRC)
         # Flatten rows → button labels.
         labels = [btn.text for row in rows for btn in row]
         # Buttons exist for 1..9.

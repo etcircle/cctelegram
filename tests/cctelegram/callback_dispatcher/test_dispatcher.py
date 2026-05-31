@@ -5,6 +5,7 @@ windows, wrong-user interactive picks, and one-shot pick tokens.
 """
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -26,13 +27,21 @@ from cctelegram.handlers.callback_data import (
     CB_DIR_SELECT,
     CB_KEYS_PREFIX,
 )
-from cctelegram.handlers import auq_ledger, interactive_ui
+from cctelegram.handlers import auq_ledger, auq_source, pick_token
 from cctelegram.handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PATH_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
 )
+from cctelegram.terminal_parser import resolve_ask_form
+
+# A real picker pane so validate_and_consume (which uses the REAL parser +
+# resolver, not a fake) re-resolves to a form whose fingerprint + source tags
+# match the minted token — i.e. genuine mint/validate parity.
+_BASELINE_PANE = (
+    Path(__file__).parents[1] / "fixtures" / "auq-baseline-pane.txt"
+).read_text()
 
 
 class FakeQuery:
@@ -65,10 +74,16 @@ class FakeTmuxManager:
         # so the Wave 3 callback handler's return-value check doesn't
         # short-circuit every test that exercises the dispatch path.
         self.send_keys = AsyncMock(return_value=True)
-        self.capture_pane = AsyncMock(return_value="pane")
+        # Return the REAL baseline picker pane: validate_and_consume uses the
+        # real parser/resolver, so an ``ok`` pick needs a pane that re-parses
+        # to the same form the token was minted against.
+        self.capture_pane = AsyncMock(return_value=_BASELINE_PANE)
 
 
 class FakeForm:
+    """Minimal form for the toggle-path adapter fake (unused by the pick path,
+    which re-resolves via the real parser inside validate_and_consume)."""
+
     is_review_screen = False
     options: list[Any] = []
 
@@ -78,35 +93,44 @@ class FakeForm:
 
 @pytest.fixture(autouse=True)
 def clear_pick_tokens() -> None:
-    interactive_ui.reset_pick_tokens_for_tests()
+    pick_token.reset_for_tests()
 
 
 def _mint_test_pick_token(user_id: int, *, window_id: str = "@1") -> str:
-    entry_cls = cast(Any, getattr(interactive_ui, "_PickTokenEntry"))
-    mint = cast(Any, getattr(interactive_ui, "_mint_pick_token"))
-    return cast(
-        str,
-        mint(
-            entry_cls(
-                window_id=window_id,
-                user_id=user_id,
-                thread_id=10,
-                fingerprint="fp",
-                option_number=1,
-                option_label="Yes",
-                is_review_submit=False,
-                expires_at=time.monotonic() + 300,
-            )
-        ),
+    """Mint a token whose fingerprint + source tags MATCH the baseline pane.
+
+    The token is recorded against the real ``resolve_ask_form`` fingerprint and
+    the real ``resolve_auq_source`` tags for ``_BASELINE_PANE`` (option 1,
+    "Done navigating"), so a same-user / same-window tap whose capture returns
+    that pane validates to ``ok``. Wrong-user / stale-window taps bounce before
+    the form check, so the exact form doesn't matter for those.
+    """
+    form = resolve_ask_form(None, _BASELINE_PANE)
+    assert form is not None
+    src = auq_source.resolve_auq_source(window_id, None, _BASELINE_PANE)
+    entry = pick_token.PickTokenEntry(
+        window_id=window_id,
+        user_id=user_id,
+        thread_id=10,
+        fingerprint=form.fingerprint(),
+        option_number=1,
+        option_label="Done navigating",
+        is_review_submit=False,
+        expires_at=time.monotonic() + 300,
+        source_kind=src.kind,
+        source_fingerprint=src.source_fingerprint,
+        row_generation=1,
     )
+    return pick_token.mint(entry)
 
 
 def _keyed_pick_callback(token: str, *, user_id: int = 1, window_id: str = "@1") -> str:
     """Build the Wave 3 keyed ``aqp:<route_hash>:<fp8>:<opt>:<token>`` shape.
 
-    Mirrors the minted entry (thread_id=10, fingerprint="fp", option 1). The
-    keyed triplet is the only callback shape the dispatcher parses since the
-    legacy ``aqp:<token>`` shape was retired.
+    Mirrors the minted entry (thread_id=10, option 1). The keyed triplet is the
+    only callback shape the dispatcher parses since the legacy ``aqp:<token>``
+    shape was retired. ``fp8`` is an idempotency-key fragment independent of the
+    entry's full form fingerprint.
     """
     route_hash = auq_ledger.make_route_hash(user_id, 10, window_id)
     return f"{CB_ASK_PICK}{route_hash}:fp:1:{token}"
@@ -179,7 +203,7 @@ async def test_wrong_user_pick_does_not_consume_token() -> None:
     await execute(authorized, _adapters(FakeSessionManager(), FakeTmuxManager()))
 
     assert query.answers == [("This control isn't yours.", True)]
-    assert interactive_ui.peek_pick_token(token) is not None
+    assert pick_token.peek(token) is not None
 
 
 @pytest.mark.asyncio
@@ -193,7 +217,7 @@ async def test_stale_owner_pick_does_not_consume_token() -> None:
         _adapters(FakeSessionManager(current_window="@2"), FakeTmuxManager()),
     )
 
-    assert interactive_ui.peek_pick_token(token) is not None
+    assert pick_token.peek(token) is not None
 
 
 @pytest.mark.asyncio
@@ -226,6 +250,15 @@ async def test_double_pick_second_click_is_already_received_after_first_dispatch
         "cctelegram.handlers.interactive_ui.resolve_ask_tool_input", lambda _wid: None
     )
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    # The first (valid) tap dispatches then re-renders via the dispatcher's
+    # handle_interactive_ui; stub it to a no-op (these assertions care about
+    # the ledger + the answer, not the re-rendered card). The dispatcher binds
+    # the name at import, so patch it on the dispatcher module.
+    from cctelegram.callback_dispatcher import interactive as cb_interactive
+
+    monkeypatch.setattr(
+        cb_interactive, "handle_interactive_ui", AsyncMock(return_value=True)
+    )
 
     query1 = FakeQuery(_keyed_pick_callback(token, user_id=1))
     authorized1 = authorize_initial(
@@ -241,9 +274,10 @@ async def test_double_pick_second_click_is_already_received_after_first_dispatch
 
     # First click dispatches and writes the ``dispatched`` ledger row; the
     # second click on the same keyed callback finds that row and answers
-    # "Action already received" instead of re-dispatching the digit.
-    assert query1.answers == [("1. Yes", False)]
-    assert query2.answers == [("Action already received: Yes", False)]
+    # "Action already received" instead of re-dispatching the digit. The
+    # option label is "Done navigating" (option 1 on the baseline pane).
+    assert query1.answers == [("1. Done navigating", False)]
+    assert query2.answers == [("Action already received: Done navigating", False)]
     auq_ledger.reset_for_tests()
 
 

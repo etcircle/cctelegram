@@ -22,14 +22,14 @@ from cctelegram.handlers import interactive_ui as iu
 from cctelegram.handlers import status_polling as _sp  # noqa: F401
 
 
+# The pick-token store (``_pick_tokens`` / ``_pick_token_cache``) moved to
+# ``pick_token`` (R4); its reset is pinned in ``test_pick_token.py``.
 _PER_TEST_DICT_NAMES = (
     "_interactive_msgs",
     "_interactive_mode",
     "_interactive_msg_meta",
     "_last_completed_ask_tool_input",
     "_last_auq_tool_use_id",
-    "_pick_tokens",
-    "_pick_token_cache",
     "_auq_context_posted",
     "_auq_context_post_pending",
     "_auq_context_msgs",

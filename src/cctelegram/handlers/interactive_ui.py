@@ -43,7 +43,7 @@ from ..terminal_parser import (
 )
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
-from . import attention, auq_source
+from . import attention, auq_source, pick_token
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -1002,7 +1002,8 @@ def resolve_ask_tool_input(window_id: str) -> dict | None:
 #
 #   PROTECTED by ``_get_route_lock`` (state held atomically across the
 #   relevant work):
-#     * ``_pick_token_cache`` / ``_pick_tokens`` — pruned under the lock in
+#     * The pick-token store (``pick_token``) — pruned via
+#       ``pick_token.prune_for_route`` under the lock in
 #       ``clear_interactive_msg``'s Phase 1 so a concurrent
 #       ``handle_interactive_ui`` (which awaits between pane capture and
 #       mint) can't post a card whose tokens point at a cache row the
@@ -1066,167 +1067,13 @@ def has_interactive_surface(user_id: int, thread_id: int | None) -> bool:
 
 # ── PR 2b: structured option-pick callback tokens ────────────────────────
 #
-# When ``handle_interactive_ui`` lands a structured AskUserQuestion card, it
-# mints one callback token per option button. The token resolves server-side
-# (via ``_pick_tokens``) to the (window, fingerprint, option_number,
-# option_label) bound at mint time. On click, the callback handler:
-#
-#   1. Looks up the token. Missing / expired → "Card expired, refresh".
-#   2. Re-captures the pane and re-runs the parser. None → "Form gone".
-#   3. Compares ``form.fingerprint()`` to the token's pinned value. Mismatch
-#      → "Form changed, refreshing" + repaint the card. Do NOT dispatch
-#      the key — that's the load-bearing staleness check Hermes flagged.
-#   4. Sends the literal digit via tmux_manager.send_keys(literal=True,
-#      enter=False). Marks the token used (single-use).
-#
-# Token lifetime is short (5 minutes) because the form is interactive and
-# the user will either resolve or abandon it within minutes. No daily GC
-# needed; ``_prune_expired_pick_tokens`` runs on every mint so the map
-# stays bounded.
-
-# Conservative TTL — Claude Code's AskUserQuestion picker stays open at most
-# a few minutes in practice. 300s is comfortably longer than the slowest
-# turnaround but short enough that a forgotten token can't pile up.
-_PICK_TOKEN_TTL_SECONDS = 300.0
-
-
-@dataclass(frozen=True)
-class _PickTokenEntry:
-    """Server-side state bound to a single option-button click.
-
-    Frozen because once minted, the entry must not mutate (the staleness
-    check compares the *minted* fingerprint against the *current* parse).
-    Marking entries used is done by popping from the map, not flipping a
-    field, so single-use semantics are enforced by ``consume_pick_token``.
-    """
-
-    window_id: str
-    user_id: int
-    thread_id: int | None
-    fingerprint: str  # form.fingerprint() at the moment the keyboard rendered
-    option_number: int  # the numeric shortcut to send (1-9)
-    option_label: str  # human label, used for log messages + sanity
-    is_review_submit: bool  # True iff this click should submit the review screen
-    expires_at: float  # monotonic clock deadline
-
-
-_pick_tokens: dict[str, _PickTokenEntry] = {}
-
-# Stable per-route cache so a re-render of the same form (same fingerprint)
-# reuses the same callback tokens. Without this, every status-polling tick
-# would mint fresh random tokens, the reply_markup would never match the
-# previous edit, Telegram would never return MESSAGE_NOT_MODIFIED, and the
-# bot would re-edit the card every poll cycle while the user is reading it.
-# Hermes peer review flagged this as a no-ship before fix.
-#
-# Key: (user_id, thread_id_or_0, window_id, fingerprint)
-# Value: list[token] — one token per option button, in the order the
-#        keyboard builder emitted them.
-_pick_token_cache: dict[tuple[int, int, str, str], list[str]] = {}
-
-
-def _prune_expired_pick_tokens(now: float | None = None) -> None:
-    """Drop expired tokens from the in-memory map.
-
-    Runs on every mint — the map is small (≤ #options per active picker, so
-    typically ≤ 10) so the O(n) scan is cheap. Cache entries pointing at
-    expired tokens are pruned too so a stale fingerprint can't pin a dead
-    token list.
-    """
-    if now is None:
-        now = time.monotonic()
-    stale = [tok for tok, e in _pick_tokens.items() if e.expires_at <= now]
-    for tok in stale:
-        _pick_tokens.pop(tok, None)
-    if stale:
-        stale_set = set(stale)
-        for cache_key, tokens in list(_pick_token_cache.items()):
-            if any(t in stale_set for t in tokens):
-                _pick_token_cache.pop(cache_key, None)
-
-
-def _mint_pick_token(entry: _PickTokenEntry) -> str:
-    """Register a token for an option button. Returns the token id.
-
-    Token is 12 hex chars from ``secrets.token_hex(6)``. Since Wave 3,
-    the full callback payload is the keyed shape
-    ``aqp:<route_hash>:<fp8>:<opt>:<token>`` (~33-34 bytes; well under
-    Telegram's 64-byte cap). This is the only shape the callback handler
-    parses; the pre-Wave-3 ``aqp:<token>`` legacy shape is no longer
-    accepted (its TTL window has long since elapsed).
-    """
-    _prune_expired_pick_tokens()
-    # 6 bytes = 12 hex chars. Collision space ~2^48; with at most a few
-    # tokens live at any moment, accidental clash is astronomically
-    # unlikely. Loop on the off chance.
-    for _ in range(8):
-        token = secrets.token_hex(6)
-        if token not in _pick_tokens:
-            _pick_tokens[token] = entry
-            return token
-    # Pathological — shouldn't happen, but signal loudly rather than
-    # silently overwrite an existing token.
-    raise RuntimeError("Unable to mint a unique pick token")
-
-
-def peek_pick_token(token: str) -> _PickTokenEntry | None:
-    """Look up a token WITHOUT consuming it. Returns the entry or None.
-
-    P1.5/CB3: callbacks MUST validate ``entry.user_id`` against the click
-    sender's ID before consuming. Looking up + consuming in one step (the
-    old ``consume_pick_token``-only API) made it possible for a wrong user
-    to click another user's button, hit the "not your card" reject, and
-    still burn the token + its sibling cache row. The legitimate owner's
-    next click then 404'd with "Card expired, refreshing."
-
-    Use this for the validate phase; call ``consume_pick_token`` only after
-    user/window/fingerprint checks pass.
-
-    Expired tokens are pruned as a side effect so the caller can treat a
-    None return as "definitely gone" without re-checking expiry.
-    """
-    _prune_expired_pick_tokens()
-    return _pick_tokens.get(token)
-
-
-def consume_pick_token(token: str) -> _PickTokenEntry | None:
-    """Pop a token (single-use). Returns the entry or None if missing/expired.
-
-    Also drops the cache entry for the form generation this token belonged
-    to: once a click lands, the form is about to advance to the next tab /
-    question / review screen, and the next render needs fresh tokens
-    against the new fingerprint anyway. Leaving the cache populated would
-    keep handing out the just-consumed token (which would then 404 on
-    click).
-
-    SECURITY (CB3): this mutates state. Callers MUST validate ownership via
-    ``peek_pick_token`` first before calling this — otherwise a wrong-user
-    click destroys the legitimate owner's token + sibling cache row.
-    """
-    _prune_expired_pick_tokens()
-    entry = _pick_tokens.pop(token, None)
-    if entry is not None:
-        cache_key = (
-            entry.user_id,
-            entry.thread_id or 0,
-            entry.window_id,
-            entry.fingerprint,
-        )
-        # Remove the cache row AND drop every sibling token belonging to
-        # that row — the whole generation is dead now that the user has
-        # acted on one of its buttons.
-        sibling_tokens = _pick_token_cache.pop(cache_key, None)
-        if sibling_tokens:
-            for sib in sibling_tokens:
-                if sib != token:
-                    _pick_tokens.pop(sib, None)
-    return entry
-
-
-def reset_pick_tokens_for_tests() -> None:
-    """Clear the pick-token map. Test-only helper."""
-    _pick_tokens.clear()
-    _pick_token_cache.clear()
+# The pick-token store + the atomic ``validate_and_consume`` finalizer moved
+# to ``handlers.pick_token`` (R4). ``interactive_ui`` is now a pure MINTER: it
+# resolves the AUQ source via ``auq_source.resolve_auq_source`` and calls
+# ``pick_token.mint_row(...)`` (which owns the cache-reuse logic + the
+# generation counter); the callback validates/consumes via
+# ``pick_token.validate_and_consume``. ``interactive_ui`` no longer holds the
+# token dicts, the entry dataclass, the prune, or the consume.
 
 
 # Cross-module emergency DM cooldown lives in ``handlers.attention``
@@ -2349,13 +2196,15 @@ def _build_pick_button_rows(
     thread_id: int | None,
     window_id: str,
     form: AskUserQuestionForm,
+    resolved_source: auq_source.ResolvedAuqSource,
 ) -> list[list[InlineKeyboardButton]]:
     """Build inline-keyboard rows of option-pick buttons for a parsed form.
 
     One button per option; max 5 per row. Each button mints a single-use
-    token bound to ``(window, fingerprint, option_number, option_label)``
-    so the callback handler can detect a "form changed under us" race
-    before dispatching the keystroke.
+    token bound to ``(window, fingerprint, option_number, option_label)`` plus
+    the minted ``(source_kind, source_fingerprint)`` from ``resolved_source``
+    so ``pick_token.validate_and_consume`` can detect a "form changed under us"
+    race AND a source drift before dispatching the keystroke.
 
     Review-screen Submit/Cancel rows are rendered here too. The Submit
     button is flagged ``is_review_submit=True`` so the callback handler
@@ -2436,10 +2285,11 @@ def _build_pick_button_rows(
         logger.info("_build_pick_button_rows SUPPRESSED gate=incomplete_multi_select")
         return []
     if form.select_mode == "multi":
-        return _build_multi_toggle_rows(user_id, thread_id, window_id, form)
+        return _build_multi_toggle_rows(
+            user_id, thread_id, window_id, form, resolved_source
+        )
 
     fingerprint = form.fingerprint()
-    deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
 
     # Filter to options that can be dispatched via literal-N. Tokens are
     # only allocated for these; the keystroke fallback still reaches the
@@ -2459,63 +2309,37 @@ def _build_pick_button_rows(
         )
         return []
 
-    cache_key = (user_id, thread_id or 0, window_id, fingerprint)
-
-    def _mint(opt_number: int, label: str, is_submit: bool) -> str:
-        return _mint_pick_token(
-            _PickTokenEntry(
-                window_id=window_id,
-                user_id=user_id,
-                thread_id=thread_id,
-                fingerprint=fingerprint,
-                option_number=opt_number,
-                option_label=label,
-                is_review_submit=is_submit,
-                expires_at=deadline,
-            )
-        )
-
-    # Token-reuse path: if we already minted tokens for this exact form
-    # generation (matching fingerprint), re-emit the same callback_data so
-    # the rendered reply_markup is byte-identical and Telegram returns
-    # MESSAGE_NOT_MODIFIED on the next edit. The cache row is wiped on
-    # consume + on fingerprint change, so this can't hand out a stale
-    # token bound to a different form.
-    cached = _pick_token_cache.get(cache_key)
-    if cached is not None and len(cached) == len(pickable):
-        # Double-check that every cached token is still alive — TTL eviction
-        # may have dropped some out from under us. If any are missing, fall
-        # through to fresh-mint so callbacks don't 404 immediately.
-        if all(t in _pick_tokens for t in cached):
-            tokens: list[str] = cached
-        else:
-            _pick_token_cache.pop(cache_key, None)
-            tokens = [
-                _mint(
-                    opt.number or 0,
-                    opt.label,
-                    form.is_review_screen and opt.cursor and opt.number == 1,
-                )
-                for opt in pickable
-            ]
-            _pick_token_cache[cache_key] = tokens
-    else:
-        tokens = [
-            _mint(
+    # Mint (or reuse) the sibling-token row via the pick_token store. mint_row
+    # owns the cache-reuse logic (so ``_pick_token_cache`` stays private): a
+    # FRESH mint of this form generation allocates the next module-global
+    # generation and stamps it on the row + entries; an unchanged-form
+    # re-render returns the SAME tokens with NO generation bump (preserving
+    # Telegram MESSAGE_NOT_MODIFIED). Each entry records the resolved
+    # ``(source_kind, source_fingerprint)`` so validate can measure source
+    # parity.
+    tokens = pick_token.mint_row(
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        fingerprint=fingerprint,
+        source_kind=resolved_source.kind,
+        source_fingerprint=resolved_source.source_fingerprint,
+        specs=[
+            pick_token._mint_spec(
                 opt.number or 0,
                 opt.label,
-                form.is_review_screen and opt.cursor and opt.number == 1,
+                bool(form.is_review_screen and opt.cursor and opt.number == 1),
             )
             for opt in pickable
-        ]
-        _pick_token_cache[cache_key] = tokens
+        ],
+    )
 
     # Wave 3: callback_data now carries (route_hash, fp8, opt, token) so
     # the restart-safe ledger can reconstruct the stable key without
-    # needing the in-memory _pick_tokens table to survive process
-    # restart. ``fp8`` is an idempotency-key fragment, NOT a security
-    # primitive — authorization comes from the in-memory token + owner
-    # check + live pane revalidation in the callback handler.
+    # needing the in-memory pick-token store to survive process restart.
+    # ``fp8`` is an idempotency-key fragment, NOT a security primitive —
+    # authorization comes from the in-memory token + owner check + live
+    # pane revalidation in pick_token.validate_and_consume.
     from . import auq_ledger
 
     route_hash = auq_ledger.make_route_hash(user_id, thread_id, window_id)
@@ -2561,6 +2385,7 @@ def _build_multi_toggle_rows(
     thread_id: int | None,
     window_id: str,
     form: AskUserQuestionForm,
+    resolved_source: auq_source.ResolvedAuqSource,
 ) -> list[list[InlineKeyboardButton]]:
     """Build multi-select toggle buttons that dispatch a bare digit only."""
     assert form.select_mode == "multi"
@@ -2568,39 +2393,23 @@ def _build_multi_toggle_rows(
     assert len(form.questions) <= 1
 
     fingerprint = form.fingerprint()
-    deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
     pickable = [
         opt for opt in form.options if opt.number is not None and 1 <= opt.number <= 9
     ]
     if not pickable:
         return []
 
-    cache_key = (user_id, thread_id or 0, window_id, fingerprint)
-
-    def _mint(opt_number: int, label: str) -> str:
-        return _mint_pick_token(
-            _PickTokenEntry(
-                window_id=window_id,
-                user_id=user_id,
-                thread_id=thread_id,
-                fingerprint=fingerprint,
-                option_number=opt_number,
-                option_label=label,
-                is_review_submit=False,
-                expires_at=deadline,
-            )
-        )
-
-    cached = _pick_token_cache.get(cache_key)
-    if (
-        cached is not None
-        and len(cached) == len(pickable)
-        and all(t in _pick_tokens for t in cached)
-    ):
-        tokens = cached
-    else:
-        tokens = [_mint(opt.number or 0, opt.label) for opt in pickable]
-        _pick_token_cache[cache_key] = tokens
+    tokens = pick_token.mint_row(
+        user_id=user_id,
+        thread_id=thread_id,
+        window_id=window_id,
+        fingerprint=fingerprint,
+        source_kind=resolved_source.kind,
+        source_fingerprint=resolved_source.source_fingerprint,
+        specs=[
+            pick_token._mint_spec(opt.number or 0, opt.label, False) for opt in pickable
+        ],
+    )
 
     from . import auq_ledger
 
@@ -2816,9 +2625,10 @@ async def handle_interactive_ui(
         # ``current_tab_inferred``; the FA5+ guard in
         # ``_build_pick_button_rows`` suppresses pick buttons when False so
         # we don't dispatch a digit against the wrong tab.
-        resolved_input = auq_source.resolve_auq_source(
+        resolved_source = auq_source.resolve_auq_source(
             window_id, tool_input, pane_text
-        ).payload
+        )
+        resolved_input = resolved_source.payload
         form = resolve_ask_form(resolved_input, pane_text)
         if form is None:
             # Belt-and-braces fallback. resolve_ask_form already tries
@@ -2870,7 +2680,9 @@ async def handle_interactive_ui(
             if partial_options_notice:
                 text = f"{text}\n\n{partial_options_notice}"
             if not p14_suppress_picks:
-                built = _build_pick_button_rows(user_id, thread_id, window_id, form)
+                built = _build_pick_button_rows(
+                    user_id, thread_id, window_id, form, resolved_source
+                )
                 if built:
                     pick_rows = built
 
@@ -3222,7 +3034,7 @@ async def clear_interactive_msg(
         # Multiple windows can never share a route (1 topic = 1 window),
         # but the pruning still wants to scope to the cleared window to
         # avoid touching unrelated routes that share a (user, thread)
-        # key in ``_pick_tokens``.
+        # key in the pick-token store.
         cleared_window_id = _interactive_mode.pop(ikey, None)
 
         # P2.2: prune pick-tokens for this route. Without this, a deleted
@@ -3230,31 +3042,11 @@ async def clear_interactive_msg(
         # which combined with stale-scrollback liveness checks (P1.3)
         # would let a stale callback validate against a closed picker.
         # Scope by (user_id, thread_id, window_id) so concurrent
-        # interactive surfaces on other routes are untouched. The token
-        # entries carry the route fields directly, so we can match
-        # cheaply by iterating the small dict.
+        # interactive surfaces on other routes are untouched. The store +
+        # cache rows live in ``pick_token`` now; ``prune_for_route`` drops
+        # the cache rows AND their sibling tokens for this route's window.
         if cleared_window_id is not None:
-            stale_tokens = [
-                tok
-                for tok, e in _pick_tokens.items()
-                if e.user_id == user_id
-                and (e.thread_id or 0) == (thread_id or 0)
-                and e.window_id == cleared_window_id
-            ]
-            for tok in stale_tokens:
-                _pick_tokens.pop(tok, None)
-            # Cache rows for this route point at the same fingerprint
-            # set; drop them so a future mint doesn't reuse a row whose
-            # tokens we just invalidated.
-            stale_cache_keys = [
-                key
-                for key in _pick_token_cache
-                if key[0] == user_id
-                and key[1] == (thread_id or 0)
-                and key[2] == cleared_window_id
-            ]
-            for key in stale_cache_keys:
-                _pick_token_cache.pop(key, None)
+            pick_token.prune_for_route(user_id, thread_id, cleared_window_id)
 
     logger.debug(
         "Clear interactive: user=%d thread=%s single=%s",
@@ -3314,11 +3106,12 @@ def reset_for_tests() -> None:
 
     Co-located with the state it resets (the R3 reset-seam contract): every
     map is resolved by direct module reference, never ``getattr(name)`` string
-    indirection. Clears the picker/mode/meta/context maps, the pick-token
-    tables, and ``_route_locks`` (created lazily by ``_get_route_lock`` and
-    otherwise never cleaned up, so clearing between tests is a pure
-    improvement — they are recreated on demand). The PreToolUse record cache
-    moved to ``auq_source`` (R5); reset it via ``auq_source.reset_for_tests``.
+    indirection. Clears the picker/mode/meta/context maps and ``_route_locks``
+    (created lazily by ``_get_route_lock`` and otherwise never cleaned up, so
+    clearing between tests is a pure improvement — they are recreated on
+    demand). The PreToolUse record cache moved to ``auq_source`` (R5); reset it
+    via ``auq_source.reset_for_tests``. The pick-token store moved to
+    ``pick_token`` (R4); reset it via ``pick_token.reset_for_tests``.
 
     ``_clear_callbacks`` is a process-lifetime registry (``status_polling``
     registers ``_on_interactive_clear`` at import); it is intentionally NOT
@@ -3330,8 +3123,6 @@ def reset_for_tests() -> None:
     _interactive_msg_meta.clear()
     _last_completed_ask_tool_input.clear()
     _last_auq_tool_use_id.clear()
-    _pick_tokens.clear()
-    _pick_token_cache.clear()
     _auq_context_posted.clear()
     _auq_context_post_pending.clear()
     _auq_context_msgs.clear()

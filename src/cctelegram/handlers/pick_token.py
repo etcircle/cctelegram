@@ -1,0 +1,582 @@
+"""The single home for the AUQ pick-token store + atomic validate-and-consume.
+
+This module owns everything about an option-button's server-side lifecycle:
+minting a single-use token at render, caching sibling tokens so a same-form
+re-render stays byte-identical (Telegram ``MESSAGE_NOT_MODIFIED``), reading a
+token without consuming it, deriving the Wave-3 ledger key, and — the reason
+this module exists as one home — the atomic ``validate_and_consume`` that
+re-resolves the AUQ source through the SAME ``auq_source.resolve_auq_source``
+the minter used (measurable mint/validate SOURCE parity) and wins-or-loses the
+single-use consume by EXCLUSIVE RESERVATION without holding the store lock
+across pane/window I/O.
+
+Core responsibilities:
+  - Own ``_pick_tokens`` (token → entry) and ``_pick_token_cache`` (route +
+    fingerprint → sibling-token row with generation + consumed-generation
+    tombstone). Both are private; ``mint_row`` owns the cache-reuse logic.
+  - Mint single-use tokens with a TTL prune; reuse cached tokens for an
+    unchanged form WITHOUT bumping the row generation.
+  - ``validate_and_consume``: phase (a) owner-check-then-reserve under the
+    store lock; phase (b) the slow pane/window/source checks lock-RELEASED,
+    wrapped in try/finally so an exception or task cancellation unreserves
+    (only if still owned by this call); phase (c) win-or-lose the consume
+    under the lock, popping the token + evicting siblings + tombstoning the
+    cache row with the winner's generation.
+
+Key components:
+  - ``PickTokenEntry`` — the frozen per-button record (now public; carries the
+    minted ``source_kind`` / ``source_fingerprint`` / ``row_generation``).
+  - ``PickValidation`` — the typed outcome of ``validate_and_consume``.
+  - ``mint`` / ``mint_row`` / ``peek`` / ``stable_key`` / ``prune_for_route``.
+  - ``validate_and_consume`` — the atomic reservation-based finalizer.
+
+Stays a leaf: imports ``resolve_auq_source`` / ``ResolvedAuqSource`` from the
+``auq_source`` LEAF — NEVER from ``interactive_ui`` (no import cycle). Pane
+capture / window lookup are INJECTED into ``validate_and_consume`` so this
+module has no telegram/tmux import and is unit-testable.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+import time
+import uuid
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+from . import auq_ledger
+from .auq_source import resolve_auq_source
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterable
+
+    from ..terminal_parser import AskUserQuestionForm
+
+logger = logging.getLogger(__name__)
+
+
+# Conservative TTL — Claude Code's AskUserQuestion picker stays open at most
+# a few minutes in practice. 300s is comfortably longer than the slowest
+# turnaround but short enough that a forgotten token can't pile up.
+_PICK_TOKEN_TTL_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class PickTokenEntry:
+    """Server-side state bound to a single option-button click.
+
+    Frozen because once minted, the entry must not mutate (the staleness
+    check compares the *minted* fingerprint against the *current* parse).
+    Marking entries used is done by popping from the map inside
+    ``validate_and_consume``'s phase (c), not flipping a field, so single-use
+    semantics are enforced atomically.
+
+    ``source_kind`` / ``source_fingerprint`` capture the ``ResolvedAuqSource``
+    the minter resolved (measurable mint/validate source parity); they are
+    DISTINCT from ``fingerprint``, which is the form's parse fingerprint.
+    ``row_generation`` is the cache row's module-global generation at mint
+    time: the winning consume writes it into the row's ``consumed_generation``
+    tombstone, and a losing sibling compares its own ``row_generation`` to the
+    row's tombstone to tell ``already_consumed`` (generation match) from
+    ``expired`` (no match / row re-minted / row pruned).
+    """
+
+    window_id: str
+    user_id: int
+    thread_id: int | None
+    fingerprint: str  # form.fingerprint() at the moment the keyboard rendered
+    option_number: int  # the numeric shortcut to send (1-9)
+    option_label: str  # human label, used for log messages + sanity
+    is_review_submit: bool  # True iff this click should submit the review screen
+    expires_at: float  # monotonic clock deadline
+    source_kind: str  # "side_file" | "jsonl_cache" | "pane" — which branch minted
+    source_fingerprint: str  # ResolvedAuqSource.source_fingerprint at mint
+    row_generation: int  # the cache row's generation at mint time
+
+
+@dataclass
+class _CacheRow:
+    """The value side of ``_pick_token_cache`` for one cache key.
+
+    Carries the live sibling token list, the row's module-global generation
+    (the counter value at this row's last FRESH mint — a cache-REUSE re-render
+    does NOT bump it), the row's minted AUQ source tags (``source_kind`` /
+    ``source_fingerprint`` — so a re-render whose FORM fingerprint is unchanged
+    but whose SOURCE drifted is NOT reused; reusing it would hand back tokens
+    carrying the stale source and dead-loop validate→source_drift→refresh), the
+    consume tombstone (the winner's ``row_generation``, set in phase (c) when a
+    token from this row is consumed), and ``tombstoned_at`` (the monotonic time
+    the tombstone was set). A consumed row is KEPT as a tombstone with
+    ``tokens`` emptied until it ages past the pick-row TTL — that lets a losing
+    SIBLING token still read the tombstone for ``already_consumed`` instead of
+    seeing a dropped row (which would misclassify as ``expired``). No separate
+    tombstone map, no separate GC.
+    """
+
+    tokens: list[str]
+    row_generation: int
+    source_kind: str
+    source_fingerprint: str
+    consumed_generation: int | None = None
+    tombstoned_at: float | None = None
+
+
+_pick_tokens: dict[str, PickTokenEntry] = {}
+
+# Stable per-route cache so a re-render of the same form (same fingerprint)
+# reuses the same callback tokens. Without this, every status-polling tick
+# would mint fresh random tokens, the reply_markup would never match the
+# previous edit, Telegram would never return MESSAGE_NOT_MODIFIED, and the
+# bot would re-edit the card every poll cycle while the user is reading it.
+#
+# Key: (user_id, thread_id_or_0, window_id, fingerprint)
+# Value: _CacheRow — sibling tokens + generation + consume tombstone.
+_pick_token_cache: dict[tuple[int, int, str, str], _CacheRow] = {}
+
+# Per-token reservation markers. ``_reservations[token]`` holds the unique
+# per-call owner id (a uuid hex string) of the in-flight ``validate_and_consume``
+# call that currently owns the slow-phase reservation for that token. A second
+# caller observing a reservation at phase (a) returns ``already_consumed``
+# WITHOUT entering the slow path; the owning call's ``finally`` clears ONLY its
+# own reservation (owner-id guard) so it never clears a reservation a re-minted
+# or other call now owns.
+_reservations: dict[str, str] = {}
+
+# MODULE-GLOBAL monotonic generation counter. MUST be module-global, NOT
+# per-row: a pruned G1 row re-minted under the same key must advance to G2 — a
+# per-row counter would lose that memory and reuse G1, misclassifying a stale
+# tombstone. The counter survives row prune within the process; only
+# ``reset_for_tests`` resets it to its initial value.
+_INITIAL_GENERATION = 0
+_generation_counter = _INITIAL_GENERATION
+
+# Serialises mutations to the token store (the dicts above + the counter).
+# NEVER held across pane/window I/O — ``validate_and_consume`` releases it for
+# the slow phase (b).
+_store_lock = asyncio.Lock()
+
+
+def _next_generation() -> int:
+    """Allocate the next module-global monotonic generation value."""
+    global _generation_counter
+    _generation_counter += 1
+    return _generation_counter
+
+
+def _prune_expired_pick_tokens(now: float | None = None) -> None:
+    """Drop expired tokens from the in-memory map.
+
+    Runs on every mint — the map is small (≤ #options per active picker, so
+    typically ≤ 10) so the O(n) scan is cheap.
+
+    Cache-row pruning has two cases:
+      - A TOMBSTONED row (``consumed_generation`` set) is KEPT until it ages
+        past the pick-row TTL (``now - tombstoned_at > TTL``). Dropping it the
+        instant its tokens emptied would let a still-in-flight losing sibling
+        reach phase (c), find no row, and misclassify ``already_consumed`` as
+        ``expired``. The TTL horizon bounds the tombstone so it can't pile up.
+      - A NON-tombstoned row is dropped as soon as it has no live token (its
+        tokens all expired) so a stale fingerprint can't pin a dead token list.
+    """
+    if now is None:
+        now = time.monotonic()
+    stale = [tok for tok, e in _pick_tokens.items() if e.expires_at <= now]
+    for tok in stale:
+        _pick_tokens.pop(tok, None)
+        _reservations.pop(tok, None)
+    for cache_key, row in list(_pick_token_cache.items()):
+        if row.consumed_generation is not None:
+            # Tombstone: keep until past TTL.
+            if (
+                row.tombstoned_at is not None
+                and now - row.tombstoned_at > _PICK_TOKEN_TTL_SECONDS
+            ):
+                _pick_token_cache.pop(cache_key, None)
+        elif not any(t in _pick_tokens for t in row.tokens):
+            _pick_token_cache.pop(cache_key, None)
+
+
+def mint(entry: PickTokenEntry) -> str:
+    """Register a token for an option button. Returns the token id.
+
+    Token is 12 hex chars from ``secrets.token_hex(6)``. Since Wave 3, the
+    full callback payload is the keyed shape
+    ``aqp:<route_hash>:<fp8>:<opt>:<token>`` (~33-34 bytes; well under
+    Telegram's 64-byte cap). This is the only shape the callback handler
+    parses; the pre-Wave-3 ``aqp:<token>`` legacy shape is no longer accepted.
+    """
+    _prune_expired_pick_tokens()
+    # 6 bytes = 12 hex chars. Collision space ~2^48; with at most a few
+    # tokens live at any moment, accidental clash is astronomically
+    # unlikely. Loop on the off chance.
+    for _ in range(8):
+        token = secrets.token_hex(6)
+        if token not in _pick_tokens:
+            _pick_tokens[token] = entry
+            return token
+    raise RuntimeError("Unable to mint a unique pick token")
+
+
+@dataclass(frozen=True)
+class _MintSpec:
+    """One option-button to mint a token for (the per-option mint inputs)."""
+
+    option_number: int
+    option_label: str
+    is_review_submit: bool
+
+
+def mint_row(
+    *,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    fingerprint: str,
+    source_kind: str,
+    source_fingerprint: str,
+    specs: Iterable[_MintSpec],
+) -> list[str]:
+    """Mint (or reuse) the sibling-token row for one rendered form generation.
+
+    Owns the cache-reuse logic so ``_pick_token_cache`` stays private. On a
+    FRESH mint of a cache key — no live cached row, or a row whose tokens have
+    been TTL-evicted — allocates the next module-global generation via
+    ``_next_generation()``, stamps it on the row AND on each minted
+    ``PickTokenEntry``, and (re)creates the token list. On the cache-REUSE
+    path (the form is UNCHANGED, the SOURCE is unchanged, and the cached tokens
+    are still live, returned to preserve Telegram's ``MESSAGE_NOT_MODIFIED``)
+    returns the SAME tokens and does NOT bump the generation.
+
+    Source-aware reuse (closes a dead-loop): the cache key is keyed on the FORM
+    fingerprint only, so a re-render after a SOURCE drift (e.g. the side_file /
+    jsonl_cache ``tool_input`` changed while the visible form stayed identical)
+    hits the same key. Reusing that row would return tokens still stamped with
+    the OLD ``source_fingerprint``, and the next tap would ``source_drift`` →
+    refresh → reuse → ``source_drift`` forever. So reuse ALSO requires the
+    cached row's ``(source_kind, source_fingerprint)`` to match the freshly
+    resolved source; on a source drift we fall through to a FRESH mint (new
+    tokens, new generation, new source tags) even though the form fingerprint
+    is unchanged.
+
+    Returns the token list in the order ``specs`` was emitted.
+    """
+    _prune_expired_pick_tokens()
+    cache_key = (user_id, thread_id or 0, window_id, fingerprint)
+    spec_list = list(specs)
+
+    cached = _pick_token_cache.get(cache_key)
+    if (
+        cached is not None
+        and cached.consumed_generation is None
+        and cached.source_kind == source_kind
+        and cached.source_fingerprint == source_fingerprint
+        and len(cached.tokens) == len(spec_list)
+        and all(t in _pick_tokens for t in cached.tokens)
+    ):
+        # Cache-REUSE: unchanged form AND unchanged source, all tokens still
+        # live, not tombstoned. Same tokens, NO generation bump.
+        return cached.tokens
+
+    # FRESH mint: drop any stale/tombstoned row at this key, allocate a new
+    # generation, mint a token per spec stamped with that generation.
+    _pick_token_cache.pop(cache_key, None)
+    deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
+    generation = _next_generation()
+    tokens = [
+        mint(
+            PickTokenEntry(
+                window_id=window_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                fingerprint=fingerprint,
+                option_number=spec.option_number,
+                option_label=spec.option_label,
+                is_review_submit=spec.is_review_submit,
+                expires_at=deadline,
+                source_kind=source_kind,
+                source_fingerprint=source_fingerprint,
+                row_generation=generation,
+            )
+        )
+        for spec in spec_list
+    ]
+    _pick_token_cache[cache_key] = _CacheRow(
+        tokens=tokens,
+        row_generation=generation,
+        source_kind=source_kind,
+        source_fingerprint=source_fingerprint,
+    )
+    return tokens
+
+
+def peek(token: str) -> PickTokenEntry | None:
+    """Look up a token WITHOUT consuming it. Returns the entry or None.
+
+    Expired tokens are pruned as a side effect so the caller can treat a None
+    return as "definitely gone" without re-checking expiry. Used callback-side
+    SOLELY to read ``entry.window_id`` before the stale-window lease check;
+    the owner check + single-use consume happen atomically inside
+    ``validate_and_consume`` (never via this peek).
+    """
+    _prune_expired_pick_tokens()
+    return _pick_tokens.get(token)
+
+
+def stable_key(entry: PickTokenEntry) -> str:
+    """Reconstruct the Wave-3 ledger key from a live pick-token entry.
+
+    Pure derivation over ``make_route_hash`` / ``make_ledger_key`` /
+    ``fingerprint[:8]`` / ``option_number`` — the SAME construction the minter
+    uses for callback_data, so the validator's reconstructed key and the
+    minter's emitted key come from one function. Used by the callback's
+    collision-defense branch.
+    """
+    return auq_ledger.make_ledger_key(
+        auq_ledger.make_route_hash(entry.user_id, entry.thread_id, entry.window_id),
+        entry.fingerprint[:8],
+        entry.option_number,
+    )
+
+
+def prune_for_route(user_id: int, thread_id: int | None, window_id: str) -> None:
+    """Drop every cached pick-token row + its tokens for one route's windows.
+
+    Lock-prune callsite used by the render path before re-minting. Conservative
+    O(n) scan over the small cache; clears the sibling tokens of any row whose
+    key matches ``(user_id, thread_id_or_0, window_id, *)``.
+    """
+    norm_thread = thread_id or 0
+    for cache_key in list(_pick_token_cache.keys()):
+        key_user, key_thread, key_window, _fp = cache_key
+        if (
+            key_user == user_id
+            and key_thread == norm_thread
+            and key_window == window_id
+        ):
+            row = _pick_token_cache.pop(cache_key, None)
+            if row is not None:
+                for tok in row.tokens:
+                    _pick_tokens.pop(tok, None)
+                    _reservations.pop(tok, None)
+
+
+def reset_for_tests() -> None:
+    """Test-only: clear the token store, cache, reservations, and generation.
+
+    Resets ``_pick_tokens``, ``_pick_token_cache``, the reservation markers,
+    the per-row generations/tombstones (cleared with the cache), AND the
+    module-global ``_generation_counter`` back to its initial value so a test
+    that consumed into a tombstone cannot leak a generation into the next test.
+    """
+    global _generation_counter
+    _pick_tokens.clear()
+    _pick_token_cache.clear()
+    _reservations.clear()
+    _generation_counter = _INITIAL_GENERATION
+
+
+# ── The atomic reservation-based validate-and-consume ─────────────────────────
+
+
+@dataclass(frozen=True)
+class PickValidation:
+    """The typed outcome of ``validate_and_consume``.
+
+    ``entry`` is the minted ``PickTokenEntry`` (present whenever the token was
+    found at phase (a)); ``current_form`` is the live re-parse, supplied on
+    ``ok`` so the caller's submit-guard can compare against the same form the
+    consume validated.
+    """
+
+    outcome: Literal[
+        "ok",
+        "wrong_user",
+        "expired",
+        "already_consumed",
+        "stale_form",
+        "source_drift",
+        "window_gone",
+    ]
+    entry: PickTokenEntry | None
+    current_form: AskUserQuestionForm | None
+
+
+_ReservePhaseA = tuple[PickValidation | None, PickTokenEntry | None, str | None]
+
+
+def _reserve_phase_a(token: str, sender_id: int) -> _ReservePhaseA:
+    """Phase (a) body, run under the store lock (caller holds ``_store_lock``).
+
+    Returns ``(early_result, entry, reserved_by)``:
+      - a terminal ``PickValidation`` in ``early_result`` (token absent →
+        ``expired``; sender mismatch → ``wrong_user`` WITHOUT reserving;
+        already reserved/consumed by another in-flight caller →
+        ``already_consumed``), with ``entry``/``reserved_by`` None; OR
+      - ``(None, entry, reserved_by)`` after minting a unique reservation owner
+        id and marking the token RESERVED.
+    """
+    _prune_expired_pick_tokens()
+    entry = _pick_tokens.get(token)
+    if entry is None:
+        # Fully-consumed or never-existed token. The ledger (consulted by the
+        # callback BEFORE this call) already answered any real sequential
+        # duplicate, so this is the benign "refresh" case — NOT already_consumed.
+        return PickValidation("expired", None, None), None, None
+    if sender_id != entry.user_id:
+        # Owner check BEFORE reserving: a wrong-user tap must not reserve or
+        # burn the legitimate owner's token.
+        return PickValidation("wrong_user", entry, None), None, None
+    if token in _reservations:
+        # A concurrent in-flight caller already owns the reservation — the
+        # second caller never enters the slow path.
+        return PickValidation("already_consumed", entry, None), None, None
+    reserved_by = uuid.uuid4().hex
+    _reservations[token] = reserved_by
+    return None, entry, reserved_by
+
+
+def _commit_phase_c(token: str, entry: PickTokenEntry) -> PickValidation:
+    """Phase (c) body, run under the store lock (caller holds ``_store_lock``).
+
+    WIN the consume, or classify the loss by generation. Pops the token +
+    evicts siblings + tombstones the row on a win; reads the row's
+    ``consumed_generation`` tombstone on a loss to distinguish
+    ``already_consumed`` (generation match) from ``expired``.
+    """
+    cache_key = (
+        entry.user_id,
+        entry.thread_id or 0,
+        entry.window_id,
+        entry.fingerprint,
+    )
+    if token not in _pick_tokens:
+        # Lost the race / TTL-pruned. Classify by the row's tombstone.
+        row = _pick_token_cache.get(cache_key)
+        if (
+            row is not None
+            and row.consumed_generation is not None
+            and row.consumed_generation == entry.row_generation
+        ):
+            # A sibling from the SAME generation won the consume.
+            return PickValidation("already_consumed", entry, None)
+        # Row never tombstoned, re-minted to a newer generation, or TTL-pruned
+        # away (no generation match) → benign refresh.
+        return PickValidation("expired", entry, None)
+
+    # WIN: pop this token, evict siblings, tombstone the row with this
+    # generation. Keep the row as a tombstone (tokens emptied) until TTL prune.
+    _pick_tokens.pop(token, None)
+    _reservations.pop(token, None)
+    row = _pick_token_cache.get(cache_key)
+    if row is not None:
+        for sib in row.tokens:
+            if sib != token:
+                _pick_tokens.pop(sib, None)
+                _reservations.pop(sib, None)
+        row.tokens = []
+        row.consumed_generation = entry.row_generation
+        row.tombstoned_at = time.monotonic()
+    return PickValidation("ok", entry, None)
+
+
+async def validate_and_consume(
+    token: str,
+    sender_id: int,
+    *,
+    capture_pane: Callable[[str, int], Awaitable[str | None]],
+    find_window_by_id: Callable[[str], Awaitable[object | None]],
+) -> PickValidation:
+    """Atomically validate + single-use-consume a pick token by reservation.
+
+    EXCLUSIVE RESERVATION — the store lock is NEVER held across pane/window
+    I/O, and phase (b) is EXCEPTION/CANCELLATION-SAFE via a pre-initialized
+    ``completed_ok`` boolean + try/finally:
+
+      (a) Under the store lock: look up the token (absent → ``expired``); owner
+          check BEFORE reserving (mismatch → ``wrong_user``, no reservation);
+          already reserved/consumed by another in-flight caller →
+          ``already_consumed``; else mint a unique ``reserved_by`` owner id,
+          mark RESERVED, release the lock.
+      (b) Lock RELEASED — the slow work, wrapped in try/finally:
+            find_window_by_id → ``window_gone`` if None; capture_pane;
+            resolve_auq_source (the SAME leaf resolver mint used) +
+            resolve_ask_form; FORM-fingerprint compare → ``stale_form``;
+            SOURCE compare (kind + source_fingerprint vs the minted tags) →
+            ``source_drift``; then phase (c). On a WINNING consume set
+            ``completed_ok = True``.
+          finally: if not completed_ok (modeled reject, raised exception, OR
+            task cancellation), re-acquire the lock and unreserve the token
+            ONLY IF it is still reserved by THIS call's ``reserved_by`` owner
+            id (so we never clear a reservation a re-minted/other call owns).
+      (c) Re-acquire the lock to WIN the consume: token gone + row tombstoned
+          with a MATCHING generation → ``already_consumed``; token gone with no
+          generation match → ``expired``; else pop + evict siblings + tombstone
+          the row (``ok`` to exactly one caller per cache-row generation).
+
+    Pane capture / window lookup are INJECTED so this module has no
+    telegram/tmux import; ``capture_pane(window_id, scrollback_lines)`` and
+    ``find_window_by_id(window_id)`` mirror the live callsites.
+    """
+    from ..terminal_parser import resolve_ask_form
+
+    # Phase (a): owner-check-then-reserve under the lock.
+    async with _store_lock:
+        early, entry, reserved_by = _reserve_phase_a(token, sender_id)
+    if early is not None:
+        return early
+    assert entry is not None and reserved_by is not None
+
+    window_id = entry.window_id
+    completed_ok = False  # SOLE finally predicate; set before phase (b)'s try.
+    try:
+        w = await find_window_by_id(window_id)
+        if w is None:
+            return PickValidation("window_gone", entry, None)
+
+        pane = await capture_pane(window_id, 500)
+        live_source = resolve_auq_source(window_id, None, pane or "")
+        current_form = resolve_ask_form(live_source.payload, pane) if pane else None
+
+        if current_form is None or current_form.fingerprint() != entry.fingerprint:
+            return PickValidation("stale_form", entry, None)
+
+        # Source parity (measurable): the re-resolved (kind, source_fingerprint)
+        # must match the minted tags. Reachable only for side_file/jsonl_cache —
+        # for the pane kind the FORM-fingerprint check above fires first.
+        if (
+            live_source.kind != entry.source_kind
+            or live_source.source_fingerprint != entry.source_fingerprint
+        ):
+            return PickValidation("source_drift", entry, None)
+
+        # Phase (c): win-or-lose the consume under the lock.
+        async with _store_lock:
+            result = _commit_phase_c(token, entry)
+        if result.outcome == "ok":
+            completed_ok = True
+            # Hand the live re-parse back so the caller's submit-guard compares
+            # against the same form the consume validated.
+            return PickValidation("ok", entry, current_form)
+        return result
+    finally:
+        if not completed_ok:
+            # Modeled reject, raised exception, OR task cancellation. Unreserve
+            # ONLY this call's reservation (owner-id guard) so the token stays
+            # in the store for a legitimate later tap and we never clear a
+            # reservation a re-minted/other call now owns.
+            async with _store_lock:
+                if _reservations.get(token) == reserved_by:
+                    _reservations.pop(token, None)
+
+
+def _mint_spec(
+    option_number: int, option_label: str, is_review_submit: bool
+) -> _MintSpec:
+    """Construct a ``_MintSpec`` (public-ish helper for the minter callsites)."""
+    return _MintSpec(
+        option_number=option_number,
+        option_label=option_label,
+        is_review_submit=is_review_submit,
+    )

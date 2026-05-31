@@ -25,7 +25,7 @@ import pytest
 from cctelegram import bot as bot_module
 from cctelegram.handlers import auq_ledger
 from cctelegram.handlers.callback_data import CB_ASK_PICK
-from cctelegram.handlers.interactive_ui import _PickTokenEntry, _pick_tokens
+from cctelegram.handlers import pick_token
 from tests.conftest import ScenarioHarness, make_update_callback
 
 
@@ -58,7 +58,7 @@ async def test_intruder_click_after_dispatch_blocked_without_label_leak(
     )
 
     # Owner mints a pick token and the ledger lands in ``dispatched``.
-    entry = _PickTokenEntry(
+    entry = pick_token.PickTokenEntry(
         window_id=wid,
         user_id=_OWNER_ID,
         thread_id=_THREAD_ID,
@@ -67,9 +67,11 @@ async def test_intruder_click_after_dispatch_blocked_without_label_leak(
         option_label=_LABEL,
         is_review_submit=False,
         expires_at=time.monotonic() + 300.0,
+        source_kind="pane",
+        source_fingerprint="sfp",
+        row_generation=1,
     )
-    token = "abc123def456"
-    _pick_tokens[token] = entry
+    token = pick_token.mint(entry)
     route_hash = auq_ledger.make_route_hash(_OWNER_ID, _THREAD_ID, wid)
     fp8 = _FINGERPRINT[:8]
     callback_data = f"{CB_ASK_PICK}{route_hash}:{fp8}:{_OPT}:{token}"
