@@ -157,6 +157,34 @@ typically unavailable during the live window), but a schema-v2 side file
 carrying the hook-captured `window_id` could discriminate — deferred as
 off-contract.
 
+**Pick-token deadline refresh (D3-β — a live card's tokens track its OBSERVED
+lifetime).** `pick_token._PICK_TOKEN_TTL_SECONDS = 300.0` bounds MEMORY only, not
+correctness: a user can leave a live AUQ picker open for tens of minutes to
+hours, and the old assumption that the token TTL outlives the picker was false —
+a long idle pruned the option token out from under a still-on-screen card, so
+the first tap hit `peek_none` and the handler *refreshed instead of
+dispatching* (the dead-first-tap). Fix: at EVERY live-card-preserve branch where
+`status_polling` resets the absent-streak and returns without re-rendering
+(same-hash idle, `is_picker_anchor_visible` Submit, `side_file_live_for_window`
+preservation), the poller calls `await
+pick_token.refresh_route_deadlines(user, thread, window,
+min_remaining_s=_DEADLINE_REFRESH_MARGIN_S)`. It re-stamps each live, non-expired
+token within the margin of its deadline by REPLACING the frozen `PickTokenEntry`
+with `expires_at = now + TTL` — **same token string, fingerprint, source tags,
+and `row_generation`**, so the keyboard stays byte-identical (`MESSAGE_NOT_MODIFIED`,
+no churn) and `_commit_phase_c`'s generation logic is untouched. It never
+resurrects an already-expired token (the `now < expires_at` guard) or a
+tombstoned row (`consumed_generation is None`), gated on the same liveness
+authorities the clear-gate trusts; a genuinely-abandoned card's tokens still
+prune at 300s. A fresh mint prunes prior-generation non-tombstoned rows for the
+route so the refresh only keeps the CURRENT card alive. Pull-only (rides the 1 Hz
+poll; no observer — c313657 forbidden). The residual cases — a restart (in-memory
+tokens wiped) or a liveness-gate false-negative — degrade to the honest
+`_refresh_pick_card` MODAL "↻ Refreshed — tap your choice again." (D3-α,
+`show_alert=True` at the `peek_none`/`expired` callsites only; the ledger-state
+callers keep their specific non-modal warnings). Restart re-dispatch of a
+token-less stale tap (so even that first tap registers) is a deferred follow-up.
+
 ## MessageDisplay live-prose capture (Bug 2)
 
 Assistant free-text prose written in the same turn as an `AskUserQuestion` /

@@ -736,3 +736,131 @@ class TestSourceParityPaneKind:
         # FORM check fires first; pane never yields source_drift.
         result = await _validate(token, _USER, pane=_AFFORDANCE_PANE)
         assert result.outcome == "stale_form"
+
+
+# ── D3-β: refresh_route_deadlines (keep a visibly-live card's tokens alive) ──────
+
+
+def _mint_row(
+    fingerprint: str,
+    specs,
+    *,
+    window: str = _WINDOW,
+    user: int = _USER,
+    thread: int = _THREAD,
+):
+    """Mint a row at an arbitrary fingerprint (no pane validation needed for the
+    deadline-refresh unit tests — they read/replace ``_pick_tokens`` directly)."""
+    return pick_token.mint_row(
+        user_id=user,
+        thread_id=thread,
+        window_id=window,
+        fingerprint=fingerprint,
+        source_kind="pane",
+        source_fingerprint="srcfp",
+        specs=specs,
+    )
+
+
+class TestRefreshRouteDeadlines:
+    """D3-β: a poll on a visibly-live card re-stamps its tokens' deadlines so a
+    token's lifetime tracks the card's OBSERVED lifetime, not a fixed 300s wall
+    clock — closing the reported idle dead-tap. SAME token string + generation
+    (no callback churn); never resurrects an expired or tombstoned token."""
+
+    @pytest.mark.asyncio
+    async def test_near_expiry_token_refreshed_same_token_and_generation(self):
+        toks = _mint_row("fpA", [pick_token._mint_spec(1, "Opt 1", False)])
+        tok = toks[0]
+        entry = pick_token._pick_tokens[tok]
+        exp, gen, fp = entry.expires_at, entry.row_generation, entry.fingerprint
+        n = await pick_token.refresh_route_deadlines(
+            _USER, _THREAD, _WINDOW, min_remaining_s=60, now=exp - 30
+        )
+        assert n == 1
+        new = pick_token._pick_tokens[tok]  # SAME token key
+        assert new.expires_at == pytest.approx(
+            (exp - 30) + pick_token._PICK_TOKEN_TTL_SECONDS
+        )
+        assert new.row_generation == gen  # generation preserved (no churn)
+        assert new.fingerprint == fp
+
+    @pytest.mark.asyncio
+    async def test_token_not_near_expiry_is_not_refreshed(self):
+        toks = _mint_row("fpA", [pick_token._mint_spec(1, "Opt 1", False)])
+        entry = pick_token._pick_tokens[toks[0]]
+        exp = entry.expires_at
+        # 200s of life left, margin is 60s → no-op.
+        n = await pick_token.refresh_route_deadlines(
+            _USER, _THREAD, _WINDOW, min_remaining_s=60, now=exp - 200
+        )
+        assert n == 0
+        assert pick_token._pick_tokens[toks[0]].expires_at == exp
+
+    @pytest.mark.asyncio
+    async def test_expired_token_is_not_resurrected(self):
+        toks = _mint_row("fpA", [pick_token._mint_spec(1, "Opt 1", False)])
+        entry = pick_token._pick_tokens[toks[0]]
+        exp = entry.expires_at
+        # now is PAST the deadline → the resurrection guard must skip it.
+        n = await pick_token.refresh_route_deadlines(
+            _USER, _THREAD, _WINDOW, min_remaining_s=60, now=exp + 10
+        )
+        assert n == 0
+        assert pick_token._pick_tokens[toks[0]].expires_at == exp
+
+    @pytest.mark.asyncio
+    async def test_tombstoned_row_is_not_refreshed(self):
+        # A consumed row is a tombstone (consumed_generation set, tokens=[]).
+        token = _mint_baseline_token()
+        result = await _validate(token, _USER)
+        assert result.outcome == "ok"
+        n = await pick_token.refresh_route_deadlines(
+            _USER, _THREAD, _WINDOW, min_remaining_s=600, now=time.monotonic()
+        )
+        assert n == 0
+
+    @pytest.mark.asyncio
+    async def test_multi_option_row_all_tokens_refreshed(self):
+        toks = _mint_row(
+            "fpA",
+            [
+                pick_token._mint_spec(1, "Opt 1", False),
+                pick_token._mint_spec(2, "Opt 2", False),
+            ],
+        )
+        exp = pick_token._pick_tokens[toks[0]].expires_at
+        n = await pick_token.refresh_route_deadlines(
+            _USER, _THREAD, _WINDOW, min_remaining_s=60, now=exp - 30
+        )
+        assert n == 2
+        for t in toks:
+            assert pick_token._pick_tokens[t].expires_at == pytest.approx(
+                (exp - 30) + pick_token._PICK_TOKEN_TTL_SECONDS
+            )
+
+    @pytest.mark.asyncio
+    async def test_only_the_matching_route_window_is_refreshed(self):
+        ta = _mint_row("fpA", [pick_token._mint_spec(1, "A", False)], window="@1")
+        tb = _mint_row("fpB", [pick_token._mint_spec(1, "B", False)], window="@2")
+        ea = pick_token._pick_tokens[ta[0]].expires_at
+        eb = pick_token._pick_tokens[tb[0]].expires_at
+        n = await pick_token.refresh_route_deadlines(
+            _USER, _THREAD, "@1", min_remaining_s=60, now=ea - 30
+        )
+        assert n == 1
+        assert pick_token._pick_tokens[ta[0]].expires_at > ea  # @1 refreshed
+        assert pick_token._pick_tokens[tb[0]].expires_at == eb  # @2 untouched
+
+    @pytest.mark.asyncio
+    async def test_fresh_mint_prunes_prior_generation_route_rows(self):
+        # codex v3 P2a: a fresh mint = a new card generation for this route;
+        # prior non-tombstoned rows (different fingerprint, same route) are
+        # dropped so β only keeps the CURRENT card alive + memory stays bounded.
+        a = _mint_row("fpA", [pick_token._mint_spec(1, "A", False)])
+        assert (_USER, _THREAD, _WINDOW, "fpA") in pick_token._pick_token_cache
+        b = _mint_row("fpB", [pick_token._mint_spec(1, "B", False)])
+        assert (_USER, _THREAD, _WINDOW, "fpA") not in pick_token._pick_token_cache
+        assert pick_token.peek(a[0]) is None  # prior-gen token evicted
+        assert (_USER, _THREAD, _WINDOW, "fpB") in pick_token._pick_token_cache
+        assert pick_token.peek(b[0]) is not None  # current card intact

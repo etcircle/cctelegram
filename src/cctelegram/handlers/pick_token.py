@@ -43,7 +43,7 @@ import logging
 import secrets
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 from . import auq_ledger
@@ -57,9 +57,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Conservative TTL — Claude Code's AskUserQuestion picker stays open at most
-# a few minutes in practice. 300s is comfortably longer than the slowest
-# turnaround but short enough that a forgotten token can't pile up.
+# TTL bounds MEMORY only — dead-tap correctness is handled by the poller's
+# ``refresh_route_deadlines`` (D3-β: a visibly-live card's tokens are re-stamped
+# every poll so a token's lifetime tracks the card's OBSERVED lifetime), NOT by
+# this constant. A genuinely-abandoned card's tokens still prune at 300s. The
+# pre-β assumption that "the picker stays open at most a few minutes" was false:
+# a user can leave a live AUQ open for tens of minutes to hours.
 _PICK_TOKEN_TTL_SECONDS = 300.0
 
 
@@ -291,6 +294,26 @@ def mint_row(
     # FRESH mint: drop any stale/tombstoned row at this key, allocate a new
     # generation, mint a token per spec stamped with that generation.
     _pick_token_cache.pop(cache_key, None)
+    # Stale-row hygiene (so D3-β's route-wide deadline refresh only keeps the
+    # CURRENT card's tokens alive, and memory stays bounded): a fresh mint means
+    # a NEW card generation is rendered for this route, so any OTHER
+    # NON-tombstoned row for the same (user, thread, window) from a prior
+    # fingerprint is no longer the visible card — drop it + its tokens. Keep
+    # TOMBSTONED rows (a losing sibling still reads their consumed_generation).
+    for other_key in list(_pick_token_cache.keys()):
+        o_user, o_thread, o_window, _o_fp = other_key
+        if (
+            o_user == user_id
+            and o_thread == (thread_id or 0)
+            and o_window == window_id
+            and other_key != cache_key
+        ):
+            other_row = _pick_token_cache.get(other_key)
+            if other_row is not None and other_row.consumed_generation is None:
+                for tok in other_row.tokens:
+                    _pick_tokens.pop(tok, None)
+                    _reservations.pop(tok, None)
+                _pick_token_cache.pop(other_key, None)
     deadline = time.monotonic() + _PICK_TOKEN_TTL_SECONDS
     generation = _next_generation()
     tokens = [
@@ -378,6 +401,64 @@ def prune_for_route(user_id: int, thread_id: int | None, window_id: str) -> None
                 for tok in row.tokens:
                     _pick_tokens.pop(tok, None)
                     _reservations.pop(tok, None)
+
+
+async def refresh_route_deadlines(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    *,
+    min_remaining_s: float,
+    now: float | None = None,
+) -> int:
+    """D3-β: re-stamp the TTL of a VISIBLY-LIVE card's pick tokens.
+
+    The poller calls this at every live-card-preserve branch (same-hash idle,
+    anchor-visible Submit, side-file-live) so a token's lifetime tracks the
+    card's OBSERVED lifetime instead of a fixed 300s wall clock — closing the
+    reported "first tap after a long idle is swallowed" bug at its source (the
+    token is never pruned out from under a still-on-screen card).
+
+    For each live, NON-tombstoned cache row of the route, every token that is
+    STILL LIVE (``now < expires_at``) and within ``min_remaining_s`` of its
+    deadline is REPLACED in ``_pick_tokens`` with a copy whose only change is
+    ``expires_at = now + TTL``. The token string, ``fingerprint``, source tags,
+    and ``row_generation`` are preserved, so the rendered keyboard is
+    byte-identical (Telegram ``MESSAGE_NOT_MODIFIED``) and ``_commit_phase_c``'s
+    generation classification is untouched. A genuinely-expired token
+    (``expires_at <= now``) is NOT resurrected — it still prunes; tombstoned
+    rows (``consumed_generation`` set) are skipped. Returns the count refreshed.
+
+    Holds ``_store_lock`` and does no ``await`` after acquiring it (the body is
+    a non-yielding sync section), so it never interleaves with
+    ``validate_and_consume``'s reserved slow phase.
+    """
+    norm_thread = thread_id or 0
+    refreshed = 0
+    async with _store_lock:
+        if now is None:
+            now = time.monotonic()
+        deadline = now + _PICK_TOKEN_TTL_SECONDS
+        for cache_key, row in _pick_token_cache.items():
+            key_user, key_thread, key_window, _fp = cache_key
+            if (
+                key_user != user_id
+                or key_thread != norm_thread
+                or key_window != window_id
+                or row.consumed_generation is not None
+            ):
+                continue
+            for tok in row.tokens:
+                entry = _pick_tokens.get(tok)
+                if entry is None:
+                    continue
+                # Re-stamp ONLY a still-live token nearing expiry. ``now <
+                # expires_at`` is the non-resurrection guard (a token already
+                # past its deadline must still prune, never get a new lease).
+                if now < entry.expires_at <= now + min_remaining_s:
+                    _pick_tokens[tok] = replace(entry, expires_at=deadline)
+                    refreshed += 1
+    return refreshed
 
 
 def reset_for_tests() -> None:

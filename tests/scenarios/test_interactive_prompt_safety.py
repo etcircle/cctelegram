@@ -98,7 +98,8 @@ async def test_wrong_user_click_is_rejected_without_consuming_token(
 async def test_stale_token_refreshes_card(
     scenario: ScenarioHarness,
 ) -> None:
-    """A click against an unknown / expired token answers 'Card expired, refreshing.'."""
+    """A click against an unknown / expired token answers the honest modal
+    '↻ Refreshed — tap your choice again.' (D3-α: not the false 'Card expired')."""
     wid = scenario.add_window(window_name="repo", cwd="/repo")
     scenario.bind_thread(thread_id=42, window_id=wid, display_name="repo", cwd="/repo")
     # Mark the user in interactive mode so the refresh path has a window to read.
@@ -115,7 +116,9 @@ async def test_stale_token_refreshes_card(
 
     update.callback_query.answer.assert_awaited()
     answer_text = update.callback_query.answer.await_args.args[0]
-    assert "Card expired" in answer_text
+    assert "tap your choice again" in answer_text.lower()
+    # D3-α: the dead-token prompt is a MODAL the user can't miss.
+    assert update.callback_query.answer.await_args.kwargs.get("show_alert") is True
 
 
 @pytest.mark.asyncio

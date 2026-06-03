@@ -169,6 +169,56 @@ class TestStatusPollerSettingsDetection:
             )
 
     @pytest.mark.asyncio
+    async def test_same_hash_idle_refreshes_pick_token_deadlines(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """D3-β: a same-hash idle tick (live card, no re-render) re-stamps the
+        route's pick-token deadlines so an idle tap never finds a pruned token."""
+        import hashlib
+
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.status_polling import extract_interactive_content
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        _interactive_mode[(1, 42)] = window_id
+        # Pin the published hash to the LIVE pane's hash so the same-hash
+        # early-return fires (no re-render).
+        ui_content = extract_interactive_content(sample_pane_settings)
+        assert ui_content is not None
+        ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
+        status_polling._last_published_ui_hash[route] = ui_hash
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling.pick_token,
+                "refresh_route_deadlines",
+                new_callable=AsyncMock,
+            ) as mock_refresh,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            mock_handle_ui.assert_not_awaited()  # same-hash → no re-render
+            mock_refresh.assert_awaited_once_with(
+                1,
+                42,
+                window_id,
+                min_remaining_s=status_polling._DEADLINE_REFRESH_MARGIN_S,
+            )
+
+    @pytest.mark.asyncio
     async def test_first_picker_content_queue_timeout_still_renders(
         self, mock_bot: AsyncMock, sample_pane_settings: str
     ):

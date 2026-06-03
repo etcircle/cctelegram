@@ -60,6 +60,7 @@ async def _refresh_pick_card(
     adapters: Any,
     *,
     text: str,
+    show_alert: bool = False,
     fallback_window_id: str | None = None,
 ) -> None:
     """Answer the callback with ``text`` and re-render the live picker card.
@@ -69,8 +70,14 @@ async def _refresh_pick_card(
     the user to retry). Resolves the route's current window via
     ``get_interactive_window``; falls back to ``fallback_window_id`` when
     the ledger row pointed at a window that's no longer bound.
+
+    ``show_alert`` is passed through to the callback answer: the dead-token
+    (``peek_none`` / ``expired``) callers set it ``True`` so their honest
+    "tap again" prompt is a MODAL the user can't miss, while the ledger-state
+    callers keep the default ``False`` so their specific warnings (e.g.
+    ``failed_after_digit`` "verify in tmux") stay as non-modal toasts.
     """
-    await safe_answer(query, text, show_alert=False)
+    await safe_answer(query, text, show_alert=show_alert)
     thread_id = _get_thread_id(update)
     window_id = get_interactive_window(user.id, thread_id) or fallback_window_id or ""
     if window_id:
@@ -763,7 +770,8 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 user,
                 tmux_manager,
                 adapters,
-                text="Card expired, refreshing.",
+                text="↻ Refreshed — tap your choice again.",
+                show_alert=True,
             )
             return
         thread_id = peeked.thread_id
@@ -827,7 +835,8 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 user,
                 tmux_manager,
                 adapters,
-                text="Card expired, refreshing.",
+                text="↻ Refreshed — tap your choice again.",
+                show_alert=True,
                 fallback_window_id=window_id,
             )
             return

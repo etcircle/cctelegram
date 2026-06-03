@@ -47,7 +47,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
-from . import auq_source
+from . import auq_source, pick_token
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -132,6 +132,13 @@ _last_published_ui_hash: dict[tuple[int, int, str], str] = {}
 # consecutive absent polls before clearing so transient single-frame redraws
 # can't kill a live picker; reset to 0 on any non-None UI observation.
 ABSENT_STREAK_THRESHOLD = 3  # ~3s at STATUS_POLL_INTERVAL=1.0
+
+# D3-β: re-stamp a live card's pick-token deadlines when a token is within this
+# many seconds of its 300s TTL. At STATUS_POLL_INTERVAL=1.0 a live card is
+# re-stamped at most ~once per (300 - margin)s, so the keyboard stays
+# byte-identical (no MESSAGE_NOT_MODIFIED churn) while never letting a visible
+# button's token expire.
+_DEADLINE_REFRESH_MARGIN_S = 60.0
 _absent_streak: dict[tuple[int, int, str], int] = {}
 
 # Per-route last-rendered run_state, keyed by ``(user_id, thread_id_or_0,
@@ -367,7 +374,18 @@ async def update_status_message(
             )
             ui_hash = hashlib.sha256(ui_content.content.encode("utf-8")).hexdigest()
             if ui_hash == _last_published_ui_hash.get(route):
-                # Same UI as last publish — user is mid-interaction, skip.
+                # Same UI as last publish — user is mid-interaction, skip the
+                # re-render. D3-β: BUT re-stamp this live card's pick-token
+                # deadlines so an idle tap never finds a TTL-pruned token (the
+                # reported dead-first-tap). Inside the same-hash branch (NOT at
+                # the streak reset above, which also runs the re-render path,
+                # which fresh-mints anyway). Same token + generation → no churn.
+                await pick_token.refresh_route_deadlines(
+                    user_id,
+                    thread_id,
+                    window_id,
+                    min_remaining_s=_DEADLINE_REFRESH_MARGIN_S,
+                )
                 return
             # New UI content. Store the new hash BEFORE the await so a
             # concurrent tick on the same route doesn't fire a duplicate
@@ -418,6 +436,14 @@ async def update_status_message(
         # anchors present → reset the streak, keep the card.
         if is_picker_anchor_visible(pane_text):
             _absent_streak.pop(route, None)
+            # D3-β: live (scrolled/compressed) Submit card — keep its tokens
+            # alive so a tap after a long idle on this screen still dispatches.
+            await pick_token.refresh_route_deadlines(
+                user_id,
+                thread_id,
+                window_id,
+                min_remaining_s=_DEADLINE_REFRESH_MARGIN_S,
+            )
             # SET (b): scrolled/compressed Submit screen — picker tail anchors
             # visible. Pane-confirmed → promote + repaint.
             await route_runtime.mark_interactive_pending(route)
@@ -441,6 +467,15 @@ async def update_status_message(
         # the overlay this must survive.
         if auq_source.side_file_live_for_window(window_id):
             _absent_streak.pop(route, None)
+            # D3-β: card preserved on side-file liveness (pane obscured by a
+            # task-list overlay / scrolled Submit / tool spam) — keep its tokens
+            # alive so a tap after a long obscured idle still dispatches.
+            await pick_token.refresh_route_deadlines(
+                user_id,
+                thread_id,
+                window_id,
+                min_remaining_s=_DEADLINE_REFRESH_MARGIN_S,
+            )
             logger.debug(
                 "Interactive UI absent on pane but PreToolUse side file live "
                 "for window_id %s — preserving card (route=%s)",
