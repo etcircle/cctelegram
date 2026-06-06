@@ -18,7 +18,7 @@ import pytest
 
 from cctelegram import bot as bot_module, terminal_parser
 from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
-from cctelegram.handlers import auq_ledger, interactive_ui
+from cctelegram.handlers import auq_ledger, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK, CB_ASK_TOGGLE
 from cctelegram.session_monitor import NewMessage
 from cctelegram.utils import app_dir
@@ -485,3 +485,132 @@ def test_aqt_prefix_is_registered() -> None:
     entry = lookup("aqt:route:fp:2:token")
     assert entry is not None
     assert entry.executor_name == "execute_interactive_callback"
+
+
+# ── Review-screen "Submit answers" stale-token-after-nav race (RED gate) ────
+#
+# The two review fixtures are the SAME live Claude Code v2.1.161 multi-select
+# review screen; only the terminal cursor ``❯`` moved between
+# ``1. Submit answers`` and ``2. Cancel`` (a ↑/↓ nav). On current main the
+# cursor is in the form fingerprint, so a nav rotates the Submit pick token out
+# from under the still-displayed button. The fix makes the review fingerprint
+# cursor-blind (token survives) + relaxes the Submit guard + makes the
+# is_review_submit tag cursor-blind.
+
+_REVIEW_SUBMIT_FIXTURE = "auq_multiselect_review_cursor_submit.txt"
+_REVIEW_CANCEL_FIXTURE = "auq_multiselect_review_cursor_cancel.txt"
+
+
+def _token_of(callback_data: str) -> str:
+    # aqp:<route_hash>:<fp8>:<opt>:<token> — token is the final colon segment.
+    return callback_data.split(":")[-1]
+
+
+@pytest.mark.asyncio
+async def test_review_submit_after_poller_rerender_dispatches(
+    scenario: ScenarioHarness,
+) -> None:
+    """RED pre-fix / GREEN post-fix — the steady-state ``peek_none`` path.
+
+    Render the review screen (cursor on Submit) → capture the ✅ Submit ``aqp:``
+    callback the Telegram client still shows. A ↑/↓ nav moves the live pane to
+    cursor-on-Cancel; the poller re-render re-mints (FRESH path, new fingerprint
+    = new cache_key) and the stale-row hygiene pops the prior Submit token →
+    ``peek()`` is None. Tapping the displayed Submit button then hits the
+    ``peek_none`` branch and refreshes the card WITHOUT dispatching.
+
+    The assertion is the post-fix behaviour (the tap dispatches ``"1"``+``Enter``).
+    RED on current main: the review fingerprints differ (cursor in canonical),
+    so the poller re-mint pops the displayed Submit token (``peek_none``), the
+    card refreshes, and NOTHING is sent → the assertion fails. GREEN after the
+    fix: cursor-blind fp → cache reuse keeps the SAME token alive → dispatch.
+    """
+    wid = _bind(scenario, _fixture(_REVIEW_SUBMIT_FIXTURE))
+    _write_side_file(_SESSION_ID, _two_toggled_input())
+
+    await _render(scenario, wid)
+    submit_cb = _prefixes(_callbacks(scenario), CB_ASK_PICK)[0]
+
+    # ↑/↓ nav → poller re-render against the cursor-on-Cancel pane.
+    scenario.tmux.set_pane(wid, _fixture(_REVIEW_CANCEL_FIXTURE))
+    await _render(scenario, wid)
+
+    scenario.tmux.sent_keys.clear()
+    await _tap(scenario, submit_cb)
+    # Post-fix the token survives (cache reuse, byte-identical keyboard) and the
+    # tap dispatches "1" + Enter. RED on main: the token was popped (peek_none),
+    # the card refreshes, and nothing is sent.
+    assert scenario.tmux.sent_keys[-2:] == [
+        (wid, "1", False, True),
+        (wid, "Enter", False, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_review_submit_sub_poll_window_dispatches(
+    scenario: ScenarioHarness,
+) -> None:
+    """RED pre-fix / GREEN post-fix — the sub-poll ``stale_form`` path.
+
+    Capture the Submit ``aqp:`` callback at cursor-on-Submit, then move the live
+    pane to cursor-on-Cancel WITHOUT a re-render (the user taps within ~1s of the
+    nav, before the 1 Hz poller re-renders). The minted token is still resident,
+    but ``validate_and_consume`` reparses the live pane and the fingerprint no
+    longer matches → ``stale_form`` → refresh, no dispatch.
+
+    RED today: cursor-on-Cancel live parse fingerprint != minted cursor-on-Submit
+    fingerprint → stale_form → no keystrokes. Post-fix the review fingerprint is
+    cursor-blind so the parse matches and ``"1"``+``Enter`` dispatch.
+    """
+    wid = _bind(scenario, _fixture(_REVIEW_SUBMIT_FIXTURE))
+    _write_side_file(_SESSION_ID, _two_toggled_input())
+
+    await _render(scenario, wid)
+    submit_cb = _prefixes(_callbacks(scenario), CB_ASK_PICK)[0]
+
+    # Live pane moved to cursor-on-Cancel; NO re-render (sub-poll-cycle window).
+    scenario.tmux.set_pane(wid, _fixture(_REVIEW_CANCEL_FIXTURE))
+
+    scenario.tmux.sent_keys.clear()
+    await _tap(scenario, submit_cb)
+    assert scenario.tmux.sent_keys[-2:] == [
+        (wid, "1", False, True),
+        (wid, "Enter", False, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_review_first_render_cursor_on_cancel_tags_submit_and_checkmark(
+    scenario: ScenarioHarness,
+) -> None:
+    """RED pre-fix / GREEN post-fix — the cursor-blind ``is_review_submit`` tag.
+
+    A card whose FIRST render already has the terminal cursor on Cancel must
+    still tag option 1 ("Submit answers") as ``is_review_submit=True`` and show
+    the ✅ prefix on its button — otherwise the relaxed Submit guard is skipped
+    and the ✅ affordance never appears.
+
+    This is the MEANINGFUL RED assertion: on current main the tag is
+    cursor-derived (``form.is_review_screen and opt.cursor and opt.number == 1``)
+    so with the cursor on Cancel the Submit row tags ``is_review_submit=False``
+    and the button text is "1. Submit answers" (no ✅). A dispatch-only assertion
+    would NOT be RED here (a False tag SKIPS the guard, so a tap would dispatch).
+    """
+    wid = _bind(scenario, _fixture(_REVIEW_CANCEL_FIXTURE))
+    _write_side_file(_SESSION_ID, _two_toggled_input())
+
+    await _render(scenario, wid)
+
+    markup = _last_markup(scenario)
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    pick_buttons = [b for b in buttons if b.callback_data.startswith(CB_ASK_PICK)]
+    assert pick_buttons, "expected aqp: review pick buttons"
+
+    # Option 1 (Submit answers) is the :1: callback.
+    submit_btn = next(b for b in pick_buttons if b.callback_data.split(":")[3] == "1")
+
+    # RED on main: cursor-derived tag is False → no ✅ prefix, no review-submit tag.
+    assert "✅" in submit_btn.text
+    submit_entry = pick_token.peek(_token_of(submit_btn.callback_data))
+    assert submit_entry is not None
+    assert submit_entry.is_review_submit is True

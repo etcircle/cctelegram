@@ -3007,3 +3007,82 @@ class TestArrowNavStaleScrollbackCursor:
         assert form is not None
         assert [o.number for o in form.options if o.cursor] == [2]
         assert next(o for o in form.options if o.number == 2).recommended is True
+
+
+# ── Review-screen cursor-blind fingerprint (AUQ Submit-after-nav race) ──────
+
+
+class TestReviewScreenFingerprintCursorBlind:
+    """RED gate for the multi-select review-screen Submit-after-nav race.
+
+    Both fixtures are the SAME live Claude Code v2.1.161 review screen — only
+    the terminal cursor ``❯`` moved between ``1. Submit answers`` and
+    ``2. Cancel``. A ↑/↓ nav on the review screen changes nothing structural
+    (the answer summary is already excluded from the canonical); the only delta
+    is the per-option cursor bit. The fix makes the review-screen fingerprint
+    cursor-blind so a nav does NOT rotate the pick token out from under the
+    still-displayed Submit button.
+
+    RED pre-fix / GREEN post-fix: on current main the cursor bit is in
+    ``_canonical_repr`` for review screens too, so these two fingerprints
+    DIFFER and the equality assertion fails.
+    """
+
+    @staticmethod
+    def _fixture(name: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "fixtures" / name).read_text()
+
+    def test_review_fixtures_parse_to_submit_cancel(self):
+        """Both fixtures parse to the documented review-screen shape (sanity
+        anchor — passes on current main; it is the precondition for the RED
+        equality test below, not itself the RED assertion)."""
+        for name, submit_cursor in (
+            ("auq_multiselect_review_cursor_submit.txt", True),
+            ("auq_multiselect_review_cursor_cancel.txt", False),
+        ):
+            form = parse_ask_user_question(self._fixture(name))
+            assert form is not None
+            assert form.is_review_screen is True
+            assert [(o.number, o.label) for o in form.options] == [
+                (1, "Submit answers"),
+                (2, "Cancel"),
+            ]
+            assert form.options[0].cursor is submit_cursor
+            assert form.options[1].cursor is (not submit_cursor)
+
+    def test_review_fingerprint_equal_across_cursor_move(self):
+        """RED pre-fix / GREEN post-fix.
+
+        A cursor move (Submit→Cancel) on the review screen must NOT change the
+        form fingerprint — otherwise the poller re-mint pops the displayed
+        Submit token (peek_none) or a sub-poll tap fails fingerprint parity
+        (stale_form), and the Submit button stops dispatching. Purely
+        behavioral (uses only the public ``fingerprint()``).
+
+        FAILS on current main: the review fingerprints differ solely because
+        the cursor moved (the per-option ``:C`` bit in ``_canonical_repr``)."""
+        fp_submit = parse_ask_user_question(
+            self._fixture("auq_multiselect_review_cursor_submit.txt")
+        )
+        fp_cancel = parse_ask_user_question(
+            self._fixture("auq_multiselect_review_cursor_cancel.txt")
+        )
+        assert fp_submit is not None and fp_cancel is not None
+        assert fp_submit.fingerprint() == fp_cancel.fingerprint()
+
+    def test_review_vs_nonreview_fingerprint_distinct(self):
+        """Cursor-blinding the REVIEW fingerprint must not let a review form
+        collide with a structurally-identical non-review form — the ``RVW:``
+        canonical line keeps them distinct (plan §3.1). Guards against the
+        cursor-blind change accidentally widening into a cross-screen collision.
+        """
+        import dataclasses
+
+        review = parse_ask_user_question(
+            self._fixture("auq_multiselect_review_cursor_submit.txt")
+        )
+        assert review is not None and review.is_review_screen is True
+        non_review = dataclasses.replace(review, is_review_screen=False)
+        assert review.fingerprint() != non_review.fingerprint()

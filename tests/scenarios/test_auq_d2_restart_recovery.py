@@ -341,3 +341,68 @@ async def test_in_process_consume_then_redelivery_no_double_dispatch(
     update = await _tap(scenario, picks[1], user_id=scenario.user_id)
     assert _digits_sent(scenario, wid) == ["2"]
     assert "already received" in _answer(update).lower()
+
+
+# ── Review-Submit recovery survives a cursor move across the restart (RED) ──
+
+_REVIEW_FIXTURES = Path(__file__).parents[1] / "cctelegram" / "fixtures"
+
+
+def _review_fixture(name: str) -> str:
+    return (_REVIEW_FIXTURES / name).read_text()
+
+
+def _review_multi_input() -> dict[str, Any]:
+    return {
+        "questions": [
+            {
+                "question": "Which ones do you pick?",
+                "header": "Pick",
+                "multiSelect": True,
+                "options": [
+                    {"label": "A) Alpha"},
+                    {"label": "B) Bravo"},
+                    {"label": "C) Charlie"},
+                    {"label": "D) Delta"},
+                ],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_review_submit_recovery_after_restart_with_cursor_moved_dispatches(
+    scenario: ScenarioHarness,
+) -> None:
+    """RED pre-fix / GREEN post-fix — D2 review-Submit recovery survives a nav.
+
+    Render the multi-select REVIEW screen with the cursor on Submit (the fresh
+    aqp: render persists the per-token mint intent). Simulate a restart
+    (``reset_for_tests`` wipes the in-memory tokens but keeps ``pick_intent.jsonl``),
+    then move the live pane to cursor-on-Cancel (the user pressed ↓ across the
+    restart) and tap the still-displayed Submit button.
+
+    RED today: ``recover_and_consume`` declines ``stale_form`` — the stored
+    cursor-on-Submit ``full_fingerprint`` differs from the live cursor-on-Cancel
+    parse (and the inlined recovery Submit guard also requires the cursor on
+    option 1). Either way NO digit is dispatched. Post-fix the review fingerprint
+    is cursor-blind AND the recovery guard is cursor-blind, so the recovery
+    dispatches ``"1"`` + Enter.
+    """
+    wid = _bind(scenario, _review_fixture("auq_multiselect_review_cursor_submit.txt"))
+    _write_side_file(_review_multi_input())
+    await _render(scenario, wid)
+    picks = [cb for cb in _pick_callbacks(scenario) if cb.startswith(CB_ASK_PICK)]
+    # Option 1 (Submit answers) is the review-Submit row.
+    submit_cb = next(cb for cb in picks if cb.split(":")[3] == "1")
+
+    pick_token.reset_for_tests()  # simulate restart (durable pick_intent survives)
+    assert pick_token.peek(_token(submit_cb)) is None
+
+    # User pressed ↓ across the restart → live pane now has the cursor on Cancel.
+    scenario.tmux.set_pane(
+        wid, _review_fixture("auq_multiselect_review_cursor_cancel.txt")
+    )
+
+    await _tap(scenario, submit_cb, user_id=scenario.user_id)
+    assert _digits_sent(scenario, wid) == ["1"]
