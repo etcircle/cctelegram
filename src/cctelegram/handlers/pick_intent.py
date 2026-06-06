@@ -393,9 +393,19 @@ def record_row(
 
 
 def lookup_intent(token: str) -> PickIntent | None:
-    """Return the live, validated ``PickIntent`` for ``token`` or None."""
+    """Return the live, validated, non-expired ``PickIntent`` for ``token`` or None.
+
+    Enforces ``RETENTION_SECONDS`` on EVERY lookup, not just at load: a
+    long-lived process (no restart) could otherwise still hold an over-24h row in
+    ``_live`` after its in-memory pick token / cache row pruned, and recover it.
+    """
     _ensure_loaded()
-    return _live.get(token)
+    intent = _live.get(token)
+    if intent is None:
+        return None
+    if intent.minted_at < _now() - RETENTION_SECONDS:
+        return None
+    return intent
 
 
 def consume_row(token: str) -> None:

@@ -844,6 +844,21 @@ async def recover_and_consume(
             return PickRecovery("stale_form")
         if not _recovery_source_parity_ok(intent, sf):
             return PickRecovery("source_drift")
+        # Submit guard BEFORE the accepted claim: a review-Submit intent only
+        # fires when the live review screen still has the cursor on Submit
+        # (option 1) with a matching label. Replicates the live path's
+        # ``_review_submit_cursor_ok`` (kept here, not in the caller, so a moved
+        # review screen declines BEFORE phase (C) writes ``accepted`` — otherwise
+        # the ledger would be stuck at ``accepted`` and later taps would answer
+        # "Action in progress" forever).
+        if intent.is_review_submit and not (
+            current_form.is_review_screen
+            and current_form.options
+            and current_form.options[0].cursor
+            and current_form.options[0].number == 1
+            and current_form.options[0].label == intent.option_label
+        ):
+            return PickRecovery("stale_form")
 
         # Phase (C): re-acquire, re-run the proofs, claim + tomb under the lock.
         async with _store_lock:

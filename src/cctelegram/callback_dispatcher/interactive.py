@@ -329,21 +329,20 @@ async def _attempt_pick_recovery(
     )
     w = await tmux_manager.find_window_by_id(result.window_id)
     if not w:
+        # The window vanished between recover_and_consume's phase-B find and now.
+        # The ``accepted`` claim is already written (inside the reservation), so
+        # record ``failed_before_digit`` (a re-tappable projection) rather than
+        # leaving the ledger stuck at ``accepted`` → "Action in progress" forever.
+        if result.ledger_key is not None:
+            auq_ledger.record(
+                result.ledger_key,
+                state="failed_before_digit",
+                failed_reason="window gone before recovery dispatch",
+            )
         await safe_answer(query, "Window not found", show_alert=True)
         return True
-    if result.is_review_submit and not _review_submit_cursor_ok(
-        result.current_form, result.option_label
-    ):
-        await safe_answer(query, "Review screen moved, refreshing.", show_alert=False)
-        await handle_interactive_ui(
-            context.bot,
-            user.id,
-            result.window_id,
-            result.thread_id,
-            tmux_mgr=tmux_manager,
-            session_mgr=adapters.session_manager,
-        )
-        return True
+    # The review-Submit cursor guard runs INSIDE recover_and_consume (before its
+    # accepted claim), so an ``ok`` result has already passed it — dispatch.
     await _dispatch_pick_digit(
         query=query,
         context=context,
