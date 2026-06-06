@@ -215,12 +215,8 @@ class TestResolvePaneKind:
         FAILS on current main: the per-option cursor bit is in
         ``_canonical_repr`` (terminal_parser.py:692), so the two pane source
         fingerprints differ."""
-        pane3 = (
-            _FIXTURE_DIR / "auq_single_long_scrolled_cursor3_S500.txt"
-        ).read_text()
-        pane4 = (
-            _FIXTURE_DIR / "auq_single_long_scrolled_cursor4_S500.txt"
-        ).read_text()
+        pane3 = (_FIXTURE_DIR / "auq_single_long_scrolled_cursor3_S500.txt").read_text()
+        pane4 = (_FIXTURE_DIR / "auq_single_long_scrolled_cursor4_S500.txt").read_text()
         r3 = auq_source.resolve_auq_source(self._WID, None, pane3)
         r4 = auq_source.resolve_auq_source(self._WID, None, pane4)
         assert r3.kind == "pane" and r4.kind == "pane"
