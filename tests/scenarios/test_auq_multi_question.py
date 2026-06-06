@@ -156,6 +156,10 @@ class _AdvancingTmux:
             return window_id in self._fake.windows
         # Advance only the modeled keys; an unmodeled key is a no-op (records but
         # does not move the pane) — keeps the test minimal to option-1 taps.
+        # The advance map keys on the literal key STRING only; the `aqp:`/`aqt:`
+        # dispatch always uses enter=False (a separate keystroke for Enter), so
+        # an implicit `enter=True` is not modeled — fine here because the picker
+        # paths under test never set it (only the nav ⏎ button does, untested).
         nxt = _ADVANCE.get((self._state or "", keys))
         if nxt is not None:
             if nxt == "__RESOLVED__":

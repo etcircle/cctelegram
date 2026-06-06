@@ -176,6 +176,13 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
             id="review-submit",
         ),
         pytest.param(
+            _SUBMIT_PANE,
+            2,
+            "Cancel",
+            False,
+            id="review-cancel",
+        ),
+        pytest.param(
             _SINGLE_PANE,
             1,
             "A) One",
@@ -209,4 +216,50 @@ async def test_aqp_pick_dispatches_bare_digit_no_enter(
 
     # Exactly one keystroke: the bare digit, enter=False. NO Enter keystroke.
     assert sent_keys == [(_WINDOW_ID, str(option_number), False, True)]
+    assert send_keys.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_landed_digit_not_downgraded_by_post_digit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-digit failure must NOT downgrade a landed digit to a retryable state.
+
+    codex+hermes diff-review P1: the digit ``send_keys`` is the only thing in the
+    ``try``; once it lands, the TUI has consumed the selection, so the ledger must
+    stay terminal ``dispatched`` even if the subsequent re-render raises. A
+    downgrade to ``failed_before_digit`` would project as retryable and re-open
+    the duplicate-tap double-dispatch the ledger exists to prevent.
+    """
+    from cctelegram.callback_dispatcher import interactive as cb_interactive
+
+    callback_data = _build_keyed_callback(
+        pane=_Q1_PANE,
+        option_number=1,
+        option_label="Write-through cache with Redis backend",
+        is_submit=False,
+    )
+    # Recover the ledger key the dispatch will write to.
+    _cb, route_hash, fp8, _opt, _token = callback_data.split(":")
+    ledger_key = auq_ledger.make_ledger_key(route_hash, fp8, 1)
+
+    send_keys = AsyncMock(return_value=True)  # the digit LANDS
+    # The post-digit re-render raises — must not undo the terminal `dispatched`.
+    monkeypatch.setattr(
+        cb_interactive,
+        "handle_interactive_ui",
+        AsyncMock(side_effect=RuntimeError("re-render boom")),
+    )
+    query = FakeQuery(callback_data)
+    authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
+
+    with pytest.raises(RuntimeError, match="re-render boom"):
+        await execute(authorized, _adapters(send_keys, _Q1_PANE))
+
+    # The digit landed → terminal `dispatched` was recorded BEFORE the re-render
+    # failure, and the failure did not downgrade it.
+    entry = auq_ledger.lookup(ledger_key)
+    assert entry is not None
+    assert entry.state == "dispatched"
+    # Exactly the bare digit was sent — no Enter, no re-send.
     assert send_keys.await_count == 1

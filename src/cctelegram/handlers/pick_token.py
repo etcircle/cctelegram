@@ -695,9 +695,10 @@ class PickRecovery:
     """Typed outcome of ``recover_and_consume``.
 
     On ``ok`` the ``accepted`` ledger claim has ALREADY been written (inside the
-    row reservation), so the caller only dispatches the digit + writes
-    ``digit_sent`` / ``dispatched`` at ``ledger_key``. ``current_form`` is the
-    live re-parse so the caller's Submit guard compares the same form.
+    row reservation), so the caller only dispatches the bare digit + writes the
+    terminal ``dispatched`` at ``ledger_key`` (v2.1.167 single-keystroke model —
+    no ``digit_sent``/Enter step). ``current_form`` is the live re-parse so the
+    caller's Submit guard compares the same form.
     """
 
     outcome: Literal[

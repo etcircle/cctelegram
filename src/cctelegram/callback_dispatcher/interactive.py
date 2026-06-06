@@ -126,42 +126,25 @@ async def _dispatch_pick_digit(
     collision-suppression fall-through — the ``if ledger_key is not None`` guards
     keep those writes off another route's row. ``send_keys`` returns False (does
     not raise) on failure; the return is checked (Wave-3 P1).
+
+    Ledger-downgrade safety (codex+hermes diff-review P1): the ``try`` wraps ONLY
+    the digit ``send_keys`` — the single operation that can leave the digit
+    un-landed. ``failed_before_digit`` is therefore written *only* when the digit
+    provably never reached tmux (send_keys raised or returned False). Once the
+    digit lands, the TUI has already consumed the selection/submission, so the
+    terminal ``dispatched`` is recorded OUTSIDE the ``try`` and a later failure
+    (the ``record`` write, ``safe_answer``, or the re-render) can NEVER downgrade
+    a landed digit back to a retryable state — that downgrade would re-open the
+    duplicate-tap double-dispatch the ledger exists to prevent. A post-digit
+    failure that prevents recording ``dispatched`` leaves the row at ``accepted``
+    (honest: "in progress" / post-restart ``unknown`` → refresh, never re-dispatch).
     """
     try:
         digit_ok = await tmux_manager.send_keys(
             w.window_id, str(option_number), enter=False, literal=True
         )
-        if not digit_ok:
-            if ledger_key is not None:
-                auq_ledger.record(
-                    ledger_key,
-                    state="failed_before_digit",
-                    failed_reason="tmux send_keys(digit) returned False",
-                )
-            logger.warning(
-                "Pick-token dispatch: tmux send_keys(digit=%d) returned False "
-                "for window=%s user=%d",
-                option_number,
-                window_id,
-                user.id,
-            )
-            await safe_answer(
-                query, "Action failed; refreshing card.", show_alert=False
-            )
-            await handle_interactive_ui(
-                context.bot,
-                user.id,
-                window_id,
-                thread_id,
-                tmux_mgr=tmux_manager,
-                session_mgr=adapters.session_manager,
-            )
-            return
-        # The bare digit IS the complete dispatch (v2.1.167 single-keystroke
-        # model). Record the terminal ``dispatched`` directly — no Enter step.
-        if ledger_key is not None:
-            auq_ledger.record(ledger_key, state="dispatched")
     except Exception as exc:
+        # send_keys raised → the digit never landed; a retryable failure is honest.
         if ledger_key is not None:
             auq_ledger.record(
                 ledger_key,
@@ -170,7 +153,37 @@ async def _dispatch_pick_digit(
             )
         await safe_answer(query, "Action failed; refreshing card.", show_alert=False)
         raise
+    if not digit_ok:
+        if ledger_key is not None:
+            auq_ledger.record(
+                ledger_key,
+                state="failed_before_digit",
+                failed_reason="tmux send_keys(digit) returned False",
+            )
+        logger.warning(
+            "Pick-token dispatch: tmux send_keys(digit=%d) returned False "
+            "for window=%s user=%d",
+            option_number,
+            window_id,
+            user.id,
+        )
+        await safe_answer(query, "Action failed; refreshing card.", show_alert=False)
+        await handle_interactive_ui(
+            context.bot,
+            user.id,
+            window_id,
+            thread_id,
+            tmux_mgr=tmux_manager,
+            session_mgr=adapters.session_manager,
+        )
+        return
 
+    # The bare digit landed — this IS the complete dispatch (v2.1.167
+    # single-keystroke model). Record the terminal ``dispatched`` OUTSIDE the
+    # ``try`` so no post-digit failure can downgrade a landed digit (see the
+    # ledger-downgrade-safety note above).
+    if ledger_key is not None:
+        auq_ledger.record(ledger_key, state="dispatched")
     logger.info(
         "AUQ_PICK dispatch_ok user=%d window=%s opt=%d label=%s",
         user.id,
