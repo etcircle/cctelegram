@@ -202,6 +202,30 @@ class TestResolvePaneKind:
         again = auq_source.resolve_auq_source(self._WID, None, pane)
         assert again.source_fingerprint == resolved.source_fingerprint
 
+    def test_pane_source_fingerprint_equal_across_cursor_move(self, _cc_dir):
+        """RED pre-fix / GREEN post-fix (item 2 coupling guard).
+
+        The pane-kind ``source_fingerprint`` hashes the form's
+        ``_canonical_repr`` (``auq_source._pane_fingerprint``), shared in
+        lockstep with the FORM fingerprint. A NON-review cursor move must NOT
+        change it — otherwise a pane-sourced live card ``source_drift``s when
+        the cursor moves. The non-review twin of the review-screen lockstep
+        guard.
+
+        FAILS on current main: the per-option cursor bit is in
+        ``_canonical_repr`` (terminal_parser.py:692), so the two pane source
+        fingerprints differ."""
+        pane3 = (
+            _FIXTURE_DIR / "auq_single_long_scrolled_cursor3_S500.txt"
+        ).read_text()
+        pane4 = (
+            _FIXTURE_DIR / "auq_single_long_scrolled_cursor4_S500.txt"
+        ).read_text()
+        r3 = auq_source.resolve_auq_source(self._WID, None, pane3)
+        r4 = auq_source.resolve_auq_source(self._WID, None, pane4)
+        assert r3.kind == "pane" and r4.kind == "pane"
+        assert r3.source_fingerprint == r4.source_fingerprint
+
 
 # ── getter lifecycle / reset isolation ───────────────────────────────────────
 

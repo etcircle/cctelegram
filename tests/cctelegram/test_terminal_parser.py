@@ -3086,3 +3086,63 @@ class TestReviewScreenFingerprintCursorBlind:
         assert review is not None and review.is_review_screen is True
         non_review = dataclasses.replace(review, is_review_screen=False)
         assert review.fingerprint() != non_review.fingerprint()
+
+
+class TestNonReviewFingerprintCursorBlind:
+    """RED gate for the NON-review picker dead-first-tap on a cursor move.
+
+    Both fixtures are the SAME live single-select picker — only the terminal
+    cursor ``❯`` moved (option 3 → option 4). On Claude Code v2.1.167 dispatch
+    is a BARE DIGIT (the option IS the digit, cursor-independent), so a cursor
+    move must NOT rotate the form fingerprint — otherwise the poller re-mint /
+    sub-poll tap pops the displayed pick token (peek_none / stale_form) and D2
+    restart-recovery DECLINEs. This is the non-review twin of
+    ``TestReviewScreenFingerprintCursorBlind`` (PR #28, review-screen only).
+
+    RED pre-fix / GREEN post-fix: on current main the per-option cursor bit is
+    in ``_canonical_repr`` for non-review forms (terminal_parser.py:692), so
+    these two fingerprints DIFFER and the equality assertion fails.
+    """
+
+    @staticmethod
+    def _fixture(name: str) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "fixtures" / name).read_text()
+
+    def test_nonreview_fixtures_differ_only_by_cursor(self):
+        """Both fixtures parse to the SAME non-review single-select picker with
+        only the cursor on a different option (sanity anchor — passes on current
+        main; the precondition for the RED equality test below)."""
+        f3 = parse_ask_user_question(
+            self._fixture("auq_single_long_scrolled_cursor3_S500.txt")
+        )
+        f4 = parse_ask_user_question(
+            self._fixture("auq_single_long_scrolled_cursor4_S500.txt")
+        )
+        assert f3 is not None and f4 is not None
+        assert f3.is_review_screen is False and f4.is_review_screen is False
+        # Same option set + numbers; only which option carries the cursor moves.
+        assert [(o.number, o.label) for o in f3.options] == [
+            (o.number, o.label) for o in f4.options
+        ]
+        assert [o.cursor for o in f3.options] == [False, False, True, False]
+        assert [o.cursor for o in f4.options] == [False, False, False, True]
+
+    def test_nonreview_fingerprint_equal_across_cursor_move(self):
+        """RED pre-fix / GREEN post-fix.
+
+        A cursor move on a non-review picker must NOT change the form
+        fingerprint. Purely behavioral (only the public ``fingerprint()``).
+
+        FAILS on current main: the non-review fingerprints differ solely
+        because the cursor moved (the per-option ``:C`` bit in
+        ``_canonical_repr``)."""
+        f3 = parse_ask_user_question(
+            self._fixture("auq_single_long_scrolled_cursor3_S500.txt")
+        )
+        f4 = parse_ask_user_question(
+            self._fixture("auq_single_long_scrolled_cursor4_S500.txt")
+        )
+        assert f3 is not None and f4 is not None
+        assert f3.fingerprint() == f4.fingerprint()
