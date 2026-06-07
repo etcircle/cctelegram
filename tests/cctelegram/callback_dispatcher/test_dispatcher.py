@@ -35,6 +35,7 @@ from cctelegram.handlers.directory_browser import (
     STATE_KEY,
 )
 from cctelegram.terminal_parser import resolve_ask_form
+from tests.conftest import render_cursor
 
 # A real picker pane so validate_and_consume (which uses the REAL parser +
 # resolver, not a fake) re-resolves to a form whose fingerprint + source tags
@@ -42,6 +43,10 @@ from cctelegram.terminal_parser import resolve_ask_form
 _BASELINE_PANE = (
     Path(__file__).parents[1] / "fixtures" / "auq-baseline-pane.txt"
 ).read_text()
+
+# A resolved (non-picker) pane: no AUQ marker phrases → the v2.1.168 confirm step
+# reads a single-question pick as positively RESOLVED (the picker disappeared).
+_RESOLVED_PANE = "user@host repo % \n"
 
 
 class FakeQuery:
@@ -78,6 +83,53 @@ class FakeTmuxManager:
         # real parser/resolver, so an ``ok`` pick needs a pane that re-parses
         # to the same form the token was minted against.
         self.capture_pane = AsyncMock(return_value=_BASELINE_PANE)
+
+
+class CursorAwareTmuxManager:
+    """v2.1.168-aware fake of the live single-question picker dispatch path.
+
+    ``Down``/``Up`` move a cursor over the baseline pane's 5 navigable rows
+    (3 real options + 2 affordances, wrapping); ``Enter`` from a real option
+    resolves the single-question tool (the picker disappears → ``_RESOLVED_PANE``).
+    ``capture_pane`` is STATEFUL — it renders the baseline pane with the cursor on
+    its current row until the resolving Enter, then returns the non-picker pane —
+    so the dispatch's post-Enter confirm records the terminal ``dispatched``.
+
+    The cursor starts on option 1, matching the pane the token is minted from.
+    """
+
+    _N_REAL = 3
+    _N_NAV = 5
+
+    def __init__(self) -> None:
+        self.find_window_by_id = AsyncMock(return_value=SimpleNamespace(window_id="@1"))
+        self.cursor = 1
+        self.resolved = False
+        self.send_keys = AsyncMock(side_effect=self._send_keys)
+        self.capture_pane = AsyncMock(side_effect=self._capture_pane)
+
+    async def _send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        if window_id != "@1" or self.resolved:
+            return True
+        if keys == "Down":
+            self.cursor = self.cursor + 1 if self.cursor < self._N_NAV else 1
+        elif keys == "Up":
+            self.cursor = self.cursor - 1 if self.cursor > 1 else self._N_NAV
+        elif keys == "Enter":
+            if 1 <= self.cursor <= self._N_REAL:
+                self.resolved = True
+        return True
+
+    async def _capture_pane(
+        self, window_id: str, scrollback_lines: int = 0, with_ansi: bool = False
+    ) -> str:
+        if window_id != "@1":
+            return ""
+        if self.resolved:
+            return _RESOLVED_PANE
+        return render_cursor(_BASELINE_PANE, self.cursor)
 
 
 class FakeForm:
@@ -153,7 +205,8 @@ def _ctx(query: FakeQuery, user_id: int = 1) -> SimpleNamespace:
 
 
 def _adapters(
-    session_manager: FakeSessionManager, tmux_manager: FakeTmuxManager
+    session_manager: FakeSessionManager,
+    tmux_manager: FakeTmuxManager | CursorAwareTmuxManager,
 ) -> DispatcherAdapters:
     return DispatcherAdapters(
         session_manager=session_manager,
@@ -269,12 +322,19 @@ async def test_double_pick_second_click_is_already_received_after_first_dispatch
         parse(query2.data.encode()), _ctx(query2, user_id=1)
     )
 
-    await execute(authorized1, _adapters(FakeSessionManager(), FakeTmuxManager()))
+    # First click drives the v2.1.168 arrows+Enter dispatch against a cursor-aware
+    # tmux fake (cursor on option 1 → Enter resolves the single-question tool, so
+    # the confirm step records the terminal ``dispatched``). The second click hits
+    # the ledger gate and short-circuits before touching the pane, so a plain fake
+    # is enough for it.
+    await execute(
+        authorized1, _adapters(FakeSessionManager(), CursorAwareTmuxManager())
+    )
     await execute(authorized2, _adapters(FakeSessionManager(), FakeTmuxManager()))
 
-    # First click dispatches and writes the ``dispatched`` ledger row; the
-    # second click on the same keyed callback finds that row and answers
-    # "Action already received" instead of re-dispatching the digit. The
+    # First click dispatches (arrows+Enter, confirmed advance) and writes the
+    # ``dispatched`` ledger row; the second click on the same keyed callback finds
+    # that row and answers "Action already received" instead of re-dispatching. The
     # option label is "Done navigating" (option 1 on the baseline pane).
     assert query1.answers == [("1. Done navigating", False)]
     assert query2.answers == [("Action already received: Done navigating", False)]

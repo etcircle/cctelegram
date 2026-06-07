@@ -15,6 +15,8 @@ from typing import Any, Literal, cast
 
 import asyncio
 import logging
+from types import SimpleNamespace
+
 from cctelegram.handlers import (
     auq_ledger,
     auq_source,
@@ -43,6 +45,12 @@ from cctelegram.handlers.interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
 )
+from cctelegram.terminal_parser import (
+    AskUserQuestionForm,
+    _loose_label_match,
+    _pane_looks_like_picker,
+    resolve_ask_form,
+)
 
 from . import (
     WRONG_USER_PICK_TEXT,
@@ -55,6 +63,78 @@ from . import (
 
 logger = logging.getLogger(__name__)
 resolve_ask_tool_input = interactive_ui.resolve_ask_tool_input
+
+# v2.1.168 navigate-to-target + Enter dispatch settle windows. After the nav
+# keystrokes we wait for the cursor redraw before re-capturing to verify; after
+# Enter we wait for the advance redraw before re-capturing to confirm. Tuned so
+# the first confirm capture almost always already sees the advance (the redraw
+# lag is ~10-100ms ≪ 0.5s), so the common path records ``dispatched`` and a
+# genuinely-stuck future variant degrades to ``commit_unconfirmed`` (refresh).
+NAV_SETTLE = 0.5
+COMMIT_SETTLE = 0.5
+
+
+def _is_multi_q(form: AskUserQuestionForm) -> bool:
+    """True iff the form carries ≥2 real (non-submit) question tabs."""
+    return len([t for t in form.tabs if not t.is_submit]) >= 2
+
+
+def _classify_advance(
+    committed: AskUserQuestionForm,
+    entry: Any,
+    aform: AskUserQuestionForm | None,
+    resolved: bool,
+) -> bool:
+    """Decide whether the post-Enter pane proves the EXACT expected advance.
+
+    ``committed`` is the form the user tapped (the live re-parse at validate);
+    ``entry`` carries ``.option_number`` + ``.is_review_submit``; ``aform`` is the
+    confirm re-parse (None when the pane no longer parses as a picker); ``resolved``
+    is True only when the picker positively disappeared (markers absent). Returns
+    True ONLY on a proven expected transition — every other shape fails CLOSED so a
+    sticky / over-advanced / wrong-tab form is never recorded ``dispatched``.
+    """
+    # Review-screen CANCEL (option 2): success == left the review screen.
+    if (
+        committed.is_review_screen
+        and entry.option_number == 2
+        and not entry.is_review_submit
+    ):
+        return resolved or (aform is not None and not aform.is_review_screen)
+    # Submit / single-question pick: success == the tool RESOLVED (picker gone).
+    # NOT "aform is None" — a parse-failure is not a resolution.
+    if entry.is_review_submit or not _is_multi_q(committed):
+        return resolved
+    # Multi-question pick: a POSITIVE forward transition only; a disappearance is
+    # NOT success (a non-final pick must advance to the next question).
+    if aform is None:
+        return False
+    before = [t.answered for t in committed.tabs if not t.is_submit]
+    after = [t.answered for t in aform.tabs if not t.is_submit]
+    if len(before) != len(after):
+        return False
+    ci = sum(before)  # committed question = the first unanswered tab index
+    if ci >= len(before) or before[ci]:
+        return False
+    expected = before[:]
+    expected[ci] = True  # EXACTLY the committed tab flips False → True
+    if after != expected:  # over-advance / wrong-tab / no-flip CAUGHT
+        return False
+    if ci == len(before) - 1:
+        return aform.is_review_screen  # final pick → review screen
+    # Non-final: prove the shown question IS questions[ci+1] by its OPTION-SET
+    # (stronger than the possibly-duplicate title), unique among the remaining
+    # unanswered questions → else fail closed.
+    if aform.is_review_screen:
+        return False
+    qs = committed.questions
+    if not (len(qs) > ci + 1):
+        return False
+    next_opts = tuple(o.label for o in qs[ci + 1].options)
+    if not next_opts or tuple(o.label for o in aform.options) != next_opts:
+        return False
+    remaining = [tuple(o.label for o in qs[j].options) for j in range(ci + 1, len(qs))]
+    return remaining.count(next_opts) == 1
 
 
 async def _refresh_pick_card(
@@ -98,7 +178,30 @@ async def _refresh_pick_card(
         )
 
 
-async def _dispatch_pick_digit(
+async def _rerender_picker(
+    context: Any,
+    user: Any,
+    tmux_manager: Any,
+    adapters: Any,
+    window_id: str,
+    thread_id: int | None,
+) -> None:
+    """Re-render the live picker card after a (non-)committing dispatch outcome.
+
+    Orphan-card safety is the visible-pane liveness bail inside
+    ``handle_interactive_ui``.
+    """
+    await handle_interactive_ui(
+        context.bot,
+        user.id,
+        window_id,
+        thread_id,
+        tmux_mgr=tmux_manager,
+        session_mgr=adapters.session_manager,
+    )
+
+
+async def _dispatch_pick(
     *,
     query: Any,
     context: Any,
@@ -108,80 +211,156 @@ async def _dispatch_pick_digit(
     w: Any,
     window_id: str,
     thread_id: int | None,
+    fingerprint: str,
     option_number: int,
     option_label: str,
+    is_review_submit: bool,
+    current_form: AskUserQuestionForm,
     ledger_key: str | None,
 ) -> None:
-    """Send the option digit (no Enter), record the ledger lifecycle, answer, re-render.
+    """Navigate the live cursor to the tapped option, verify, Enter, confirm advance.
 
-    On Claude Code v2.1.167 a BARE DIGIT is the universal select+advance (and, on
-    the review screen, submit) action — the trailing ``Enter`` the bot used to
-    send over-advanced multi-question forms past Q2 (it auto-answered the next
-    question with its cursor-default). So only the bare digit is dispatched; the
-    digit landing IS the complete dispatch (``accepted`` → ``dispatched``).
+    v2.1.168 model: a BARE DIGIT no longer reliably SELECTS (in the notes
+    side-panel variant it only navigates), so the bot drives the live cursor to
+    the target with ``Up``/``Down``, VERIFIES the cursor landed on the target
+    option (same form, right number, matching label, and for Submit the
+    review-Submit anchor), presses ``Enter`` (the version-stable commit), then
+    re-parses the pane and records the terminal ``dispatched`` ONLY after a
+    CONFIRMED expected advance (``_classify_advance``).
 
     Shared by the live ``ok`` path and D2 restart-recovery. The caller writes the
     ``accepted`` claim BEFORE calling this (the live path inline; recovery inside
     ``pick_token.recover_and_consume``). ``ledger_key`` is None only on a
     collision-suppression fall-through — the ``if ledger_key is not None`` guards
     keep those writes off another route's row. ``send_keys`` returns False (does
-    not raise) on failure; the return is checked (Wave-3 P1).
+    not raise) on failure; every return is checked (Wave-3 P1).
 
-    Ledger-downgrade safety (codex+hermes diff-review P1): the ``try`` wraps ONLY
-    the digit ``send_keys`` — the single operation that can leave the digit
-    un-landed. ``failed_before_digit`` is therefore written *only* when the digit
-    provably never reached tmux (send_keys raised or returned False). Once the
-    digit lands, the TUI has already consumed the selection/submission, so the
-    terminal ``dispatched`` is recorded OUTSIDE the ``try`` and a later failure
-    (the ``record`` write, ``safe_answer``, or the re-render) can NEVER downgrade
-    a landed digit back to a retryable state — that downgrade would re-open the
-    duplicate-tap double-dispatch the ledger exists to prevent. A post-digit
-    failure that prevents recording ``dispatched`` leaves the row at ``accepted``
-    (honest: "in progress" / post-restart ``unknown`` → refresh, never re-dispatch).
+    Ledger semantics: a PRE-COMMIT bail (cursor unknown, nav send False, verify
+    fail) records ``not_advanced`` (``Enter`` provably never sent → the callback
+    handler FALLS THROUGH on a re-tap, safe). Once ``Enter`` is sent the outcome
+    is either a confirmed ``dispatched`` (idempotency lock) or ``commit_unconfirmed``
+    (refresh-only, never auto-redispatch — no re-tap can re-send the commit key).
     """
-    try:
-        digit_ok = await tmux_manager.send_keys(
-            w.window_id, str(option_number), enter=False, literal=True
+
+    async def _bail_not_advanced(reason: str) -> None:
+        if ledger_key is not None:
+            auq_ledger.record(ledger_key, state="not_advanced", failed_reason=reason)
+        await safe_answer(query, "Action not registered; refreshing card.")
+        await _rerender_picker(
+            context, user, tmux_manager, adapters, window_id, thread_id
         )
-    except Exception as exc:
-        # send_keys raised → the digit never landed; a retryable failure is honest.
+
+    async def _bail_commit_unconfirmed(reason: str) -> None:
         if ledger_key is not None:
             auq_ledger.record(
-                ledger_key,
-                state="failed_before_digit",
-                failed_reason=str(exc),
+                ledger_key, state="commit_unconfirmed", failed_reason=reason
             )
-        await safe_answer(query, "Action failed; refreshing card.", show_alert=False)
-        raise
-    if not digit_ok:
-        if ledger_key is not None:
-            auq_ledger.record(
-                ledger_key,
-                state="failed_before_digit",
-                failed_reason="tmux send_keys(digit) returned False",
-            )
-        logger.warning(
-            "Pick-token dispatch: tmux send_keys(digit=%d) returned False "
-            "for window=%s user=%d",
-            option_number,
-            window_id,
-            user.id,
+        await safe_answer(query, "Action sent; refreshing card.")
+        await _rerender_picker(
+            context, user, tmux_manager, adapters, window_id, thread_id
         )
-        await safe_answer(query, "Action failed; refreshing card.", show_alert=False)
-        await handle_interactive_ui(
-            context.bot,
+
+    target = option_number
+    cur = next((o for o in current_form.options if o.cursor), None)
+    if cur is None or cur.number is None:
+        logger.info(
+            "AUQ_PICK nav cursor_unknown user=%d window=%s opt=%d",
             user.id,
             window_id,
-            thread_id,
-            tmux_mgr=tmux_manager,
-            session_mgr=adapters.session_manager,
+            target,
         )
+        await _bail_not_advanced("cursor_unknown")
         return
 
-    # The bare digit landed — this IS the complete dispatch (v2.1.167
-    # single-keystroke model). Record the terminal ``dispatched`` OUTSIDE the
-    # ``try`` so no post-digit failure can downgrade a landed digit (see the
-    # ledger-downgrade-safety note above).
+    # MONOTONIC navigation: step the cursor one row at a time toward the target —
+    # never a wrap-shortcut. ``Down`` increases the number, ``Up`` decreases it.
+    delta = target - cur.number
+    nav_key = "Down" if delta > 0 else "Up"
+    for _ in range(abs(delta)):
+        if not await tmux_manager.send_keys(
+            w.window_id, nav_key, enter=False, literal=False
+        ):
+            logger.warning(
+                "AUQ_PICK nav send_keys(%s) returned False user=%d window=%s",
+                nav_key,
+                user.id,
+                window_id,
+            )
+            await _bail_not_advanced("nav_send_failed")
+            return
+
+    await asyncio.sleep(NAV_SETTLE)
+
+    vpane = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    vform: AskUserQuestionForm | None = None
+    if vpane:
+        vsource = auq_source.resolve_auq_source(window_id, None, vpane)
+        vform = resolve_ask_form(vsource.payload, vpane)
+    vc = next((o for o in vform.options if o.cursor), None) if vform else None
+    logger.info(
+        "AUQ_PICK nav_verify user=%d window=%s target=%d cursor_num=%s cursor_label=%s",
+        user.id,
+        window_id,
+        target,
+        vc.number if vc else None,
+        (vc.label[:24] if vc else None),
+    )
+    if not (
+        vform is not None
+        and vform.fingerprint() == fingerprint  # still the SAME form (cursor-blind)
+        and vc is not None
+        and vc.number == target
+        and _loose_label_match(vc.label, option_label)
+        and (
+            not is_review_submit
+            or (vform.review_submit_dispatchable(option_label) and vc.number == 1)
+        )
+    ):
+        await _bail_not_advanced("verify_failed")
+        return
+
+    # Cursor confirmed on target — commit with the version-stable Enter. A False
+    # return means it never reached tmux (contract: send_keys False == not sent),
+    # so this is still a PRE-COMMIT bail.
+    if not await tmux_manager.send_keys(
+        w.window_id, "Enter", enter=False, literal=False
+    ):
+        logger.warning(
+            "AUQ_PICK commit send_keys(Enter) returned False user=%d window=%s",
+            user.id,
+            window_id,
+        )
+        await _bail_not_advanced("commit_send_failed")
+        return
+
+    await asyncio.sleep(COMMIT_SETTLE)
+
+    # ── Enter WAS sent: from here a failure is at worst ``commit_unconfirmed`` ──
+    pane2 = await tmux_manager.capture_pane(w.window_id, scrollback_lines=500)
+    if pane2 is None:
+        await _bail_commit_unconfirmed("confirm_capture_failed")
+        return
+    asource = auq_source.resolve_auq_source(window_id, None, pane2)
+    aform = resolve_ask_form(asource.payload, pane2) if pane2 else None
+    if aform is None:
+        if _pane_looks_like_picker(pane2):
+            # Markers present but unparseable → AMBIGUOUS; never record dispatched.
+            await _bail_commit_unconfirmed("confirm_parse_failed")
+            return
+        resolved = True  # picker positively GONE → the tool resolved.
+    else:
+        resolved = False
+
+    confirm_entry = SimpleNamespace(
+        option_number=option_number, is_review_submit=is_review_submit
+    )
+    if not _classify_advance(current_form, confirm_entry, aform, resolved):
+        await _bail_commit_unconfirmed("commit_unconfirmed")
+        return
+
+    # CONFIRMED expected advance — record the terminal ``dispatched`` (the
+    # idempotency lock). Recorded OUTSIDE any further send so a later failure
+    # (record write, answer, re-render) can NEVER downgrade a confirmed dispatch.
     if ledger_key is not None:
         auq_ledger.record(ledger_key, state="dispatched")
     logger.info(
@@ -192,18 +371,7 @@ async def _dispatch_pick_digit(
         option_label[:24],
     )
     await safe_answer(query, f"{option_number}. {option_label[:32]}")
-    await asyncio.sleep(0.5)
-    # Re-render the picker after the digit lands so the card reflects the
-    # advanced screen. Orphan-card safety is the visible-pane liveness bail
-    # inside ``handle_interactive_ui``.
-    await handle_interactive_ui(
-        context.bot,
-        user.id,
-        window_id,
-        thread_id,
-        tmux_mgr=tmux_manager,
-        session_mgr=adapters.session_manager,
-    )
+    await _rerender_picker(context, user, tmux_manager, adapters, window_id, thread_id)
 
 
 async def _attempt_pick_recovery(
@@ -310,14 +478,17 @@ async def _attempt_pick_recovery(
         if result.ledger_key is not None:
             auq_ledger.record(
                 result.ledger_key,
-                state="failed_before_digit",
+                state="not_advanced",
                 failed_reason="window gone before recovery dispatch",
             )
         await safe_answer(query, "Window not found", show_alert=True)
         return True
     # The review-Submit cursor guard runs INSIDE recover_and_consume (before its
-    # accepted claim), so an ``ok`` result has already passed it — dispatch.
-    await _dispatch_pick_digit(
+    # accepted claim), so an ``ok`` result has already passed it — navigate +
+    # commit. The fingerprint is the recovered form's own (recover_and_consume
+    # already proved it equals ``intent.full_fingerprint``), so the nav-verify
+    # step compares against the same form.
+    await _dispatch_pick(
         query=query,
         context=context,
         user=user,
@@ -326,8 +497,11 @@ async def _attempt_pick_recovery(
         w=w,
         window_id=result.window_id,
         thread_id=result.thread_id,
+        fingerprint=result.current_form.fingerprint(),
         option_number=result.option_number,
         option_label=result.option_label,
+        is_review_submit=result.is_review_submit,
+        current_form=result.current_form,
         ledger_key=result.ledger_key,
     )
     return True
@@ -990,6 +1164,34 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                     fallback_window_id=existing.window_id,
                 )
                 return
+            if proj_state == "commit_unconfirmed":
+                # ``Enter`` WAS sent for this key but the advance was never
+                # confirmed. A re-tap must NEVER re-send the commit key, so this
+                # REFRESHES ONLY and returns — the re-render shows the live pane
+                # (caught-up next question, or genuinely stuck → the orthogonal
+                # un-ledgered ``⏎ Enter`` nav button is the user's escape).
+                await _refresh_pick_card(
+                    query,
+                    context,
+                    update,
+                    user,
+                    tmux_manager,
+                    adapters,
+                    text="Action sent; refreshing card.",
+                    fallback_window_id=existing.window_id,
+                )
+                return
+            if proj_state == "not_advanced":
+                # A PRE-COMMIT bail (``Enter`` provably never sent → nothing
+                # committed). FALL THROUGH (no return) so a fresh-token re-tap
+                # re-validates against the live form and retries the navigate +
+                # commit — safe because the commit key was never sent for this key.
+                logger.info(
+                    "AUQ_PICK ledger_not_advanced fallthrough user=%d window=%s opt=%d",
+                    user.id,
+                    existing.window_id,
+                    existing.option_number,
+                )
 
         # R4: side-effect-free peek to read entry.window_id (and entry.user_id
         # for the wrong-user gate). The pane capture, source/form re-resolve,
@@ -1195,10 +1397,12 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
                 option_label=entry.option_label,
             )
 
-        # Dispatch the bare digit (no Enter — v2.1.167 select+advance/submit) and
-        # record the ledger lifecycle via the shared helper (also used by D2
-        # restart-recovery). The ``accepted`` claim was already written above.
-        await _dispatch_pick_digit(
+        # Navigate the live cursor to the tapped option, verify, Enter, and
+        # confirm the advance before recording ``dispatched`` (v2.1.168 model) —
+        # via the shared helper (also used by D2 restart-recovery). The
+        # ``accepted`` claim was already written above. ``current_form`` is the
+        # live re-parse handed back by ``validate_and_consume``.
+        await _dispatch_pick(
             query=query,
             context=context,
             user=user,
@@ -1207,7 +1411,10 @@ async def execute_interactive_callback(authorized: Any, adapters: Any) -> None:
             w=w,
             window_id=window_id,
             thread_id=thread_id,
+            fingerprint=entry.fingerprint,
             option_number=entry.option_number,
             option_label=entry.option_label,
+            is_review_submit=entry.is_review_submit,
+            current_form=current_form,
             ledger_key=ledger_key,
         )

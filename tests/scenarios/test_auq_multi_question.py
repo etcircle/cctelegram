@@ -1,21 +1,27 @@
 """Scenario coverage for multi-QUESTION AskUserQuestion picker delivery.
 
-The bug: a single-select pick dispatched a bare digit AND a trailing ``Enter``.
-On Claude Code v2.1.167 a bare digit already selects+advances (Q1 → Q2), so the
-extra ``Enter`` auto-answered Q2 with its cursor-default and jumped to the
-Submit review — Q2's live picker never reached the Telegram user.
+The bug (v2.1.167 era): a single-select pick dispatched a bare digit AND a
+trailing ``Enter``, which over-advanced past Q2 to the Submit review so Q2's
+live picker never reached the Telegram user.
+
+v2.1.168 model: the ``aqp:`` pick no longer trusts the bare digit at all — it
+arrow-navigates the live cursor to the tapped option and presses ``Enter`` (the
+version-stable commit), recording ``dispatched`` only after a confirmed advance.
 
 This scenario drives the public callback seam (Update → real handler stack →
-fake tmux / fake bot) with the real PII-scrubbed v2.1.167 captures, using a
-keystroke-aware advancing fake tmux that encodes the verified TUI semantics:
+fake tmux / fake bot) with the real PII-scrubbed captures, using a
+keystroke-aware CURSOR-AWARE advancing fake tmux that encodes the verified .168
+TUI semantics:
 
-    Q1     + "1"     -> Q2 pane              Q1     + "Enter" -> Q2 pane
-    Q2     + "1"     -> Submit pane          Q2     + "Enter" -> Submit pane
-    Submit + "1"     -> resolved/inert       Submit + "Enter" -> resolved/inert
+    Down/Up move the cursor (wrapping over the numbered rows);
+    Enter from a real option selects it AND advances to the next screen:
+        Q1     + Enter -> Q2 pane
+        Q2     + Enter -> Submit pane
+        Submit + Enter -> resolved/inert
 
-so a stray ``Enter`` is what over-advances. Pre-fix: tapping Q1 sends ``1`` then
-``Enter`` → lands on Submit → the card never shows Q2 (RED). Post-fix: only the
-bare digit is sent → lands on Q2 (GREEN).
+``capture_pane`` is STATEFUL and renders the cursor, so the dispatch's post-nav
+VERIFY + post-Enter CONFIRM see the real form. The key property under test still
+holds: tapping Q1 must land on Q2's picker (never over-advance to Submit).
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.session_monitor import NewMessage
 from cctelegram.tmux_manager import tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
-from tests.conftest import ScenarioHarness, make_update_callback
+from tests.conftest import ScenarioHarness, make_update_callback, render_cursor
 
 pytestmark = pytest.mark.scenario
 
@@ -121,23 +127,31 @@ def _fixture(name: str) -> str:
     return (_FIXTURES / name).read_text()
 
 
-# Verified-keystroke advance map: (current_pane_fixture, key) -> next_pane.
-# Only the digit "1" and "Enter" are modeled (the test taps option 1 only).
-_ADVANCE: dict[tuple[str, str], str] = {
-    (_Q1_FIXTURE, "1"): _Q2_FIXTURE,
-    (_Q1_FIXTURE, "Enter"): _Q2_FIXTURE,
-    (_Q2_FIXTURE, "1"): _SUBMIT_FIXTURE,
-    (_Q2_FIXTURE, "Enter"): _SUBMIT_FIXTURE,
-    # Submit + 1/Enter resolves; the pane goes inert. Modeled as a sentinel.
-    (_SUBMIT_FIXTURE, "1"): "__RESOLVED__",
-    (_SUBMIT_FIXTURE, "Enter"): "__RESOLVED__",
+# Per-screen geometry + the Enter-advance chain (verified .168 semantics). Each
+# screen names the fixture, its REAL option count, the navigable-row count (real +
+# affordances, for wrap), and the NEXT fixture an Enter on a real option lands on
+# ("__RESOLVED__" → the picker disappears).
+_SCREENS: dict[str, tuple[int, int, str]] = {
+    # fixture: (n_real, n_nav, next_on_enter)
+    _Q1_FIXTURE: (3, 5, _Q2_FIXTURE),
+    _Q2_FIXTURE: (3, 5, _SUBMIT_FIXTURE),
+    _SUBMIT_FIXTURE: (2, 2, "__RESOLVED__"),
 }
 
 
 class _AdvancingTmux:
-    """Wraps the scenario's FakeTmux so send_keys advances the pane per the
-    verified v2.1.167 keystroke semantics — processing each dispatched key
-    SEQUENTIALLY against the CURRENT pane state (not a callback-start snapshot).
+    """Cursor-aware advancing wrapper over the scenario's FakeTmux.
+
+    Models the captured v2.1.168 picker: ``Down``/``Up`` move the cursor over the
+    current screen's navigable rows (wrapping), and ``Enter`` from a REAL option
+    selects it and advances to the next screen (the final screen → resolved). It
+    overrides both ``send_keys`` (state machine) and ``capture_pane`` (renders the
+    current fixture with the cursor on its live row) so the dispatch's post-nav
+    VERIFY and post-Enter CONFIRM both observe a consistent live form.
+
+    A bare digit is intentionally NOT modeled as a selection — on .168 it does not
+    reliably select, which is exactly why the bot stopped trusting it; a stray
+    digit here is a recorded no-op.
     """
 
     def __init__(self, scenario: ScenarioHarness, wid: str) -> None:
@@ -145,7 +159,18 @@ class _AdvancingTmux:
         self._wid = wid
         # The current fixture NAME the pane represents (None once resolved).
         self._state: str | None = _Q1_FIXTURE
+        self.cursor = 1
         self.original_send_keys = self._fake.send_keys
+
+    def _sync_pane(self) -> None:
+        """Mirror the live pane (cursor rendered) onto the fake for any consumer
+        that reads ``capture_pane`` indirectly via the underlying fake."""
+        if self._state is None:
+            self._fake.set_pane(self._wid, _RESOLVED_PANE)
+        else:
+            self._fake.set_pane(
+                self._wid, render_cursor(_fixture(self._state), self.cursor)
+            )
 
     async def send_keys(
         self, window_id: str, keys: str, enter: bool = True, literal: bool = True
@@ -154,21 +179,32 @@ class _AdvancingTmux:
         self._fake.sent_keys.append((window_id, keys, enter, literal))
         if window_id != self._wid:
             return window_id in self._fake.windows
-        # Advance only the modeled keys; an unmodeled key is a no-op (records but
-        # does not move the pane) — keeps the test minimal to option-1 taps.
-        # The advance map keys on the literal key STRING only; the `aqp:`/`aqt:`
-        # dispatch always uses enter=False (a separate keystroke for Enter), so
-        # an implicit `enter=True` is not modeled — fine here because the picker
-        # paths under test never set it (only the nav ⏎ button does, untested).
-        nxt = _ADVANCE.get((self._state or "", keys))
-        if nxt is not None:
-            if nxt == "__RESOLVED__":
-                self._state = None
-                self._fake.set_pane(self._wid, _RESOLVED_PANE)
-            else:
-                self._state = nxt
-                self._fake.set_pane(self._wid, _fixture(nxt))
+        if self._state is not None:
+            n_real, n_nav, nxt = _SCREENS[self._state]
+            if keys == "Down":
+                self.cursor = self.cursor + 1 if self.cursor < n_nav else 1
+            elif keys == "Up":
+                self.cursor = self.cursor - 1 if self.cursor > 1 else n_nav
+            elif keys == "Enter":
+                if 1 <= self.cursor <= n_real:
+                    if nxt == "__RESOLVED__":
+                        self._state = None
+                    else:
+                        self._state = nxt
+                        self.cursor = 1
+            # A bare digit (literal=True) does NOT select on .168 — recorded no-op.
+            self._sync_pane()
         return self._wid in self._fake.windows
+
+    async def capture_pane(
+        self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+    ) -> str:
+        del with_ansi, scrollback_lines
+        if window_id != self._wid:
+            return ""
+        if self._state is None:
+            return _RESOLVED_PANE
+        return render_cursor(_fixture(self._state), self.cursor)
 
 
 def _bind(scenario: ScenarioHarness) -> str:
@@ -263,10 +299,14 @@ def _install_advancing_tmux(
     scenario: ScenarioHarness, wid: str, monkeypatch: pytest.MonkeyPatch
 ) -> _AdvancingTmux:
     adv = _AdvancingTmux(scenario, wid)
-    # Bind the advancing send_keys onto the real singleton AND the fake instance
-    # so every consumer (handlers, dispatcher) sees the advancing behaviour.
+    adv._sync_pane()  # seed the pane with the cursor rendered on option 1
+    # Bind the advancing send_keys + cursor-aware capture_pane onto the real
+    # singleton AND the fake instance so every consumer (handlers, dispatcher)
+    # sees the advancing behaviour.
     monkeypatch.setattr(_real_tmux, "send_keys", adv.send_keys, raising=False)
     monkeypatch.setattr(scenario.tmux, "send_keys", adv.send_keys, raising=False)
+    monkeypatch.setattr(_real_tmux, "capture_pane", adv.capture_pane, raising=False)
+    monkeypatch.setattr(scenario.tmux, "capture_pane", adv.capture_pane, raising=False)
     return adv
 
 
@@ -274,9 +314,11 @@ def _install_advancing_tmux(
 async def test_multi_question_q1_pick_advances_to_q2_then_submit(
     scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Full multi-question flow. RED on current code at step 2 (the bot's stray
-    Enter lands on Submit so the card never shows Q2); GREEN after the Enter is
-    deleted (the bare digit lands on Q2)."""
+    """Full multi-question flow under the v2.1.168 arrows+Enter dispatch. The
+    key property: tapping Q1 option 1 must land on Q2's picker — never
+    over-advance to the Submit screen. The cursor starts on option 1, so each tap
+    of option 1 sends only ``Enter`` (delta=0, no nav steps) and NEVER a bare
+    digit on the ``aqp:`` path."""
     wid = _bind(scenario)
     side_file = _write_side_file()
     _install_advancing_tmux(scenario, wid, monkeypatch)
@@ -288,36 +330,44 @@ async def test_multi_question_q1_pick_advances_to_q2_then_submit(
     assert "Which implementation approach" in _last_card_text(scenario)
 
     # 2. Tap Q1 option 1. The advancing fake processes each dispatched key.
-    #    Post-fix the bot sends ONLY "1" → pane lands on Q2; the post-dispatch
-    #    re-render must now show Q2's three Rollout options.
+    #    The cursor is on option 1 (delta=0) → the bot sends ONLY "Enter" →
+    #    the pane lands on Q2; the post-dispatch re-render must now show Q2's
+    #    three Rollout options (NEVER over-advancing to Submit).
     scenario.bot.sent.clear()
+    scenario.tmux.sent_keys.clear()
     await _tap(scenario, q1_picks[0])
     q2_picks = _picks(scenario)
     assert len(q2_picks) == 3, (
         "after tapping Q1 the card must advance to Q2's picker — "
-        "a trailing Enter over-advances past Q2 to the Submit screen"
+        "over-advancing past Q2 to the Submit screen is the bug"
     )
     q2_text = _last_card_text(scenario)
     assert "How should we roll this out" in q2_text
     assert "Immediate full rollout to everyone" in q2_text
-    # The bare digit only — no Enter — was dispatched for the Q1 pick.
-    assert scenario.tmux.sent_keys[-1] == (wid, "1", False, True)
-    assert (wid, "Enter", False, False) not in scenario.tmux.sent_keys
+    # The arrows+Enter path: option 1 with the cursor on 1 → only "Enter", and
+    # NO bare digit on the aqp: pick path.
+    assert scenario.tmux.sent_keys[-1] == (wid, "Enter", False, False)
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
     # 3. Tap Q2 option 1 → the card advances to the Submit review screen.
     scenario.bot.sent.clear()
+    scenario.tmux.sent_keys.clear()
     await _tap(scenario, q2_picks[0])
     review_picks = _picks(scenario)
     assert len(review_picks) == 2, "expected Submit + Cancel review buttons"
     review_text = _last_card_text(scenario)
     assert "Submit answers" in review_text
     assert "Cancel" in review_text
+    assert scenario.tmux.sent_keys[-1] == (wid, "Enter", False, False)
 
-    # 4. Tap Submit → a bare digit "1" is dispatched (no Enter); then resolve.
+    # 4. Tap Submit → arrows+Enter (cursor on Submit=opt 1 → only "Enter"); the
+    #    form resolves. No bare digit on the aqp: Submit path.
+    scenario.bot.sent.clear()
+    scenario.tmux.sent_keys.clear()
     submit_cb = review_picks[0]
     await _tap(scenario, submit_cb)
-    assert scenario.tmux.sent_keys[-1] == (wid, "1", False, True)
-    assert (wid, "Enter", False, False) not in scenario.tmux.sent_keys
+    assert scenario.tmux.sent_keys[-1] == (wid, "Enter", False, False)
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
     # tool_result cleanup teardown (forget_ask_tool_input unlinks the side file).
     await bot_module.handle_new_message(

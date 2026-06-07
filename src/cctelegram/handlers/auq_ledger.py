@@ -1,19 +1,35 @@
 """Restart-safe write-ahead ledger for AskUserQuestion option-pick dispatches.
 
 Records every option-pick callback's lifecycle (``accepted`` →
-``dispatched``, or the ``failed_before_digit`` failure terminal) so the
-callback handler can detect duplicate taps even after a process restart.
-The in-memory pick-token store (``pick_token._pick_tokens``) does not
-survive restart; this ledger does.
+``dispatched``, or the ``not_advanced`` / ``commit_unconfirmed`` /
+``failed_before_digit`` non-success states) so the callback handler can
+detect duplicate taps even after a process restart. The in-memory pick-token
+store (``pick_token._pick_tokens``) does not survive restart; this ledger does.
 
-v2.1.167 single-keystroke model: a pick dispatches only a BARE DIGIT (no
-trailing Enter), so the dispatch path now writes ``accepted`` → ``dispatched``
-directly. The ``digit_sent`` and ``failed_after_digit`` states are
+v2.1.168 navigate-to-target + Enter model: a pick no longer trusts a sent
+keystroke to mean "committed". The dispatch path (``_navigate_and_commit``)
+arrow-navigates the live cursor to the tapped option, VERIFIES the cursor
+landed there, presses ``Enter`` (the version-stable commit), re-parses the
+pane, and records ``dispatched`` ONLY after a confirmed expected advance.
+The non-success states:
+
+  - ``not_advanced``       — a PRE-COMMIT bail (``Enter`` provably never sent:
+                             cursor unknown, a nav send returned False, or the
+                             post-nav verify failed). Nothing was committed, so
+                             the callback handler FALLS THROUGH on a re-tap (a
+                             fresh-token tap re-validates against the live form).
+  - ``commit_unconfirmed`` — ``Enter`` WAS sent but the expected advance could
+                             not be confirmed (incl. confirm-capture / parse
+                             failure). The callback handler REFRESHES ONLY and
+                             never auto-redispatches (no re-tap can re-send the
+                             commit key for this key).
+
+v2.1.167 legacy: that build dispatched a single BARE DIGIT. The
+``digit_sent``, ``failed_before_digit``, and ``failed_after_digit`` states are
 **legacy-only** — kept defined here so on-disk rows from older builds still
 load and project correctly, but they are no longer *written* by the dispatch
-path. (Before the Enter was deleted, ``digit_sent`` marked the gap between the
-digit and the Enter send, and ``failed_after_digit`` marked an Enter that
-returned False / raised.)
+path. (``digit_sent`` marked the gap between a digit and a since-deleted Enter;
+``failed_before_digit`` / ``failed_after_digit`` marked digit-send failures.)
 
 Storage: append-only JSONL at ``<CC_TELEGRAM_DIR>/auq_action_ledger.jsonl``
 (mode ``0600``). Each line is one persisted state transition for one
@@ -22,9 +38,20 @@ lines (partial writes during crash) are tolerated by skipping them with
 a WARNING.
 
 Persisted states:
-  - ``accepted``            — token validated, BEFORE digit send.
-  - ``dispatched``          — bare digit landed (terminal success).
-  - ``failed_before_digit`` — digit send returned False / raised before tmux.
+  - ``accepted``            — token validated, BEFORE navigation/commit.
+  - ``dispatched``          — confirmed expected advance (terminal success).
+  - ``not_advanced``        — a PRE-COMMIT bail (``Enter`` never sent). The
+                              ``failed_reason`` carries the sub-reason:
+                              ``"cursor_unknown"``, ``"nav_send_failed"``,
+                              ``"verify_failed"``, or ``"commit_send_failed"``.
+                              Callback FALLS THROUGH (re-tap re-validates).
+  - ``commit_unconfirmed``  — ``Enter`` was sent, advance unconfirmed. The
+                              ``failed_reason`` carries: ``"commit_unconfirmed"``,
+                              ``"confirm_capture_failed"``, or
+                              ``"confirm_parse_failed"``. Callback REFRESHES
+                              ONLY, never auto-redispatches.
+  - ``failed_before_digit`` — LEGACY (v2.1.167 bare-digit): digit send returned
+                              False / raised before tmux. No longer written.
   - ``digit_sent``          — LEGACY (pre-v2.1.167 digit+Enter): digit landed,
                               Enter not yet. No longer written.
   - ``failed_after_digit``  — LEGACY (pre-v2.1.167 digit+Enter): digit landed,
@@ -71,8 +98,10 @@ RETENTION_SECONDS: Final[float] = 24 * 60 * 60.0
 
 LedgerState = Literal[
     "accepted",
-    "digit_sent",
     "dispatched",
+    "not_advanced",
+    "commit_unconfirmed",
+    "digit_sent",
     "failed_before_digit",
     "failed_after_digit",
 ]
@@ -80,8 +109,10 @@ LedgerState = Literal[
 _PERSISTED_STATES: Final[frozenset[str]] = frozenset(
     {
         "accepted",
-        "digit_sent",
         "dispatched",
+        "not_advanced",
+        "commit_unconfirmed",
+        "digit_sent",
         "failed_before_digit",
         "failed_after_digit",
     }

@@ -264,36 +264,53 @@ card DECLINES (its in-process getter is wiped on restart). The form fingerprint 
 now cursor-blind on **every** screen — `AskUserQuestionForm._canonical_repr` omits
 the per-option cursor bit UNCONDITIONALLY (not just when `is_review_screen`), and
 `auq_source._pane_fingerprint` hashes the SAME `_canonical_repr` so the pane source
-fingerprint collapses in lockstep. On Claude Code v2.1.167 dispatch is a bare digit
-(cursor-independent), so a moved cursor — Submit↔Cancel on the review screen OR any
-option on a non-review picker — no longer rotates the pick token (live OR across a
+fingerprint collapses in lockstep. The cursor-blind fingerprint stays load-bearing
+under the v2.1.168 navigate-to-target dispatch (the bot MOVES the cursor to the
+target before committing, so the form identity must not shift as the cursor moves —
+else the nav-verify re-parse would no longer match the minted fingerprint and every
+pick would bail). A moved cursor — Submit↔Cancel on the review screen OR any option
+on a non-review picker — no longer rotates the pick token (live OR across a
 restart), and D2 recovery SURVIVES a moved cursor on **every** screen (**the former
 D3-γ non-review DECLINE is RETIRED**). Both the live and recovery Submit guards
 share the cursor-blind `AskUserQuestionForm.review_submit_dispatchable`
 predicate (anchored on `is_review_screen` + option #1 + the literal
-`REVIEW_SUBMIT_LABEL` "Submit answers" + the minted label; digit `1` activates
-Submit regardless of cursor, verified on Claude Code v2.1.161/.167). The
-`_pane_fingerprint` ⇄ `_canonical_repr` shared-canonical coupling is load-bearing
-for this fix — a refactor giving the pane source its own fingerprint basis would
-re-break it; the fingerprint-EQUALITY-across-cursor-move tests (for BOTH the
-review screen and non-review pickers) guard the coupling.
+`REVIEW_SUBMIT_LABEL` "Submit answers" + the minted label; verified on Claude Code
+v2.1.161/.167/.168). The `_pane_fingerprint` ⇄ `_canonical_repr` shared-canonical
+coupling is load-bearing for this fix — a refactor giving the pane source its own
+fingerprint basis would re-break it; the fingerprint-EQUALITY-across-cursor-move
+tests (for BOTH the review screen and non-review pickers) guard the coupling.
 
-**AUQ pick dispatch is a single BARE DIGIT (no Enter — v2.1.167 model).**
-`_dispatch_pick_digit` (shared by the live `aqp:` pick path AND D2 recovery)
-sends only the option digit (`send_keys(enter=False, literal=True)`) and records
-`accepted → dispatched` (or `failed_before_digit`) — there is **no Enter step**.
-On Claude Code v2.1.167 a bare digit is the universal select+advance (and, on the
-review screen, submit) action — the same keystroke `aqt:` toggles already used —
-so the prior trailing `Enter` over-advanced multi-QUESTION forms past Q2: tapping
-Q1 sent `1` (advancing Q1→Q2) then `Enter` (auto-answering Q2 with its
-cursor-default and jumping to the Submit review), so Q2's live picker never
-reached the user. The Enter was only "accidentally harmless" for single-question
-forms (the digit resolved the tool; the stray Enter hit the inert main prompt).
-The `auq_ledger` `digit_sent` / `failed_after_digit` states are **legacy-only**
-(kept defined for on-disk compat; no longer written by the dispatch path). The
-nav `⏎ Enter` button (`CB_ASK_ENTER`) + arrow nav still send Enter — that is the
-orthogonal navigation path, unchanged. Validated against Claude Code v2.1.167
-terminal behavior.
+**AUQ pick dispatch NAVIGATES the cursor to the target, VERIFIES, then Enter
+(v2.1.168 model — single-select `aqp:` + review Submit/Cancel ONLY).** On Claude
+Code v2.1.168 a richer "notes side-panel" picker variant makes a bare digit only
+MOVE the cursor (no select), so the form sticks and the bot would wrongly record
+`dispatched` → an "Action already received" hard lock. Fix: `_dispatch_pick`
+(shared by the live `aqp:` pick path AND D2 recovery) finds the live `❯` cursor in
+`current_form`, computes `delta = target − cursor.number`, sends `Down`/`Up` ×
+|delta| (`send_keys(enter=False, literal=False)`, MONOTONIC — never a wrap
+shortcut, each return-checked), waits `NAV_SETTLE` (0.5s), re-parses to VERIFY the
+cursor landed on the target (same cursor-blind `fingerprint` + `vc.number ==
+target` + `_loose_label_match(vc.label, minted_label)` + the
+`review_submit_dispatchable` anchor for Submit), presses `Enter` (`enter=False,
+literal=False` — the version-stable commit, True in every variant), waits
+`COMMIT_SETTLE` (0.5s), re-parses, and records `dispatched` ONLY after
+`_classify_advance` confirms the EXACT expected transition (a positive forward
+advance / resolution — over-advance, wrong-tab, no-flip all fail CLOSED). Ledger
+non-success states: a **pre-commit bail** (`cursor_unknown` / `nav_send_failed` /
+`verify_failed` — Enter provably never sent) records `not_advanced` and the
+callback **falls through** (a fresh-token re-tap re-validates against the live
+form; safe because nothing was committed); once `Enter` is sent an unconfirmed
+advance (`commit_unconfirmed` / `confirm_capture_failed` / `confirm_parse_failed` —
+a parse-fail with picker markers still present is AMBIGUOUS, never `dispatched`)
+records `commit_unconfirmed` and the callback **refreshes-only, never
+auto-redispatches** (no re-tap can re-send the commit key). The bare digit + the
+`auq_ledger` `digit_sent` / `failed_*_digit` states are now **legacy-only** (kept
+for on-disk compat). The nav `⏎ Enter` button (`CB_ASK_ENTER`) + arrow nav still
+send Enter — the orthogonal navigation path, unchanged, AND the user's manual
+escape if a future variant defeats the auto-dispatch. **Scoped to single-select
+`aqp:` + review Submit/Cancel; the multi-select `aqt:` toggle still dispatches a
+bare digit — a filed fast-follow (AUQ is NOT globally fixed).** Validated against
+Claude Code v2.1.168 terminal behavior.
 
 ## MessageDisplay live-prose capture (Bug 2)
 

@@ -4,6 +4,13 @@ Exercises the public Telegram callback seam for the PR-C ``aqt:`` toggle path:
 render uses the pane-aware side-file source, toggles send a bare digit without
 ledgering or consuming sibling tokens, and Submit/Cancel remains the existing
 review-screen ``aqp:`` flow.
+
+Keystroke model: the multi-select TOGGLE path (``aqt:``) still dispatches a BARE
+DIGIT (this fix is deferred for toggles), so those assertions stay bare-digit.
+The ``aqp:`` Submit/single-select path follows the v2.1.168 model — arrow-navigate
+the live cursor to the target, then ``Enter`` (no bare digit). Those review-Submit
+dispatch tests drive a cursor-aware advancing fake (``_AdvancingPicker``) so the
+post-nav verify + post-Enter confirm observe the real form.
 """
 
 from __future__ import annotations
@@ -21,17 +28,89 @@ from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
 from cctelegram.handlers import auq_ledger, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK, CB_ASK_TOGGLE
 from cctelegram.session_monitor import NewMessage
+from cctelegram.tmux_manager import tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
-from tests.conftest import ScenarioHarness, make_update_callback
+from tests.conftest import ScenarioHarness, make_update_callback, render_cursor
 
 pytestmark = pytest.mark.scenario
 
 _FIXTURES = Path(__file__).parents[1] / "cctelegram" / "fixtures"
 _SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
+# A resolved (non-picker) pane: no AUQ marker phrases → the v2.1.168 confirm step
+# reads a Submit / single-select pick as positively RESOLVED.
+_RESOLVED_PANE = "user@host repo % \n"
+
 
 def _fixture(name: str) -> str:
     return (_FIXTURES / name).read_text()
+
+
+class _AdvancingPicker:
+    """Cursor-aware advancing fake for the v2.1.168 ``aqp:`` Submit / single-select
+    dispatch (overrides ``send_keys`` + ``capture_pane`` on the scenario's tmux).
+
+    Models ONE picker screen: ``Down``/``Up`` move the cursor over ``n_nav``
+    navigable rows (wrapping); ``Enter`` from a real option (1..``n_real``)
+    resolves the tool (the picker disappears → ``_RESOLVED_PANE``). ``capture_pane``
+    is STATEFUL — it renders ``pane`` with the cursor on its live row until the
+    resolving Enter — so the dispatch's post-nav verify and post-Enter confirm both
+    observe a consistent live form.
+
+    ``initial_cursor`` seeds the cursor where the live pane already shows ``❯`` so
+    the dispatch computes the right nav delta (e.g. cursor-on-Cancel ⇒ 2).
+    """
+
+    def __init__(
+        self,
+        scenario: ScenarioHarness,
+        wid: str,
+        pane: str,
+        *,
+        n_real: int,
+        n_nav: int,
+        initial_cursor: int = 1,
+    ) -> None:
+        self._fake = scenario.tmux
+        self._wid = wid
+        self._pane = pane
+        self._n_real = n_real
+        self._n_nav = n_nav
+        self.cursor = initial_cursor
+        self.resolved = False
+
+    async def send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        self._fake.sent_keys.append((window_id, keys, enter, literal))
+        if window_id != self._wid or self.resolved:
+            return window_id in self._fake.windows
+        if keys == "Down":
+            self.cursor = self.cursor + 1 if self.cursor < self._n_nav else 1
+        elif keys == "Up":
+            self.cursor = self.cursor - 1 if self.cursor > 1 else self._n_nav
+        elif keys == "Enter":
+            if 1 <= self.cursor <= self._n_real:
+                self.resolved = True
+        return window_id in self._fake.windows
+
+    async def capture_pane(
+        self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+    ) -> str:
+        del with_ansi, scrollback_lines
+        if window_id != self._wid:
+            return ""
+        if self.resolved:
+            return _RESOLVED_PANE
+        return render_cursor(self._pane, self.cursor)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _AdvancingPicker:
+        for target in (_real_tmux, self._fake):
+            monkeypatch.setattr(target, "send_keys", self.send_keys, raising=False)
+            monkeypatch.setattr(
+                target, "capture_pane", self.capture_pane, raising=False
+            )
+        return self
 
 
 def _safeguards_input(*, multi: bool = True) -> dict[str, Any]:
@@ -196,7 +275,7 @@ def _prefixes(callbacks: list[str], prefix: str) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_happy_path_toggle_tab_review_submit_and_tool_result_cleanup(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wid = _bind(scenario, _fixture("auq_multiselect_fresh_tmux_capture.txt"))
     side_file = _write_side_file(_SESSION_ID, _safeguards_input())
@@ -208,6 +287,7 @@ async def test_happy_path_toggle_tab_review_submit_and_tool_result_cleanup(
     assert not _prefixes(callbacks, CB_ASK_PICK)
     assert not any(cb.startswith(("aqm:", "aqs:", "aqx:")) for cb in callbacks)
 
+    # Toggle path is UNCHANGED — a bare digit (deferred fast-follow).
     await _tap(scenario, toggles[1])
     assert scenario.tmux.sent_keys == [(wid, "2", False, True)]
     assert side_file.exists(), "aqt toggles must not clean side files"
@@ -225,11 +305,25 @@ async def test_happy_path_toggle_tab_review_submit_and_tool_result_cleanup(
     assert _prefixes(review_callbacks, CB_ASK_PICK)
     assert not _prefixes(review_callbacks, CB_ASK_TOGGLE)
 
+    # The review Submit is now an ``aqp:`` arrows+Enter dispatch. The ready-to-submit
+    # pane has the cursor on Submit (option 1), so the bot sends ONLY "Enter"
+    # (delta=0) — never a bare digit on the aqp: path. Install the cursor-aware
+    # advancing fake for the Submit step (the resolving Enter clears the picker).
+    _AdvancingPicker(
+        scenario,
+        wid,
+        _fixture("auq_multiselect_ready_to_submit_tmux_capture.txt"),
+        n_real=2,
+        n_nav=2,
+        initial_cursor=1,
+    ).install(monkeypatch)
+    scenario.tmux.sent_keys.clear()
     submit = _prefixes(review_callbacks, CB_ASK_PICK)[0]
     await _tap(scenario, submit)
     assert scenario.tmux.sent_keys[-1:] == [
-        (wid, "1", False, True),
+        (wid, "Enter", False, False),
     ]
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
     assert side_file.exists(), "review aqp dispatch is not the cleanup event"
 
     await bot_module.handle_new_message(
@@ -457,8 +551,8 @@ async def test_multi_question_suppresses_toggle_buttons(
 
 
 @pytest.mark.asyncio
-async def test_single_select_still_aqp_bare_digit_no_enter(
-    scenario: ScenarioHarness,
+async def test_single_select_aqp_navigates_then_enter_no_bare_digit(
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pane = """Pick one.
 
@@ -471,13 +565,18 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
     picks = _prefixes(_callbacks(scenario), CB_ASK_PICK)
     assert len(picks) == 2
     assert not _prefixes(_callbacks(scenario), CB_ASK_TOGGLE)
+    # v2.1.168: a single-select pick navigates the cursor to the target with
+    # arrows, then presses Enter — NO bare digit on the aqp: path. The cursor is
+    # on option 1 (delta=0), so the dispatch sends ONLY "Enter".
+    _AdvancingPicker(scenario, wid, pane, n_real=2, n_nav=2, initial_cursor=1).install(
+        monkeypatch
+    )
+    scenario.tmux.sent_keys.clear()
     await _tap(scenario, picks[0])
-    # v2.1.167: a single-select pick dispatches a BARE DIGIT (no Enter) — same
-    # keystroke as aqt: toggles.
-    assert scenario.tmux.sent_keys[:1] == [
-        (wid, "1", False, True),
+    assert scenario.tmux.sent_keys[-1:] == [
+        (wid, "Enter", False, False),
     ]
-    assert (wid, "Enter", False, False) not in scenario.tmux.sent_keys
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
 
 def test_aqt_prefix_is_registered() -> None:
@@ -509,7 +608,7 @@ def _token_of(callback_data: str) -> str:
 
 @pytest.mark.asyncio
 async def test_review_submit_after_poller_rerender_dispatches(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED pre-fix / GREEN post-fix — the steady-state ``peek_none`` path.
 
@@ -520,11 +619,12 @@ async def test_review_submit_after_poller_rerender_dispatches(
     ``peek()`` is None. Tapping the displayed Submit button then hits the
     ``peek_none`` branch and refreshes the card WITHOUT dispatching.
 
-    The assertion is the post-fix behaviour (the tap dispatches ``"1"``+``Enter``).
-    RED on current main: the review fingerprints differ (cursor in canonical),
-    so the poller re-mint pops the displayed Submit token (``peek_none``), the
-    card refreshes, and NOTHING is sent → the assertion fails. GREEN after the
-    fix: cursor-blind fp → cache reuse keeps the SAME token alive → dispatch.
+    The assertion is the post-fix behaviour (the tap dispatches arrows+Enter, no
+    bare digit). RED on current main: the review fingerprints differ (cursor in
+    canonical), so the poller re-mint pops the displayed Submit token
+    (``peek_none``), the card refreshes, and NOTHING is sent → the assertion
+    fails. GREEN after the fix: cursor-blind fp → cache reuse keeps the SAME token
+    alive → dispatch.
     """
     wid = _bind(scenario, _fixture(_REVIEW_SUBMIT_FIXTURE))
     _write_side_file(_SESSION_ID, _two_toggled_input())
@@ -536,20 +636,34 @@ async def test_review_submit_after_poller_rerender_dispatches(
     scenario.tmux.set_pane(wid, _fixture(_REVIEW_CANCEL_FIXTURE))
     await _render(scenario, wid)
 
+    # The live pane now has the cursor on Cancel (option 2). Tapping the still-shown
+    # Submit (option 1) navigates ``Up`` to reach it, then ``Enter`` — install the
+    # cursor-aware advancing fake seeded at cursor-on-Cancel so the post-nav verify
+    # sees the cursor land on Submit and the resolving Enter clears the picker.
+    _AdvancingPicker(
+        scenario,
+        wid,
+        _fixture(_REVIEW_CANCEL_FIXTURE),
+        n_real=2,
+        n_nav=2,
+        initial_cursor=2,
+    ).install(monkeypatch)
     scenario.tmux.sent_keys.clear()
     await _tap(scenario, submit_cb)
     # Post-fix the token survives (cache reuse, byte-identical keyboard) and the
-    # tap dispatches the bare digit "1" (v2.1.167 submits on a bare digit, no
-    # Enter). RED on main: the token was popped (peek_none), the card refreshes,
+    # tap dispatches arrows+Enter (Up to reach Submit, then Enter — v2.1.168, no
+    # bare digit). RED on main: the token was popped (peek_none), card refreshes,
     # and nothing is sent.
-    assert scenario.tmux.sent_keys[-1:] == [
-        (wid, "1", False, True),
+    assert scenario.tmux.sent_keys == [
+        (wid, "Up", False, False),
+        (wid, "Enter", False, False),
     ]
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
 
 @pytest.mark.asyncio
 async def test_review_submit_sub_poll_window_dispatches(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED pre-fix / GREEN post-fix — the sub-poll ``stale_form`` path.
 
@@ -561,7 +675,7 @@ async def test_review_submit_sub_poll_window_dispatches(
 
     RED today: cursor-on-Cancel live parse fingerprint != minted cursor-on-Submit
     fingerprint → stale_form → no keystrokes. Post-fix the review fingerprint is
-    cursor-blind so the parse matches and ``"1"``+``Enter`` dispatch.
+    cursor-blind so the parse matches and the v2.1.168 arrows+Enter dispatch fires.
     """
     wid = _bind(scenario, _fixture(_REVIEW_SUBMIT_FIXTURE))
     _write_side_file(_SESSION_ID, _two_toggled_input())
@@ -569,14 +683,26 @@ async def test_review_submit_sub_poll_window_dispatches(
     await _render(scenario, wid)
     submit_cb = _prefixes(_callbacks(scenario), CB_ASK_PICK)[0]
 
-    # Live pane moved to cursor-on-Cancel; NO re-render (sub-poll-cycle window).
-    scenario.tmux.set_pane(wid, _fixture(_REVIEW_CANCEL_FIXTURE))
+    # Live pane moved to cursor-on-Cancel; NO re-render (sub-poll-cycle window). The
+    # cursor-aware advancing fake is seeded at cursor-on-Cancel so the dispatch
+    # navigates ``Up`` to Submit (option 1) then commits with ``Enter``.
+    _AdvancingPicker(
+        scenario,
+        wid,
+        _fixture(_REVIEW_CANCEL_FIXTURE),
+        n_real=2,
+        n_nav=2,
+        initial_cursor=2,
+    ).install(monkeypatch)
 
     scenario.tmux.sent_keys.clear()
     await _tap(scenario, submit_cb)
-    assert scenario.tmux.sent_keys[-1:] == [
-        (wid, "1", False, True),
+    # Arrows+Enter (Up to Submit, then Enter) — no bare digit on the aqp: path.
+    assert scenario.tmux.sent_keys == [
+        (wid, "Up", False, False),
+        (wid, "Enter", False, False),
     ]
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
 
 @pytest.mark.asyncio

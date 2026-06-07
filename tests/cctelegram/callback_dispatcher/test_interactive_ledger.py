@@ -1,12 +1,23 @@
 """Integration tests for the Wave 3 ledger flow in the pick callback handler.
 
 Covers:
-  - Per-state behavior matrix for all 5 persisted states + the unknown
-    load-time projection (post-restart).
+  - Per-state behavior matrix for the persisted states + the unknown
+    load-time projection (post-restart). The legacy ``digit_sent`` /
+    ``failed_before_digit`` / ``failed_after_digit`` projections are still
+    served by the matrix (on-disk compat) and asserted as such.
   - Wrong-user replay returns WRONG_USER_PICK_TEXT (not the option label).
   - Legitimate live-token collision falls through to the in-process path.
   - Malformed callback shape bounces with "Card expired".
   - Same-user window-id collision falls through to the token path.
+
+v2.1.168 dispatch model: the live ``aqp:`` dispatch arrow-navigates the cursor to
+the tapped option, presses ``Enter`` (the version-stable commit), re-parses the
+pane, and records ``dispatched`` ONLY after a confirmed advance. So the
+dispatch-path fakes here are CURSOR-AWARE + advance-aware (``FakeTmuxManager``
+moves a cursor on ``Down``/``Up`` and, on ``Enter`` from a real option, resolves
+the single-question tool → a non-picker pane), and a nav/commit ``send_keys``
+returning False now records ``not_advanced`` (the pre-commit bail), not the legacy
+``failed_before_digit``.
 
 Uses the same FakeQuery / _ctx / _adapters scaffolding as
 ``test_dispatcher.py`` for consistency.
@@ -31,6 +42,7 @@ from cctelegram.callback_dispatcher import (
 from cctelegram.handlers import auq_ledger, auq_source, interactive_ui, pick_token
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.terminal_parser import resolve_ask_form
+from tests.conftest import render_cursor
 
 
 _OWNER_ID = 1
@@ -74,19 +86,63 @@ class FakeSessionManager:
         return self.current_window
 
 
+# A resolved (non-picker) pane: no AUQ marker phrases, so
+# ``_pane_looks_like_picker`` is False → the v2.1.168 confirm step reads the
+# single-question pick as positively RESOLVED (the tool's picker disappeared).
+_RESOLVED_PANE = "user@host repo % \n"
+
+# The baseline pane offers 3 real options (1-3) plus affordances 4 (Type
+# something) and 5 (Chat about this) — 5 navigable rows.
+_BASELINE_N_REAL = 3
+_BASELINE_N_NAV = 5
+
+
 class FakeTmuxManager:
+    """Cursor-aware + advance-aware fake of the v2.1.168 single-question picker.
+
+    Models the captured .168 keystroke semantics for the live ``aqp:`` dispatch
+    path: ``Down``/``Up`` move the cursor (with wrap), ``Enter`` from a real
+    option resolves the single-question tool (the picker disappears →
+    ``_RESOLVED_PANE``). ``capture_pane`` is STATEFUL — before the commit it
+    renders the baseline pane with the cursor on its current row (so the dispatch's
+    post-nav VERIFY sees the moved cursor), and after the resolving Enter it returns
+    the non-picker pane (so the confirm step records ``dispatched``).
+
+    The cursor starts on option 1 (the baseline pane's ``❯`` row), matching the
+    pane the token is minted from.
+    """
+
     def __init__(self) -> None:
         self.find_window_by_id = AsyncMock(
             return_value=SimpleNamespace(window_id=_WINDOW_ID)
         )
-        # Production send_keys returns True/False; default success here so
-        # the handler's Wave 3 return-value check doesn't short-circuit
-        # tests that exercise the dispatch path.
-        self.send_keys = AsyncMock(return_value=True)
-        # Real baseline pane: validate_and_consume re-parses via the real
-        # parser, so the dispatch (``ok``) path needs a pane that resolves to
-        # the minted form.
-        self.capture_pane = AsyncMock(return_value=_BASELINE_PANE)
+        self.cursor = 1
+        self.resolved = False
+        self.send_keys = AsyncMock(side_effect=self._send_keys)
+        self.capture_pane = AsyncMock(side_effect=self._capture_pane)
+
+    async def _send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        if window_id != _WINDOW_ID or self.resolved:
+            return True
+        if keys == "Down":
+            self.cursor = self.cursor + 1 if self.cursor < _BASELINE_N_NAV else 1
+        elif keys == "Up":
+            self.cursor = self.cursor - 1 if self.cursor > 1 else _BASELINE_N_NAV
+        elif keys == "Enter":
+            if 1 <= self.cursor <= _BASELINE_N_REAL:
+                self.resolved = True  # single-question tool resolves
+        return True
+
+    async def _capture_pane(
+        self, window_id: str, scrollback_lines: int = 0, with_ansi: bool = False
+    ) -> str:
+        if window_id != _WINDOW_ID:
+            return ""
+        if self.resolved:
+            return _RESOLVED_PANE
+        return render_cursor(_BASELINE_PANE, self.cursor)
 
 
 def _ctx(query: FakeQuery, user_id: int = _OWNER_ID) -> SimpleNamespace:
@@ -510,9 +566,9 @@ class TestAcceptedToDispatchedHappyPath:
     async def test_first_keyed_tap_writes_full_state_machine(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Owner taps a fresh keyed button. v2.1.167 single-keystroke model:
-        the ledger walks accepted → dispatched directly (the bare digit IS the
-        complete dispatch — no intermediate digit_sent / Enter step).
+        """Owner taps a fresh keyed button. v2.1.168 navigate+Enter model:
+        the ledger walks accepted → dispatched, where ``dispatched`` is recorded
+        only after the post-Enter confirm proves the expected advance.
         """
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         monkeypatch.setattr(
@@ -534,20 +590,27 @@ class TestAcceptedToDispatchedHappyPath:
         assert entry.dispatched_at is not None
 
 
-class TestSendKeysFailureRecordsFailed:
+class TestSendKeysFailureRecordsNotAdvanced:
     """Codex Wave 3 P1: tmux send_keys returns False on missing session /
-    window / pane / libtmux exception. Handler MUST check the return and
-    record failed_before_digit instead of writing dispatched. A silent False
-    return used to convert a tmux failure into a permanent "already received"
-    — duplicate tap then locked the user out of the action even though tmux
-    never received the digit. (Post-v2.1.167 the dispatch sends only the bare
-    digit, so failed_after_digit is no longer reachable — there is no Enter.)
+    window / pane / libtmux exception. Handler MUST check the return and NOT
+    record ``dispatched``. A silent False return used to convert a tmux failure
+    into a permanent "already received" — duplicate tap then locked the user out
+    of the action even though tmux never received the keystroke.
+
+    v2.1.168 model: a nav (``Down``/``Up``) OR the commit ``Enter`` returning
+    False is a PRE-COMMIT bail (``Enter`` provably never committed) → the ledger
+    records ``not_advanced`` (the retryable state), NOT the legacy
+    ``failed_before_digit``. The callback answers "Action not registered;
+    refreshing card." and the row is fall-through retryable, never the terminal
+    "already received" lock.
     """
 
     @pytest.mark.asyncio
-    async def test_digit_send_returns_false_records_failed_before_digit(
+    async def test_commit_send_returns_false_records_not_advanced(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Option 1 (cursor already on it): delta=0, so the FIRST send_keys is the
+        # commit Enter — it returns False → pre-commit bail (commit_send_failed).
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         monkeypatch.setattr(
             "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
@@ -558,15 +621,56 @@ class TestSendKeysFailureRecordsFailed:
         )
         callback_data, ledger_key = _build_keyed_callback()
         tmux = FakeTmuxManager()
-        # Digit send returns False.
+        # Every send_keys returns False (the commit Enter never reaches tmux).
         tmux.send_keys = AsyncMock(return_value=False)
         query = FakeQuery(callback_data)
         authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
         await execute(authorized, _adapters(FakeSessionManager(), tmux))
-        assert query.answers == [("Action failed; refreshing card.", False)]
+        assert query.answers == [("Action not registered; refreshing card.", False)]
         entry = auq_ledger.lookup(ledger_key)
         assert entry is not None
-        assert entry.state == "failed_before_digit"
+        assert entry.state == "not_advanced"
+        assert entry.failed_reason == "commit_send_failed"
         assert entry.dispatched_at is None
-        # Only one send_keys call (the digit); v2.1.167 sends no Enter.
+        # Exactly one send_keys call (the commit Enter); delta=0 sends no nav keys.
         assert tmux.send_keys.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_nav_send_returns_false_records_not_advanced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Option 3 with the cursor on option 1: delta=2 → the FIRST send_keys is a
+        # ``Down`` nav step. It returns False → pre-commit bail (nav_send_failed);
+        # the Enter is never reached.
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        monkeypatch.setattr(
+            "cctelegram.handlers.interactive_ui.resolve_ask_tool_input",
+            lambda _wid: None,
+        )
+        monkeypatch.setattr(
+            interactive_ui, "handle_interactive_ui", AsyncMock(return_value=True)
+        )
+        callback_data, ledger_key = _build_keyed_callback(
+            option_number=3, label="Defer Wave 0"
+        )
+        tmux = FakeTmuxManager()
+        sent: list[str] = []
+
+        async def _send_keys(
+            window_id: str, keys: str, enter: bool = True, literal: bool = True
+        ) -> bool:
+            sent.append(keys)
+            return False  # the first nav step fails
+
+        tmux.send_keys = AsyncMock(side_effect=_send_keys)
+        query = FakeQuery(callback_data)
+        authorized = authorize_initial(parse(query.data.encode()), _ctx(query))
+        await execute(authorized, _adapters(FakeSessionManager(), tmux))
+        assert query.answers == [("Action not registered; refreshing card.", False)]
+        entry = auq_ledger.lookup(ledger_key)
+        assert entry is not None
+        assert entry.state == "not_advanced"
+        assert entry.failed_reason == "nav_send_failed"
+        assert entry.dispatched_at is None
+        # Bailed on the first nav step — never reached Enter.
+        assert sent == ["Down"]

@@ -21,6 +21,7 @@ preserves the kill-criterion signal: scenarios fail the bar only when the
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -198,6 +199,126 @@ class FakeTmux:
     # Sometimes called by older paths
     async def get_session(self) -> Any:
         return MagicMock(name="fake-tmux-session")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# v2.1.168 AUQ keystroke-aware fake picker
+# ──────────────────────────────────────────────────────────────────────────
+
+_OPT_LINE = re.compile(r"^(\s*)(?:❯ |  )(\d+)\. (.*)$")
+_RESOLVED_PANE = "user@host repo % \n"
+
+
+def render_cursor(pane: str, cursor_number: int) -> str:
+    """Return ``pane`` with the ``❯`` cursor relocated onto option ``cursor_number``.
+
+    Models a .168 cursor move: every numbered option line (real options AND the
+    ``Type something`` / ``Chat about this`` affordance rows) is re-prefixed with
+    ``❯ `` for the target number and ``  `` otherwise. Putting the cursor on an
+    affordance number reproduces the affordance-cursor parse (no real option is
+    marked ``cursor`` — the wrap-hazard case).
+    """
+    out: list[str] = []
+    for line in pane.split("\n"):
+        m = _OPT_LINE.match(line)
+        if m:
+            indent, num, rest = m.group(1), m.group(2), m.group(3)
+            prefix = "❯ " if int(num) == cursor_number else "  "
+            out.append(f"{indent}{prefix}{num}. {rest}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+@dataclass
+class _Screen:
+    """One picker screen the :class:`Fake168Picker` can show."""
+
+    pane: str  # the fixture pane text (cursor relocated dynamically)
+    n_real: int  # count of REAL (non-affordance) options the screen offers
+    n_nav: int  # total navigable numbered rows (real + affordances) for wrap
+
+
+class Fake168Picker:
+    """Keystroke-aware fake of the Claude Code v2.1.168 single-select picker.
+
+    Models the captured .168 keystroke semantics so RED tests can prove the bot's
+    dispatch is correct WITHOUT the version-fragile bare digit:
+
+      - ``Up``/``Down`` move the cursor by one navigable row, **wrapping** at the
+        edges (``Up`` from option 1 wraps to the last affordance row — NOT clamped).
+      - ``Enter`` selects the cursor's REAL option and ADVANCES to the next screen
+        (the final screen advancing resolves the tool → a non-picker pane).
+      - a bare digit (``literal=True``): in ``variant="A"`` it select+advances (the
+        inline picker — used by the over-advance guard); in ``variant="B"`` it only
+        moves the cursor (the notes-side-panel variant that broke the bare digit).
+
+    ``capture_pane`` is STATEFUL: it renders the CURRENT screen with the cursor on
+    the current position, so a dispatch that navigates then re-captures sees the
+    moved cursor, and a post-Enter capture sees the advanced screen.
+    """
+
+    def __init__(
+        self, window_id: str, screens: list[_Screen], *, variant: str = "A"
+    ) -> None:
+        self.window_id = window_id
+        self.screens = screens
+        self.variant = variant
+        self.idx = 0
+        self.cursor = 1
+        self.sent: list[tuple[str, str, bool, bool]] = []
+
+    # ── introspection ──────────────────────────────────────────────────
+    def current_pane(self) -> str:
+        if self.idx >= len(self.screens):
+            return _RESOLVED_PANE
+        return render_cursor(self.screens[self.idx].pane, self.cursor)
+
+    @property
+    def resolved(self) -> bool:
+        return self.idx >= len(self.screens)
+
+    def _advance(self) -> None:
+        self.idx += 1
+        self.cursor = 1
+
+    # ── tmux_manager interface ─────────────────────────────────────────
+    async def capture_pane(
+        self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+    ) -> str:
+        del with_ansi, scrollback_lines
+        if window_id != self.window_id:
+            return ""
+        return self.current_pane()
+
+    async def find_window_by_id(self, window_id: str) -> Any:
+        if window_id != self.window_id:
+            return None
+        return SimpleNamespace(window_id=self.window_id, window_name="repo")
+
+    async def send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        self.sent.append((window_id, keys, enter, literal))
+        if window_id != self.window_id or self.resolved:
+            return True
+        scr = self.screens[self.idx]
+        if keys == "Down":
+            self.cursor = self.cursor + 1 if self.cursor < scr.n_nav else 1
+        elif keys == "Up":
+            self.cursor = self.cursor - 1 if self.cursor > 1 else scr.n_nav
+        elif keys == "Enter":
+            if 1 <= self.cursor <= scr.n_real:
+                self._advance()
+        elif literal and keys.isdigit():
+            d = int(keys)
+            if self.variant == "B":
+                if 1 <= d <= scr.n_nav:
+                    self.cursor = d  # navigate only — the .168 notes-panel break
+            elif 1 <= d <= scr.n_real:  # variant A: select + advance
+                self.cursor = d
+                self._advance()
+        return True
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -3,6 +3,12 @@
 Exercises the public Telegram callback seam for the live AUQ regression where
 render minted ``aqp:`` tokens from the PreToolUse side file but validation fell
 back to pane-only parsing, making long/compressed pickers permanently bounce.
+
+Keystroke model: the v2.1.168 ``aqp:`` dispatch arrow-navigates the live cursor
+to the tapped option then presses ``Enter`` (no bare digit). The compressed panes
+here show the cursor already on the tapped option (option 2), so the dispatch
+sends ONLY ``Enter`` (delta=0). The dispatch tests drive a cursor-aware advancing
+fake so the post-Enter confirm sees the single-question tool resolve.
 """
 
 from __future__ import annotations
@@ -21,12 +27,83 @@ from cctelegram.callback_dispatcher import DispatcherAdapters, dispatch_callback
 from cctelegram.handlers import auq_source, interactive_ui, pick_token, status_polling
 from cctelegram.handlers.callback_data import CB_ASK_PICK
 from cctelegram.session_monitor import NewMessage
+from cctelegram.tmux_manager import tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
-from tests.conftest import ScenarioHarness, make_update_callback
+from tests.conftest import ScenarioHarness, make_update_callback, render_cursor
 
 pytestmark = pytest.mark.scenario
 
 _SESSION_ID = "22222222-2222-4222-8222-222222222222"
+
+# A resolved (non-picker) pane: no AUQ marker phrases → the v2.1.168 confirm step
+# reads a single-question pick as positively RESOLVED.
+_RESOLVED_PANE = "user@host repo % \n"
+
+
+class _AdvancingPicker:
+    """Cursor-aware advancing fake for the v2.1.168 ``aqp:`` single-select dispatch.
+
+    Overrides ``send_keys`` + ``capture_pane`` on the scenario's tmux: ``Down``/
+    ``Up`` move the cursor over ``n_nav`` rows (wrapping); ``Enter`` from a real
+    option (1..``n_real``) resolves the single-question tool (picker disappears →
+    ``_RESOLVED_PANE``). ``capture_pane`` is STATEFUL (renders ``pane`` with the
+    cursor on its live row until the resolving Enter), so the dispatch's post-nav
+    verify + post-Enter confirm observe a consistent live form.
+
+    ``initial_cursor`` seeds the cursor where the live pane already shows ``❯``.
+    """
+
+    def __init__(
+        self,
+        scenario: ScenarioHarness,
+        wid: str,
+        pane: str,
+        *,
+        n_real: int,
+        n_nav: int,
+        initial_cursor: int,
+    ) -> None:
+        self._fake = scenario.tmux
+        self._wid = wid
+        self._pane = pane
+        self._n_real = n_real
+        self._n_nav = n_nav
+        self.cursor = initial_cursor
+        self.resolved = False
+
+    async def send_keys(
+        self, window_id: str, keys: str, enter: bool = True, literal: bool = True
+    ) -> bool:
+        self._fake.sent_keys.append((window_id, keys, enter, literal))
+        if window_id != self._wid or self.resolved:
+            return window_id in self._fake.windows
+        if keys == "Down":
+            self.cursor = self.cursor + 1 if self.cursor < self._n_nav else 1
+        elif keys == "Up":
+            self.cursor = self.cursor - 1 if self.cursor > 1 else self._n_nav
+        elif keys == "Enter":
+            if 1 <= self.cursor <= self._n_real:
+                self.resolved = True
+        return window_id in self._fake.windows
+
+    async def capture_pane(
+        self, window_id: str, with_ansi: bool = False, scrollback_lines: int = 0
+    ) -> str:
+        del with_ansi, scrollback_lines
+        if window_id != self._wid:
+            return ""
+        if self.resolved:
+            return _RESOLVED_PANE
+        return render_cursor(self._pane, self.cursor)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _AdvancingPicker:
+        for target in (_real_tmux, self._fake):
+            monkeypatch.setattr(target, "send_keys", self.send_keys, raising=False)
+            monkeypatch.setattr(
+                target, "capture_pane", self.capture_pane, raising=False
+            )
+        return self
+
 
 _DESCRIPTION_1 = (
     "Use the safe rollout lane only after confirming the callback source parity "
@@ -183,7 +260,7 @@ def _token(callback_data: str) -> str:
 
 @pytest.mark.asyncio
 async def test_single_select_side_file_fingerprint_dispatch_and_compact_card(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pane = _compressed_pane()
     wid = _bind(scenario, pane)
@@ -215,11 +292,19 @@ async def test_single_select_side_file_fingerprint_dispatch_and_compact_card(
     assert "Ship the live hotfix path" in context
     assert "Defer the unrelated cleanup lane" in context
 
+    # v2.1.168: the dispatch navigates the cursor to option 2 then presses Enter.
+    # The compressed pane already shows the cursor on option 2 (delta=0), so it
+    # sends ONLY "Enter" (no bare digit). The resolving Enter clears the picker.
+    _AdvancingPicker(scenario, wid, pane, n_real=3, n_nav=3, initial_cursor=2).install(
+        monkeypatch
+    )
+    scenario.tmux.sent_keys.clear()
     await _tap(scenario, picks[1])
 
     assert scenario.tmux.sent_keys[-1:] == [
-        (wid, "2", False, True),
+        (wid, "Enter", False, False),
     ]
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
     assert "Form changed, refreshing." not in [
         str(sent.kwargs.get("text") or "") for sent in scenario.bot.sent
     ]
@@ -258,7 +343,7 @@ async def test_single_select_compressed_pane_rejects_stale_same_labels_title_mis
 
 @pytest.mark.asyncio
 async def test_single_select_compressed_pane_matching_title_still_dispatches(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pane = _compressed_pane()
     wid = _bind(scenario, pane)
@@ -279,15 +364,21 @@ async def test_single_select_compressed_pane_matching_title_still_dispatches(
         "ok",
     )
 
+    # v2.1.168 arrows+Enter dispatch — cursor on option 2 (delta=0) → only "Enter".
+    _AdvancingPicker(scenario, wid, pane, n_real=3, n_nav=3, initial_cursor=2).install(
+        monkeypatch
+    )
+    scenario.tmux.sent_keys.clear()
     await _tap(scenario, picks[1])
     assert scenario.tmux.sent_keys[-1:] == [
-        (wid, "2", False, True),
+        (wid, "Enter", False, False),
     ]
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
 
 @pytest.mark.asyncio
 async def test_single_select_compressed_pane_title_absent_still_dispatches(
-    scenario: ScenarioHarness,
+    scenario: ScenarioHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pane = _compressed_pane_title_absent_same_labels()
     wid = _bind(scenario, pane)
@@ -308,10 +399,16 @@ async def test_single_select_compressed_pane_title_absent_still_dispatches(
         "ok",
     )
 
+    # v2.1.168 arrows+Enter dispatch — cursor on option 2 (delta=0) → only "Enter".
+    _AdvancingPicker(scenario, wid, pane, n_real=3, n_nav=3, initial_cursor=2).install(
+        monkeypatch
+    )
+    scenario.tmux.sent_keys.clear()
     await _tap(scenario, picks[1])
     assert scenario.tmux.sent_keys[-1:] == [
-        (wid, "2", False, True),
+        (wid, "Enter", False, False),
     ]
+    assert not any(lit and k.isdigit() for _w, k, _e, lit in scenario.tmux.sent_keys)
 
 
 # ── Card-liveness regression: a live AUQ card must NOT auto-expire while the

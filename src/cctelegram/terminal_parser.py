@@ -24,7 +24,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -792,6 +792,88 @@ def _checkbox_selected_from_line(line: str) -> bool | None:
 def _strip_option_checkbox(label: str) -> str:
     """Remove a leading ``[ ]`` / ``[✔]`` checkbox from a parsed option label."""
     return re.sub(r"^\[[ ✔xX]\]\s+", "", label, count=1)
+
+
+def _normalize_pick_label(label: str) -> str:
+    """Canonicalize an option label for the cursor-landing verify compare.
+
+    Lowercase, collapse internal whitespace runs to a single space, strip a
+    leading checkbox glyph (``[ ]`` / ``[x]`` / ``[X]`` / ``[✔]``, trailing
+    whitespace OPTIONAL so ``[✔]Foo`` normalizes the same as ``[✔] Foo``) and a
+    trailing ``(recommended)`` suffix (case-insensitive), then edge-strip. The
+    live pane label and the minted label go through the SAME normalization so a
+    checkbox redraw, a recommended tag, or trailing whitespace never spuriously
+    fails the confirm. The checkbox strip is done locally (not via the shared
+    ``_strip_option_checkbox``, whose required trailing whitespace other callers
+    depend on) so the no-space ``[✔]Foo`` case strips too.
+    """
+    stripped = re.sub(r"^\[[ xX✔]\]\s*", "", label.strip(), count=1)
+    stripped = re.sub(r"\(recommended\)\s*$", "", stripped, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", stripped).strip().lower()
+
+
+def _loose_label_match(live: str, minted: str) -> bool:
+    """True iff the live cursor's label is the minted label (truncation-tolerant).
+
+    Both sides are normalized via ``_normalize_pick_label``. An empty normalized
+    side is rejected (an empty match would accept anything — a wrong-option commit
+    hazard). This is the cursor-landing sanity guard alongside the NUMBER +
+    FINGERPRINT checks, so it tolerates the .168 picker clipping long option text
+    (the minted token may carry the full label while the pane clips the live one),
+    while still rejecting an unrelated option.
+
+    Accepts iff (both non-empty) the normalized strings are EQUAL, or the live
+    label is a string PREFIX of the minted label (``minted.startswith(live)`` — the
+    pane truncated a longer option). This rejects semantic extension
+    (live ``"Approve with conditions"`` vs minted ``"Approve"`` → False) and accepts
+    truncation (live ``"Approve with cond"`` vs minted ``"Approve with conditions"``
+    → True). The asymmetry is deliberate: only the LIVE side is ever clipped by the
+    terminal, so the minted label is never the truncated one.
+    """
+    nl = _normalize_pick_label(live)
+    nm = _normalize_pick_label(minted)
+    if not nl or not nm:
+        return False
+    return nl == nm or nm.startswith(nl)
+
+
+# Raw-pane markers that prove an AskUserQuestion picker / review screen is up.
+# Used by the v2.1.168 confirm step to distinguish "picker still rendered but
+# unparseable" (AMBIGUOUS — never record ``dispatched``) from "picker positively
+# gone" (the tool resolved). Footer phrases + the review-screen headers.
+_PICKER_MARKERS: Final[tuple[str, ...]] = (
+    "to select",
+    "to navigate",
+    "to cancel",
+    "Review your answers",
+    "Ready to submit",
+)
+
+# A numbered-option row carrying a real selection cursor glyph (``❯``/``›``/``▶``).
+# This is the cursor-glyph fallback for ``_pane_looks_like_picker``: a still-live
+# picker whose footer/header markers are scrolled off / truncated / outside the
+# captured slice can still be proven up by a cursor-led numbered option. Restricted
+# to the genuine cursor glyphs — ``↓`` is the scroll indicator and ``*``/``>``/``)``
+# are noise, so they are deliberately excluded.
+_RE_PICKER_CURSOR_ROW = re.compile(r"^\s*[❯›▶]\s*\d+\.\s")
+
+
+def _pane_looks_like_picker(pane: str) -> bool:
+    """True iff the raw pane text carries any AskUserQuestion picker marker.
+
+    A coarse raw-text scan (no parse) for the footer phrases and review-screen
+    headers an AUQ picker always renders, OR a numbered-option line carrying a
+    real selection cursor glyph (``❯``/``›``/``▶`` via ``_RE_PICKER_CURSOR_ROW``)
+    — the cursor-glyph fallback covers a still-live picker whose footer/header
+    markers are scrolled off / truncated / outside the captured slice. The
+    confirm step uses it as the tie-breaker when ``resolve_ask_form`` returns
+    None: a match means the picker is still up but the parse failed (AMBIGUOUS →
+    ``commit_unconfirmed``, never ``dispatched``); no match means the picker
+    positively disappeared (the tool resolved).
+    """
+    if any(marker in pane for marker in _PICKER_MARKERS):
+        return True
+    return any(_RE_PICKER_CURSOR_ROW.match(line) for line in pane.splitlines())
 
 
 def _pane_glyph_signal(lines: list[str]) -> Literal["single", "multi", "unknown"]:
