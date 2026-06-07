@@ -31,6 +31,7 @@ from pathlib import Path
 
 from ..config import config
 from ..session import session_manager
+from .message_queue import set_route_user_turn_at
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,11 @@ async def _send_bundle(route: Route, bundle: _PendingBundle) -> bool:
         return True
 
     window_id = route[2]
+    # Item 3 / P2-1: stamp the user-turn delivery instant PRE-SEND (before
+    # send_to_window) so the turn boundary precedes any prose this turn streams —
+    # a fast prose→AUQ turn must not finalize its prose before the stamp lands,
+    # or the live-prose freshness gate would treat it as a prior turn's leftover.
+    set_route_user_turn_at(route[0], route[1], window_id)
     try:
         success, message = await session_manager.send_to_window(window_id, text_to_send)
         if not success:

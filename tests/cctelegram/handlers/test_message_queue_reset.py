@@ -28,6 +28,7 @@ _DICT_NAMES = (
     "_route_inflight",
     "_status_msg_info",
     "_route_last_user_message",
+    "_route_user_turn_at",
     "_tool_msg_ids",
     "_agent_tool_ids",
     "_activity_msg_info",

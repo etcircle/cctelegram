@@ -466,6 +466,38 @@ def test_gc_stale_predicate_exception_skips_reap(cc_dir):
     assert removed == 1
 
 
+def test_gc_stale_monitor_tracked_predicate_keeps_live_reaps_dead(cc_dir):
+    """Integration: the bot.py predicate shape
+    ``lambda sid: monitor.state.get_session(sid) is not None`` keeps a tracked
+    (live AUQ OR EPM — the predicate is session-keyed, not prompt-typed)
+    session's capture file and reaps an untracked one. Locks the wiring without
+    standing up post_init."""
+    from cctelegram.monitor_state import MonitorState, TrackedSession
+
+    state = MonitorState(state_file=cc_dir / "monitor_state.json")
+    state.update_session(
+        TrackedSession(session_id="tracked-sess", file_path="/p/tracked.jsonl")
+    )
+
+    d = cc_dir / "msg_display"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tracked = d / "tracked-sess.ndjson"  # stem == the tracked original session id
+    untracked = d / "gone-sess.ndjson"
+    for f in (tracked, untracked):
+        f.write_text("{}\n")
+    stale = time.time() - 7200
+    for f in (tracked, untracked):
+        os.utime(f, (stale, stale))
+
+    removed = md_capture.gc_stale(
+        max_age_seconds=3600,
+        is_live_session=lambda sid: state.get_session(sid) is not None,
+    )
+    assert removed == 1
+    assert tracked.exists()  # live session's file (+ its dedup markers) survives
+    assert not untracked.exists()
+
+
 def test_gc_stale_toctou_reskip_when_refreshed_before_unlink(cc_dir):
     """TOCTOU: if the file is refreshed (mtime advances within max_age) between
     the age check and unlink, it is NOT reaped. Simulated via a predicate that

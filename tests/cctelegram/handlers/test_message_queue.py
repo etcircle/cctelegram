@@ -18,6 +18,7 @@ Covers two recently-fixed bugs:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3628,3 +3629,51 @@ class TestTodoDigest:
         assert message_queue._todo_msg_info[(1, 42)] is state_b
         assert message_queue._todo_msg_info[(1, 42)].message_id == 0
         assert message_queue._todo_msg_info[(1, 42)].window_id == "@0-new"
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestRouteUserTurnAt:
+    """Item 3 / P2-1: the per-route user-turn delivery stamp store.
+
+    Records the wall-clock instant the bot delivered the current user turn into
+    tmux (the ``not_before`` turn boundary for the live-prose freshness gate).
+    Beside ``_route_last_user_message``; same route-teardown + reset lifecycle.
+    """
+
+    def test_set_then_peek_round_trip(self):
+        before = time.time()
+        message_queue.set_route_user_turn_at(1, 100, "@0")
+        after = time.time()
+        stamped = message_queue.peek_route_user_turn_at(1, 100, "@0")
+        assert stamped is not None
+        assert before <= stamped <= after
+
+    def test_peek_missing_route_is_none(self):
+        assert message_queue.peek_route_user_turn_at(9, 999, "@nope") is None
+
+    def test_peek_is_non_consuming(self):
+        message_queue.set_route_user_turn_at(1, 100, "@0")
+        first = message_queue.peek_route_user_turn_at(1, 100, "@0")
+        second = message_queue.peek_route_user_turn_at(1, 100, "@0")
+        assert first is not None and first == second
+
+    def test_thread_none_normalizes_to_zero(self):
+        message_queue.set_route_user_turn_at(1, None, "@0")
+        assert message_queue.peek_route_user_turn_at(1, 0, "@0") is not None
+        assert message_queue.peek_route_user_turn_at(1, None, "@0") is not None
+
+    @pytest.mark.asyncio
+    async def test_route_teardown_clears_turn_at(self, mock_bot: AsyncMock):
+        route = (1, 100, "@0")
+        # A real queue/worker so teardown_route runs its pop block.
+        message_queue._get_or_create_route(mock_bot, route)
+        message_queue.set_route_user_turn_at(1, 100, "@0")
+        assert message_queue.peek_route_user_turn_at(1, 100, "@0") is not None
+        await message_queue.teardown_route(route, drop_pending=True)
+        assert message_queue.peek_route_user_turn_at(1, 100, "@0") is None
+
+    def test_reset_for_tests_clears_turn_at(self):
+        message_queue.set_route_user_turn_at(1, 100, "@0")
+        assert message_queue.peek_route_user_turn_at(1, 100, "@0") is not None
+        message_queue.reset_for_tests()
+        assert message_queue.peek_route_user_turn_at(1, 100, "@0") is None

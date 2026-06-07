@@ -112,7 +112,9 @@ def test_select_fresh_prose_not_before_excludes_prior_turn(cc_dir):
     excluded even though it is still within the TTL window — the P2-1 leak."""
     now = time.time()
     _seed(_SID, message_id="PRIOR", delta="prior turn prose", captured_at=now - 3)
-    assert select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=now - 1) is None
+    assert (
+        select_fresh_prose(_SID, now=now, ttl_seconds=8.0, not_before=now - 1) is None
+    )
 
 
 def test_select_fresh_prose_not_before_includes_current_turn(cc_dir):

@@ -346,6 +346,32 @@ never a delayed picker). A bounded ≤250ms retry covers the rare same-tick race
 (the prose finalizes ~0.68s before the picker blocks, so it almost never fires).
 Render-path state only — NOT a RouteRuntime field (Bug-1 contract intact).
 
+**Turn-boundary anchor (Item 3 / P2-1 — the prior-turn-prose leak).** Freshness
+was session + TTL only, so a PRIOR turn's leftover prose (still in the per-session
+file because teardown only fires at AUQ/EPM resolution, and still within the TTL)
+could be posted above a picker whose OWN turn produced no prose. Fix: a
+**delivery-seam `not_before` anchor**. `message_queue.set_route_user_turn_at`
+stamps the route's wall-clock delivery instant (`time.time()`) **PRE-SEND** —
+immediately BEFORE `send_to_window` at the user-turn delivery seams
+(`inbound_aggregator._send_bundle`, the slash-command `bot.forward_command_handler`,
+and the `/effort` callback) so a fast prose→AUQ turn can't finalize its prose
+before the stamp lands. `_maybe_post_live_prose` reads it non-consumingly
+(`peek_route_user_turn_at`, resolved INSIDE the function so the 22
+`handle_interactive_ui` callers are untouched — auto-closes the inbound:1061
+on-pane + restart first-render holes) and passes it as `not_before` to
+`select_fresh_prose`, which adds a **STRICT `final_at > not_before`** gate: the
+current turn's prose is captured AFTER delivery, a prior turn's BEFORE it
+(`==` boundary is excluded — not causally after the delivered message). The stamp
+shares the appender's `captured_at` clock, so they compare directly. The store is
+torn down with the route (beside `_route_last_user_message`) and cleared by
+`reset_for_tests`; it is **render/callback-path state, NOT a RouteRuntime field**
+(pull-only; c313657 forbidden). **Residuals (all safe):** after a **restart** the
+in-memory stamp is gone → `not_before=None` → TTL-only (the prior-turn leak is
+NOT fixed across a restart — documented degradation, never a false-negative on the
+live path); a rare **wall-clock-backwards** jump could mis-order a stamp vs a
+`captured_at` (NO epsilon is added — accepted as a rare residual); the per-session
+file's tracked-idle disk retention is unchanged (teardown still owns reclaim).
+
 **Dedup (PR-D).** `session_monitor.filter_live_prose_duplicates` runs on the
 poll BATCH before per-message dispatch (the prose text block and its sibling
 interactive `tool_use` are separate `NewMessage`s of one `message_id`, prose
@@ -372,8 +398,20 @@ primary seam — fires for both via `bot.handle_new_message`'s
 → the thread's bound window). The 1h startup `gc_stale` is the backstop. The
 shown-live / consumed marker lines live in the SAME `msg_display/<session>.ndjson`
 as the capture deltas (the delta reader ignores `marker` lines and vice-versa),
-so they share that lifecycle. Pull-only throughout (no observer; c313657
-forbidden).
+so they share that lifecycle. **Startup-GC liveness gate (Item 3 / P2-2).**
+`gc_stale` previously reaped ANY `*.ndjson` >1h with no liveness check, so a
+long-open picker's capture file (which carries its shown_live/consumed dedup
+markers) was reaped at startup → the post-resolution dedup double-posted. Fix: an
+**INJECTED `is_live_session` predicate** — the `bot.py` callsite passes
+`lambda sid: monitor.state.get_session(sid) is not None` (keyed by the file STEM =
+the original session id the monitor tracks under `--resume`, covering BOTH AUQ and
+EPM since it is session-keyed, not prompt-typed). After the age test, a `True` →
+**SKIP** (keep the live file + its markers); a predicate **raise** → conservative
+SKIP (never delete on uncertainty; caught around the predicate call only so the
+pass continues); and a **re-`stat` before `unlink`** is the TOCTOU guard (a
+concurrent append refreshing the mtime within `max_age` → skip). The predicate is
+NEVER imported into `md_capture` (it stays a leaf — only stdlib + `utils`). Pull-only
+throughout (no observer; c313657 forbidden).
 
 ## Rate Limiting
 

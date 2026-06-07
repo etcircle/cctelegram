@@ -44,6 +44,7 @@ import os
 import shlex
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -370,6 +371,7 @@ def select_fresh_prose(
     *,
     now: float,
     ttl_seconds: float,
+    not_before: float | None = None,
     base_dir: Path | None = None,
 ) -> ProseRecord | None:
     """Pick the freshest FINALIZED prose record whose ``final_at`` is within
@@ -377,11 +379,24 @@ def select_fresh_prose(
     ``None``. Records are per-session by construction (the file is keyed by the
     session's transcript stem), so "same session" needs no extra check; the TTL
     is the staleness guard. Returns the MOST RECENT match — the prose that
-    streamed immediately before this picker."""
+    streamed immediately before this picker.
+
+    TURN-BOUNDARY FILTER (Item 3 / P2-1): ``not_before`` is the wall-clock
+    instant the bot DELIVERED the current user turn into tmux (the same
+    ``time.time()`` clock the appender stamps as ``captured_at``, so directly
+    comparable). The current turn's prose is captured AFTER delivery
+    (``final_at > not_before``); a PRIOR turn's leftover prose — still in the
+    per-session file because teardown only fires at AUQ/EPM resolution, and
+    possibly still within the TTL — finalized BEFORE it. The filter is STRICT
+    ``final_at > not_before`` (prose captured exactly at the boundary is not
+    causally after the delivered message). ``not_before=None`` (the default) is
+    byte-for-byte the prior TTL-only behavior — the restart / first-render
+    degradation where no delivery stamp exists for the route."""
     fresh = [
         r
         for r in read_prose_records(session_id, base_dir=base_dir)
         if (now - r.final_at) <= ttl_seconds
+        and (not_before is None or r.final_at > not_before)
     ]
     return fresh[-1] if fresh else None
 
@@ -524,10 +539,30 @@ def teardown_session(session_id: str, *, base_dir: Path | None = None) -> None:
         logger.warning("md_capture: could not unlink %s: %s", path, e)
 
 
-def gc_stale(max_age_seconds: float = 3600.0, *, base_dir: Path | None = None) -> int:
+def gc_stale(
+    max_age_seconds: float = 3600.0,
+    *,
+    is_live_session: Callable[[str], bool] | None = None,
+    base_dir: Path | None = None,
+) -> int:
     """Sweep capture files older than ``max_age_seconds`` (startup GC, mirroring
     the AUQ side-file 1h GC). Returns the count removed. A live but unanswered
-    prompt's file is younger than the TTL; a crashed/abandoned one ages out."""
+    prompt's file is younger than the TTL; a crashed/abandoned one ages out.
+
+    LIVENESS GATE (Item 3 / P2-2): a long-open picker's capture file (which ALSO
+    carries its shown_live/consumed dedup markers in the same file) can age past
+    ``max_age_seconds`` while the prompt is still genuinely live; reaping it
+    would drop the markers and double-post the prose at resolution. When
+    ``is_live_session`` is supplied, it is called with the file STEM (= the
+    original session id, the ndjson key) after the age test passes: True → SKIP
+    (keep the live file); an EXCEPTION → conservative SKIP (never delete on
+    uncertainty; the raise is caught around the predicate call only so the rest
+    of the pass continues). The predicate is INJECTED — ``md_capture`` stays a
+    leaf and never imports a cctelegram module to learn liveness.
+
+    TOCTOU: after the age + liveness checks pass, the mtime is re-``stat``-ed
+    immediately before ``unlink``; if a concurrent append refreshed the file
+    (``now - st_mtime <= max_age_seconds`` at re-stat) it is SKIPPED."""
     d = (base_dir / MD_DISPLAY_DIRNAME) if base_dir is not None else msg_display_dir()
     removed = 0
     now = time.time()
@@ -539,9 +574,22 @@ def gc_stale(max_age_seconds: float = 3600.0, *, base_dir: Path | None = None) -
         if not f.name.endswith(".ndjson"):
             continue
         try:
-            if now - f.stat().st_mtime > max_age_seconds:
-                f.unlink()
-                removed += 1
+            if now - f.stat().st_mtime <= max_age_seconds:
+                continue
+            if is_live_session is not None:
+                try:
+                    if is_live_session(f.stem):
+                        continue  # live prompt — keep its file + dedup markers
+                except Exception:
+                    # Never delete on uncertainty; the predicate raising must
+                    # not abort the whole GC pass either.
+                    continue
+            # Re-stat immediately before unlink: a concurrent append between the
+            # age check and now could have refreshed the file.
+            if now - f.stat().st_mtime <= max_age_seconds:
+                continue
+            f.unlink()
+            removed += 1
         except OSError:
             continue
     return removed

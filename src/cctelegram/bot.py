@@ -126,6 +126,7 @@ from .handlers.message_queue import (
     enqueue_content_message,
     get_content_queue,
     probe_topic_liveness,
+    set_route_user_turn_at,
     shutdown_workers,
 )
 from . import message_refs
@@ -631,6 +632,10 @@ async def forward_command_handler(
     route = (user.id, thread_id or 0, wid)
     await aggregator_flush_route(route)
 
+    # Item 3 / P2-1: stamp the user-turn delivery instant PRE-SEND — a forwarded
+    # slash command is a user turn that can make Claude produce prose + a picker,
+    # so the live-prose freshness gate needs this turn boundary.
+    set_route_user_turn_at(user.id, thread_id or 0, wid)
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
@@ -1176,7 +1181,17 @@ async def post_init(application: Application) -> None:
         from . import md_capture
 
         md_capture.ensure_capture_settings()
-        md_capture.gc_stale()
+        # Item 3 / P2-2: gate the startup reap on session liveness so a
+        # long-open AUQ/EPM picker's capture file (which also carries its
+        # shown_live/consumed dedup markers) is NOT reaped while the prompt is
+        # still live — reaping it would drop the markers and double-post the
+        # prose at resolution. The ndjson stem IS the ORIGINAL session id the
+        # monitor tracks (under --resume the bot tracks the original id), so
+        # tracked-session membership is the AUQ+EPM-covering liveness test. The
+        # predicate is INJECTED (md_capture stays a leaf, never imports here).
+        md_capture.gc_stale(
+            is_live_session=lambda sid: monitor.state.get_session(sid) is not None
+        )
         if not md_capture.capture_settings_has_message_display():
             logger.warning(
                 "MessageDisplay capture settings missing the hook (%s); live "

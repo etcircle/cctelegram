@@ -10,15 +10,18 @@ import pytest
 
 from cctelegram.config import config
 from cctelegram.handlers import inbound_aggregator
+from cctelegram.handlers import message_queue
 
 
 @pytest.fixture(autouse=True)
 def _clear_aggregator_state():
     inbound_aggregator._route_pending.clear()
     inbound_aggregator._route_locks.clear()
+    message_queue._route_user_turn_at.clear()
     yield
     inbound_aggregator._route_pending.clear()
     inbound_aggregator._route_locks.clear()
+    message_queue._route_user_turn_at.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -386,3 +389,49 @@ def test_session_manager_mock_protocol():
     # AsyncMock works as a stand-in.
     session_manager_mock = AsyncMock()
     session_manager_mock.send_to_window = AsyncMock(return_value=(True, "ok"))
+
+
+# ── Item 3 / P2-1: user-turn delivery stamp lands PRE-SEND ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_bundle_stamps_turn_at_before_send_to_window():
+    """The route's user-turn delivery stamp must be set BEFORE
+    ``send_to_window`` runs (pre-send ordering is load-bearing: a fast
+    prose→AUQ turn could otherwise finalize its prose before the stamp lands,
+    and the live-prose freshness gate would then mistake it for a prior turn)."""
+    route = (1, 100, "@0")
+    stamp_seen_at_send: list[float | None] = []
+
+    async def checking_send(window_id: str, text: str) -> tuple[bool, str]:
+        # When send_to_window runs, the stamp must already exist.
+        stamp_seen_at_send.append(message_queue.peek_route_user_turn_at(1, 100, "@0"))
+        return True, "ok"
+
+    with patch.object(
+        inbound_aggregator.session_manager,
+        "send_to_window",
+        side_effect=checking_send,
+    ):
+        await inbound_aggregator.aggregator_offer_text(route, "hello")
+        await inbound_aggregator.aggregator_flush_route(route)
+
+    assert len(stamp_seen_at_send) == 1
+    assert stamp_seen_at_send[0] is not None, (
+        "send_to_window ran before the user-turn stamp was set — pre-send "
+        "ordering broken"
+    )
+    # And the stamp persists after the flush for the live-prose gate to read.
+    assert message_queue.peek_route_user_turn_at(1, 100, "@0") is not None
+
+
+@pytest.mark.asyncio
+async def test_send_bundle_empty_text_does_not_stamp():
+    """An empty bundle returns early (before the stamp), so it must not write a
+    turn boundary for a route that delivered nothing."""
+    route = (1, 100, "@0")
+    bundle = inbound_aggregator._PendingBundle()  # no text/attachments → empty
+    # _format_bundle yields empty → _send_bundle returns early before the stamp.
+    sent = await inbound_aggregator._send_bundle(route, bundle)
+    assert sent is True
+    assert message_queue.peek_route_user_turn_at(1, 100, "@0") is None

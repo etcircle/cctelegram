@@ -2626,11 +2626,22 @@ async def _maybe_post_live_prose(
         if ui_name == "ExitPlanMode"
         else md_capture.AUQ_PROSE_TTL_S
     )
+    # Item 3 / P2-1: the turn-boundary anchor — the wall-clock instant the bot
+    # delivered THIS route's current user turn into tmux (same clock as the prose
+    # ``captured_at``). Resolved INSIDE this function (not threaded through
+    # ``handle_interactive_ui``'s 22 callers) so the inbound:1061 + restart
+    # first-render holes auto-close. ``None`` (e.g. after a restart that wiped the
+    # in-memory stamp) degrades to TTL-only — never a false-negative on the live
+    # path. Filters out a PRIOR turn's leftover prose (final_at <= boundary)
+    # whose own turn produced no prose for this picker.
+    from .message_queue import peek_route_user_turn_at
+
+    nb = peek_route_user_turn_at(user_id, thread_id, window_id)
     deadline = time.monotonic() + _LIVE_PROSE_RETRY_BUDGET_S
     candidate: md_capture.ProseRecord | None = None
     while True:
         candidate = md_capture.select_fresh_prose(
-            session_id, now=time.time(), ttl_seconds=ttl
+            session_id, now=time.time(), ttl_seconds=ttl, not_before=nb
         )
         if candidate is not None or time.monotonic() >= deadline:
             break

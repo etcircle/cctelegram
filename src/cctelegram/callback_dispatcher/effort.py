@@ -20,6 +20,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from cctelegram.handlers.callback_data import CB_EFFORT
 from cctelegram.handlers.inbound_aggregator import aggregator_flush_route
+from cctelegram.handlers.message_queue import set_route_user_turn_at
 from cctelegram.handlers.message_sender import safe_edit
 
 from . import safe_answer, window_lease
@@ -104,6 +105,11 @@ async def execute_effort_callback(authorized: Any, adapters: Any) -> None:
         # the same per-route ordering as a regular slash command.
         route = (user.id, cb_thread_id or 0, window_id)
         await aggregator_flush_route(route)
+        # Item 3 / P2-1: stamp the user-turn delivery instant PRE-SEND, mirroring
+        # forward_command_handler. /effort itself is a config toggle that rarely
+        # streams prose + a picker, but stamping here keeps the turn boundary
+        # uniform across both slash-command delivery seams (zero-cost).
+        set_route_user_turn_at(user.id, cb_thread_id or 0, window_id)
         success, send_msg = await session_manager.send_to_window(
             window_id, f"/effort {level}"
         )

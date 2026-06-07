@@ -181,6 +181,17 @@ _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 # stale message. Tearing down a route also drops the entry.
 _route_last_user_message: dict[Route, int] = {}
 
+# Per-route wall-clock instant the bot DELIVERED the user's turn into tmux (Item
+# 3 / P2-1). Stamped (``time.time()``) PRE-SEND at the delivery seam so a fast
+# prose→AUQ turn cannot finalize its prose before the stamp lands; read
+# non-consumingly by ``interactive_ui._maybe_post_live_prose`` as the
+# ``not_before`` turn boundary for ``md_capture.select_fresh_prose`` so a PRIOR
+# turn's leftover prose (still within the freshness TTL) is not posted above a
+# picker whose own turn produced no prose. Same clock as the appender's
+# ``captured_at``, so directly comparable. Torn down with the route; degrades to
+# ``None`` (TTL-only) across a restart.
+_route_user_turn_at: dict[Route, float] = {}
+
 # Activity digest tracking: one editable message per user/topic that collapses
 # tool calls, tool results, and thinking into a Hermes-style activity card.
 _activity_msg_info: dict[tuple[int, int], ActivityDigestState] = {}
@@ -387,6 +398,37 @@ def consume_route_last_user_message(
     """Pop helper for callers that own the anchor lifecycle (interactive UI)."""
     route = _route_for(user_id, thread_id, window_id)
     return _route_last_user_message.pop(route, None)
+
+
+def set_route_user_turn_at(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> None:
+    """Stamp the wall-clock instant the bot delivers the current user turn into
+    tmux (Item 3 / P2-1 turn boundary).
+
+    Called PRE-SEND at the delivery seam (immediately before
+    ``send_to_window``) so the boundary precedes any prose the turn streams. The
+    same ``time.time()`` clock the MessageDisplay appender stamps as
+    ``captured_at``, so ``select_fresh_prose(not_before=...)`` can compare them
+    directly: the current turn's prose finalizes AFTER this stamp, a prior
+    turn's leftover prose BEFORE it.
+    """
+    route = _route_for(user_id, thread_id, window_id)
+    _route_user_turn_at[route] = time.time()
+
+
+def peek_route_user_turn_at(
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+) -> float | None:
+    """Non-consuming read of the route's last user-turn delivery instant, or
+    ``None`` when none was stamped (e.g. after a restart — degrades the live
+    prose freshness to TTL-only)."""
+    route = _route_for(user_id, thread_id, window_id)
+    return _route_user_turn_at.get(route)
 
 
 def get_content_queue(route: Route) -> asyncio.Queue[MessageTask] | None:
@@ -2893,6 +2935,9 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         # §2.5.2: drop any per-route anchor candidate so a freshly re-bound
         # route can't reply-to a Telegram message_id from the old session.
         _route_last_user_message.pop(route, None)
+        # Item 3 / P2-1: drop the route's user-turn delivery stamp alongside the
+        # anchor so a re-bound route can't carry a stale turn boundary.
+        _route_user_turn_at.pop(route, None)
         route_runtime.clear_route(route)
         # Cancel any pending activity-digest debounce so we don't fire an
         # edit against a torn-down route. Also drop the upsert lock — a
@@ -3018,6 +3063,7 @@ def reset_for_tests() -> None:
     _route_inflight.clear()
     _status_msg_info.clear()
     _route_last_user_message.clear()
+    _route_user_turn_at.clear()
     _tool_msg_ids.clear()
     _agent_tool_ids.clear()
     _activity_msg_info.clear()
