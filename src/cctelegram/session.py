@@ -877,7 +877,16 @@ class SessionManager:
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
-        """Send text to a tmux window by ID."""
+        """Send text to a tmux window by ID.
+
+        The whole text→settle→Enter transaction (send_keys with
+        ``literal+enter`` sleeps 500ms between the text and the Enter) runs
+        under the per-window send lock, so concurrent sends to the SAME
+        window — e.g. the inbound aggregator's unawaited boundary-flush vs a
+        cap-flush — serialize FIFO instead of interleaving keystrokes
+        (finding 9). The lock is a leaf: nothing here does Telegram I/O or
+        touches route locks while holding it.
+        """
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",
@@ -885,10 +894,11 @@ class SessionManager:
             display,
             len(text),
         )
-        window = await tmux_manager.find_window_by_id(window_id)
-        if not window:
-            return False, "Window not found (may have been closed)"
-        success = await tmux_manager.send_keys(window.window_id, text)
+        async with tmux_manager.window_send_lock(window_id):
+            window = await tmux_manager.find_window_by_id(window_id)
+            if not window:
+                return False, "Window not found (may have been closed)"
+            success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             # Record the bot-originated send so the session_monitor can
             # suppress the matching user-message echo from JSONL. Without

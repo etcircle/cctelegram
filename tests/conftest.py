@@ -774,6 +774,10 @@ def _reset_all_handler_state() -> None:
     _reset_aggregator()
     _reset_status_polling()
     _reset_session_manager()
+    # Wave 3a: per-window send locks live on the tmux_manager singleton and
+    # are loop-bound at first acquire — drop them between tests so a lock
+    # created under a previous test's event loop never leaks forward.
+    _real_tmux.reset_window_send_locks_for_tests()
 
 
 # ──────────────────────────────────────────────────────────────────────────

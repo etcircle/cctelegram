@@ -15,6 +15,19 @@ Performance:
   - list_windows() has a 1s TTL cache so the 8 concurrent gather() callers
     in status_poll_loop coalesce to a single tmux subprocess per cycle.
 
+Concurrency (Wave 3a):
+  - window_send_lock(window_id) is a per-window asyncio.Lock registry that
+    serializes multi-keystroke transactions to one pane: the text→settle→Enter
+    send in SessionManager.send_to_window, and the nav→verify→Enter→confirm
+    critical section of the AUQ pick dispatch. Lifecycle: an entry is dropped
+    on kill_window ONLY; a stale entry for an externally-vanished or
+    topic-closed window is harmless (an asyncio.Lock with no holders) and
+    bounded by tmux window-id reuse — the next claimant of a reused id simply
+    inherits an idle lock. The lock is a LEAF: holders must never acquire
+    route locks / route_runtime / message_queue internals while holding it,
+    and (with the single exception of an already-in-flight callback answer)
+    no Telegram I/O may run while it is held.
+
 Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
 
@@ -121,6 +134,15 @@ class TmuxManager:
         # invocations against the same instance — binding a lock to a
         # specific loop here would explode in those cases.
         self._list_lock: asyncio.Lock | None = None
+        # Per-window send locks (see "Concurrency" in the module docstring).
+        # Each entry records the event loop it was created under: asyncio.Lock
+        # is loop-bound at first acquire, so under tests that run a fresh loop
+        # per test against this module singleton a stale entry must be
+        # recreated rather than reused (production has exactly one loop, so
+        # the loop check never fires there).
+        self._window_send_locks: dict[
+            str, tuple[asyncio.Lock, asyncio.AbstractEventLoop]
+        ] = {}
 
     @property
     def server(self) -> libtmux.Server:
@@ -435,6 +457,29 @@ class TmuxManager:
             return False
         return True
 
+    def window_send_lock(self, window_id: str) -> asyncio.Lock:
+        """Return the per-window send lock for ``window_id``, creating on demand.
+
+        Must be called from a running event loop. Serializes multi-keystroke
+        pane transactions (see "Concurrency" in the module docstring for the
+        lifecycle and the leaf rule). A registry entry created under a
+        previous, now-replaced event loop (test-only situation) is recreated:
+        the stale lock provably has no holders because its loop is gone.
+        """
+        running = asyncio.get_running_loop()
+        entry = self._window_send_locks.get(window_id)
+        if entry is not None:
+            lock, loop = entry
+            if loop is running:
+                return lock
+        lock = asyncio.Lock()
+        self._window_send_locks[window_id] = (lock, running)
+        return lock
+
+    def reset_window_send_locks_for_tests(self) -> None:
+        """Drop all per-window send locks (test isolation seam)."""
+        self._window_send_locks.clear()
+
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
@@ -585,6 +630,15 @@ class TmuxManager:
 
         result = await asyncio.to_thread(_sync_kill)
         self._invalidate_list_cache()
+        # Drop the per-window send lock ONLY on a confirmed kill (Wave 3a
+        # Hermes P3): a failed kill can leave the window ALIVE with an
+        # in-flight holder, and popping here would hand a later acquirer a
+        # FRESH lock for the same live window — the split-lock class this
+        # registry exists to prevent. A window that vanished externally
+        # leaves a stale no-holder entry, which is the documented harmless
+        # bound (module docstring).
+        if result:
+            self._window_send_locks.pop(window_id, None)
         return result
 
     async def create_window(
