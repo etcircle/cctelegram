@@ -150,10 +150,29 @@ Handler modules (handlers/):
                         commit_unconfirmed (Enter sent, advance unconfirmed);
                         ``failed_reason`` carries the sub-reason. digit_sent /
                         failed_before_digit / failed_after_digit are legacy-only
-                        (on-disk compat). ``lookup()`` returns raw rows; the
-                        **callback handler** projects pre-restart accepted rows
-                        to ``unknown`` (via ``process_start_time()``) so it
-                        refreshes the card instead of re-dispatching.
+                        (on-disk compat). ``released`` tombstones a window's rows
+                        on tool_result-confirmed resolution ONLY:
+                        ``release_window`` fires at the explicit AUQ
+                        ``tool_result`` branch in ``bot.handle_new_message``
+                        AND the startup reconciler's positive-proof branch —
+                        NEVER at the generic ``forget_ask_tool_input`` teardown
+                        (`/clear` / session replacement / surface clear are
+                        not resolution proof; releasing there would remove a
+                        dispatched-but-UNRESOLVED row's single-use brake) — so
+                        a same-day byte-identical AUQ (same content-derived
+                        key) is dispatchable again. 24h retention is enforced on READ —
+                        load collapses latest-per-key FIRST then drops an
+                        expired latest key (never resurrecting an older row);
+                        ``lookup()`` re-checks the cutoff and treats a latest
+                        ``released`` row as None. Otherwise ``lookup()`` returns
+                        raw rows; the **callback handler** projects pre-restart
+                        accepted rows to ``unknown`` (via
+                        ``process_start_time()``) so it refreshes the card
+                        instead of re-dispatching. ``pick_token``'s sibling-
+                        claimed recovery guard filters by STATE: not_advanced /
+                        released / failed_before_digit do NOT spend the row;
+                        ``accepted`` stays claimed REGARDLESS of process epoch
+                        (crash-ambiguous — Enter may have been sent).
   pick_intent.py      ─ D2 restart-recovery: durable per-callback-TOKEN AUQ pick
                         mint-intent store (leaf; imports only utils). Append-only
                         JSONL (row + tombstone lines) at pick_intent.jsonl, 24h
@@ -176,11 +195,19 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
                              multi-select toggles; cleaned on AUQ tool_result,
                              session replacement, or startup GC
   auq_action_ledger.jsonl  ─ Wave 3 append-only ledger of AUQ option-pick
-                             lifecycle transitions (mode 0600). The callback
-                             handler consults this BEFORE the in-memory token
-                             table so a duplicate tap after process restart
-                             returns "Action already received" instead of
-                             re-dispatching the digit to tmux.
+                             lifecycle transitions (mode 0600; latest line per
+                             key wins). The callback handler consults this
+                             BEFORE the in-memory token table so a duplicate
+                             tap after process restart returns "Action already
+                             received" instead of re-committing the pick. 24h
+                             retention enforced on read (load + lookup; file
+                             rewritten only by over-cap compaction). `released`
+                             rows tomb a window's keys on tool_result-confirmed
+                             AUQ resolution only (the AUQ tool_result branch in
+                             bot.handle_new_message + the startup reconciler's
+                             positive-proof branch — never the generic
+                             forget_ask_tool_input teardown) so a re-asked
+                             identical question is dispatchable again.
   pick_intent.jsonl        ─ D2 restart-recovery: durable per-callback-TOKEN AUQ
                              pick mint-intent store (mode 0600; append-only row +
                              tombstone JSONL; 24h retention + compaction). Written

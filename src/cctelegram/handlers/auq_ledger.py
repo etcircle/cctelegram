@@ -35,7 +35,11 @@ Storage: append-only JSONL at ``<CC_TELEGRAM_DIR>/auq_action_ledger.jsonl``
 (mode ``0600``). Each line is one persisted state transition for one
 ledger key. The latest line per key wins on lookup. Corrupt trailing
 lines (partial writes during crash) are tolerated by skipping them with
-a WARNING.
+a WARNING. Retention (``RETENTION_SECONDS``, 24h) is enforced on READ:
+``_load_from_disk`` drops a key whose LATEST row is expired (collapse
+latest-per-key FIRST, then the cutoff — never resurrecting an older row),
+and ``lookup`` re-checks the cutoff for a long-running process. The file
+itself is only rewritten by ``_compact`` (above ``LRU_CAP``).
 
 Persisted states:
   - ``accepted``            — token validated, BEFORE navigation/commit.
@@ -50,6 +54,17 @@ Persisted states:
                               ``"confirm_capture_failed"``, or
                               ``"confirm_parse_failed"``. Callback REFRESHES
                               ONLY, never auto-redispatches.
+  - ``released``            — the AUQ INSTANCE resolved (``tool_result``
+                              confirmed): appended by ``release_window`` at
+                              the explicit AUQ ``tool_result`` branch in
+                              ``bot.handle_new_message`` and the startup
+                              reconciler's positive-proof branch — never the
+                              generic ``forget_ask_tool_input`` teardown
+                              (Hermes R2 P1-1).
+                              ``lookup`` treats a latest ``released`` row as
+                              None, so a same-day byte-identical AUQ
+                              (reconstructing the same content-derived key)
+                              is dispatchable again.
   - ``failed_before_digit`` — LEGACY (v2.1.167 bare-digit): digit send returned
                               False / raised before tmux. No longer written.
   - ``digit_sent``          — LEGACY (pre-v2.1.167 digit+Enter): digit landed,
@@ -70,10 +85,11 @@ is the option number. The key is stable across restarts; the full
 fingerprint + user_id are stored per entry for diagnostics and the
 collision-defense check in the callback handler.
 
-``lookup()`` is a pure read — it returns the latest raw row for a key
-or ``None``. It does NOT enforce owner / collision semantics; that
-classification lives in the callback handler per v4 §7.2 (owner-check
-first, then collision via live-pick-token peek).
+``lookup()`` returns the latest row for a key or ``None`` — treating a
+latest ``released`` row and an out-of-retention row as ``None`` (Wave 2).
+It does NOT enforce owner / collision semantics; that classification
+lives in the callback handler per v4 §7.2 (owner-check first, then
+collision via live-pick-token peek).
 """
 
 from __future__ import annotations
@@ -101,6 +117,7 @@ LedgerState = Literal[
     "dispatched",
     "not_advanced",
     "commit_unconfirmed",
+    "released",
     "digit_sent",
     "failed_before_digit",
     "failed_after_digit",
@@ -112,6 +129,7 @@ _PERSISTED_STATES: Final[frozenset[str]] = frozenset(
         "dispatched",
         "not_advanced",
         "commit_unconfirmed",
+        "released",
         "digit_sent",
         "failed_before_digit",
         "failed_after_digit",
@@ -242,6 +260,15 @@ def _load_from_disk() -> None:
     except OSError as exc:
         logger.warning("auq_ledger: failed to read %s: %s", path, exc)
         return
+    # Retention-on-read (Wave 2 fix 3a): apply the RETENTION_SECONDS cutoff
+    # AFTER the latest-wins collapse, never before — an expired LATEST row
+    # drops the KEY entirely; filtering per-line pre-collapse would resurrect
+    # an older (possibly `dispatched`) row for the same key and re-lock it
+    # (Hermes R1 P2-2). Runs regardless of LRU_CAP; the `_compact` rewrite
+    # below still only triggers above the cap.
+    cutoff = _now() - RETENTION_SECONDS
+    for key in [k for k, e in latest.items() if e.accepted_at < cutoff]:
+        del latest[key]
     _entries.clear()
     _entries.update(latest)
     if len(_entries) > LRU_CAP:
@@ -256,13 +283,33 @@ def _ensure_loaded() -> None:
 def lookup(key: str | None) -> LedgerEntry | None:
     """Return the latest LedgerEntry for ``key``, or None.
 
-    Pure read. Owner-check / collision classification lives in the
-    callback handler (v4 §7.2).
+    Owner-check / collision classification lives in the callback handler
+    (v4 §7.2). Two lifecycle filters apply here (Wave 2):
+
+      - a latest ``released`` row → None (the AUQ instance resolved; a
+        re-asked identical question reconstructing the same content-derived
+        key must be dispatchable again). The entry STAYS in ``_entries`` so
+        ``release_window`` stays idempotent.
+      - a latest row whose ``accepted_at`` aged past ``RETENTION_SECONDS``
+        → None, covering a process running >24h whose in-memory map predates
+        the cutoff (load-time retention can't see that). The expired entry
+        IS evicted from ``_entries`` on this read (a later ``record`` then
+        takes the first-write path, which the live mint always satisfies);
+        the FILE is never rewritten on read — disk reclaim stays with
+        ``_compact``.
     """
     if key is None:
         return None
     _ensure_loaded()
-    return _entries.get(key)
+    entry = _entries.get(key)
+    if entry is None:
+        return None
+    if entry.accepted_at < _now() - RETENTION_SECONDS:
+        del _entries[key]
+        return None
+    if entry.state == "released":
+        return None
+    return entry
 
 
 def record(
@@ -282,7 +329,11 @@ def record(
     fields (``user_id``, ``window_id``, ``full_fingerprint``,
     ``option_number``, ``option_label``). Subsequent writes inherit them
     from the existing entry; only ``state`` and ``failed_reason`` are
-    expected to vary.
+    expected to vary. Exception (Hermes P3-1): a fresh ``accepted`` over a
+    ``released`` latest entry replaces the identifying fields with the
+    caller-provided ones — released keys intentionally allow same-key
+    reuse, and the new instance's diagnostics must not inherit the dead
+    instance's identity (matters for rare same-``fp8`` collisions).
 
     Idempotency: writing the same terminal state for an entry that is
     already in that state still appends a new JSONL line but the
@@ -320,15 +371,36 @@ def record(
             failed_reason=failed_reason,
         )
     else:
+        # Hermes P3-1: a fresh `accepted` over a `released` latest entry is a
+        # NEW instance reusing the same content-derived key (the intended
+        # same-day byte-identical re-ask — or, rarely, an fp8 collision).
+        # `lookup()` returns None for released keys, so the caller can't
+        # inspect the old identity; replace the identifying fields with the
+        # caller-provided ones (when given) instead of inheriting the dead
+        # instance's diagnostics. All other merges keep strict inheritance.
+        fresh_over_released = state == "accepted" and existing.state == "released"
+
+        def _ident(provided, inherited):
+            return (
+                provided
+                if (fresh_over_released and provided is not None)
+                else inherited
+            )
+
         entry = LedgerEntry(
             key=existing.key,
             state=state,
-            user_id=existing.user_id,
-            window_id=existing.window_id,
-            full_fingerprint=existing.full_fingerprint,
-            option_number=existing.option_number,
-            option_label=existing.option_label,
-            accepted_at=existing.accepted_at,
+            user_id=_ident(user_id, existing.user_id),
+            window_id=_ident(window_id, existing.window_id),
+            full_fingerprint=_ident(full_fingerprint, existing.full_fingerprint),
+            option_number=_ident(option_number, existing.option_number),
+            option_label=_ident(option_label, existing.option_label),
+            # Wave 2 fix 13: a later `accepted` write is a FRESH in-flight
+            # dispatch claim — stamp it `now` so the callback handler's
+            # process_start_time projection sees a current-process claim
+            # ("Action in progress") instead of projecting a key with
+            # pre-restart history to `unknown` mid-dispatch.
+            accepted_at=now if state == "accepted" else existing.accepted_at,
             digit_sent_at=now if state == "digit_sent" else existing.digit_sent_at,
             dispatched_at=now if state == "dispatched" else existing.dispatched_at,
             failed_reason=(
@@ -338,6 +410,46 @@ def record(
     _append_line(entry)
     _entries[key] = entry
     return entry
+
+
+def release_window(window_id: str) -> int:
+    """Append a ``released`` tombstone for every live ledger row carried by
+    ``window_id``; return the number of rows released.
+
+    Called at the two POSITIVE-PROOF AUQ-resolution seams (Wave 2 fix 3b +
+    the P1-1 placement fix): the explicit AUQ ``tool_result`` branch in
+    ``bot.handle_new_message`` and the startup reconciler's positive-proof
+    branch in ``session_monitor`` (the crash window where the bot was down
+    between the ``tool_result`` and the live seam — Hermes R1 P2-1).
+    Deliberately NOT called from ``forget_ask_tool_input`` — that generic
+    teardown also fires on `/clear` / session replacement / surface clears,
+    none of which prove resolution (Hermes R2 P1-1). Releasing unblocks
+    a same-day byte-identical AUQ whose content-derived key reconstructs the
+    same ``(route_hash, fp8, opt)`` triplet.
+
+    "Carries that window_id" = the latest in-memory entry's ``window_id``
+    field. WINDOW-scoped, never session-scoped: under a double-``--resume``
+    of one session into two windows, the sibling window's unresolved card
+    keeps its rows. Skips rows already ``released`` (idempotent) and rows
+    out of retention (already dead to ``lookup``). Append-only latest-wins
+    — never rewrites or clobbers history. A pure leaf persistence write: no
+    RouteRuntime / status_polling wiring, no observer (c313657 forbidden).
+    """
+    _ensure_loaded()
+    cutoff = _now() - RETENTION_SECONDS
+    released = 0
+    for key, entry in list(_entries.items()):
+        if entry.window_id != window_id:
+            continue
+        if entry.state == "released":
+            continue
+        if entry.accepted_at < cutoff:
+            continue
+        record(key, state="released")
+        released += 1
+    if released:
+        logger.info("auq_ledger: released %d row(s) for window %s", released, window_id)
+    return released
 
 
 def _append_line(entry: LedgerEntry) -> None:

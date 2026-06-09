@@ -754,22 +754,44 @@ class PickRecovery:
     current_form: AskUserQuestionForm | None = None
 
 
+# Ledger states that provably committed NOTHING (or whose AUQ instance
+# resolved): a sibling row in one of these must NOT spend the recovery row.
+# ``not_advanced`` = pre-commit bail, Enter provably never sent;
+# ``released`` = the instance resolved (tool_result confirmed — also masked
+# to None by ``lookup`` itself, kept here as belt-and-braces);
+# ``failed_before_digit`` = legacy v2.1.167 pre-send failure.
+_SIBLING_UNCLAIMED_STATES: frozenset[str] = frozenset(
+    {"not_advanced", "released", "failed_before_digit"}
+)
+
+
 def _any_sibling_claimed(
     route_hash: str, fp8: str, option_numbers: Iterable[int]
 ) -> bool:
-    """True iff ANY of the row's sibling option ledger keys already has a row.
+    """True iff ANY sibling option ledger key holds a CLAIMED row.
 
     Row-level single-use, restart-DURABLE: a single-select row is spent the
-    moment ANY one of its options reaches the action ledger
-    (accepted/digit_sent/dispatched/failed). Bounded ≤9 ``lookup``s — no ledger
-    scan API. Covers the crash-between-accepted-and-row-tomb case (the 24h ledger
-    row outlives the in-memory tomb) AND a sibling whose key the top callback gate
-    missed via collision-suppression (``ledger_key=None``).
+    moment ANY one of its options reaches a claimed ledger state. Bounded ≤9
+    ``lookup``s — no ledger scan API. Covers the
+    crash-between-accepted-and-row-tomb case (the 24h ledger row outlives the
+    in-memory tomb) AND a sibling whose key the top callback gate missed via
+    collision-suppression (``ledger_key=None``).
+
+    State filter (Wave 2 fix 4, revised per Hermes R1 P1-1): rows in
+    ``_SIBLING_UNCLAIMED_STATES`` do NOT block — Enter was provably never
+    sent / the instance resolved. CLAIMED: ``dispatched``,
+    ``commit_unconfirmed``, legacy ``digit_sent`` / ``failed_after_digit``,
+    and ``accepted`` REGARDLESS of process epoch — a pre-restart ``accepted``
+    is crash-AMBIGUOUS (the crash may have hit between Enter and the terminal
+    write), so recovery must DECLINE rather than risk a sibling
+    double-dispatch. Deliberately NO ``process_start_time`` projection here;
+    revisit only if a durable ``enter_sent`` sub-state is ever introduced.
     """
-    return any(
-        auq_ledger.lookup(auq_ledger.make_ledger_key(route_hash, fp8, n)) is not None
-        for n in option_numbers
-    )
+    for n in option_numbers:
+        entry = auq_ledger.lookup(auq_ledger.make_ledger_key(route_hash, fp8, n))
+        if entry is not None and entry.state not in _SIBLING_UNCLAIMED_STATES:
+            return True
+    return False
 
 
 def _recovery_source_parity_ok(

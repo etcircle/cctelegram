@@ -325,3 +325,239 @@ class TestProcessStartTimeProjection:
         # The caller's projection rule — exercised in callback handler
         # tests — applies HERE; this test just confirms the inputs.
         assert entry.accepted_at < auq_ledger.process_start_time()
+
+
+def _raw_line(key: str, state: str, accepted_at: float, **overrides) -> str:
+    """Hand-write one JSONL line so tests control line ORDER + timestamps
+    independently of record()'s merge semantics."""
+    payload = {
+        "key": key,
+        "state": state,
+        "user_id": 42,
+        "window_id": "@7",
+        "full_fingerprint": "ff" * 20,
+        "option_number": 2,
+        "option_label": "alpha",
+        "accepted_at": accepted_at,
+        "digit_sent_at": None,
+        "dispatched_at": None,
+        "failed_reason": None,
+    }
+    payload.update(overrides)
+    return json.dumps(payload, separators=(",", ":")) + "\n"
+
+
+class TestRetentionOnRead:
+    """Wave 2 fix 3a — retention is enforced on READ (load + lookup), not
+    only inside the over-LRU-cap compaction rewrite. Latest-wins-AWARE:
+    collapse to the latest row per key FIRST, then apply the cutoff to that
+    latest row; an expired latest row drops the KEY entirely and must never
+    resurrect an older row (Hermes R1 P2-2)."""
+
+    def test_expired_latest_row_drops_key_at_load(self, ledger_path, clock):
+        clock.t = 200_000.0
+        cutoff_age = auq_ledger.RETENTION_SECONDS
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            f.write(_raw_line("k:1", "dispatched", clock() - cutoff_age - 10.0))
+        auq_ledger.reset_for_tests(path=ledger_path, now=clock, start_time=clock())
+        assert auq_ledger.lookup("k:1") is None, (
+            "an expired latest row must drop the key at load — without this "
+            "the '24h durable' contract is infinitely durable"
+        )
+
+    def test_expired_latest_never_resurrects_older_in_retention_row(
+        self, ledger_path, clock
+    ):
+        """The killer ordering case: line 1 (older) is IN retention, line 2
+        (latest, same key) is EXPIRED. A retention filter applied per-line
+        BEFORE the latest-wins collapse would drop line 2 and resurrect
+        line 1's `dispatched` — re-locking the key. Correct: collapse first,
+        latest is expired, the KEY drops entirely."""
+        clock.t = 200_000.0
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            # Older line: recent accepted_at (in retention), dispatched.
+            f.write(_raw_line("k:1", "dispatched", clock() - 10.0))
+            # Latest line: expired accepted_at.
+            f.write(
+                _raw_line(
+                    "k:1",
+                    "accepted",
+                    clock() - auq_ledger.RETENTION_SECONDS - 10.0,
+                )
+            )
+        auq_ledger.reset_for_tests(path=ledger_path, now=clock, start_time=clock())
+        assert auq_ledger.lookup("k:1") is None, (
+            "an expired LATEST row must drop the key — never resurrect an "
+            "older row for the same key"
+        )
+
+    def test_in_retention_latest_survives_load(self, ledger_path, clock):
+        clock.t = 200_000.0
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            f.write(
+                _raw_line(
+                    "k:1",
+                    "dispatched",
+                    clock() - auq_ledger.RETENTION_SECONDS - 10.0,
+                )
+            )
+            f.write(_raw_line("k:1", "dispatched", clock() - 10.0))
+        auq_ledger.reset_for_tests(path=ledger_path, now=clock, start_time=clock())
+        entry = auq_ledger.lookup("k:1")
+        assert entry is not None
+        assert entry.state == "dispatched"
+
+    def test_lookup_returns_none_when_in_memory_entry_ages_out(
+        self, setup_ledger, clock, ledger_path
+    ):
+        """A process running >24h: the in-memory map was loaded before the
+        cutoff. lookup() must apply the cutoff itself (the entry may be
+        evicted from memory, but the FILE is never rewritten on read)."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        before = ledger_path.read_text()
+        clock.tick(auq_ledger.RETENTION_SECONDS + 1.0)
+        assert auq_ledger.lookup("k:1") is None, (
+            "lookup must enforce retention for a long-running process whose "
+            "in-memory map predates the cutoff"
+        )
+        assert ledger_path.read_text() == before, (
+            "retention-on-read must never rewrite the file"
+        )
+
+
+class TestReleasedTombstone:
+    """Wave 2 fix 3b — `released` tombstone at AUQ resolution closes the
+    same-day identical-AUQ collision (the content-derived key reconstructs
+    the same triplet; a stale `dispatched` row answered 'Action already
+    received' forever)."""
+
+    def test_release_window_makes_lookup_none(self, setup_ledger):
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        count = auq_ledger.release_window("@7")
+        assert count == 1
+        assert auq_ledger.lookup("k:1") is None
+
+    def test_release_window_scopes_by_window(self, setup_ledger):
+        """Window-scoped, NEVER session-scoped — a double-`--resume` sibling
+        window's unresolved card must keep its rows (Hermes Q1)."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        auq_ledger.record(
+            "k:2", **_first_write_kwargs(state="dispatched", window_id="@8")
+        )
+        count = auq_ledger.release_window("@7")
+        assert count == 1
+        assert auq_ledger.lookup("k:1") is None
+        sibling = auq_ledger.lookup("k:2")
+        assert sibling is not None and sibling.state == "dispatched"
+
+    def test_released_round_trips_restart(self, setup_ledger, clock, ledger_path):
+        """`released` must be in _PERSISTED_STATES — unknown states are
+        skipped on load, so without it the tombstone is a restart no-op
+        (Hermes R1 P2-2)."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        auq_ledger.release_window("@7")
+        # Simulate restart: reload from disk.
+        auq_ledger.reset_for_tests(path=ledger_path, now=clock, start_time=clock())
+        assert auq_ledger.lookup("k:1") is None, (
+            "a released row must survive restart (persisted-state parse) "
+            "and lookup must treat it as None"
+        )
+
+    def test_same_key_reask_after_release_is_dispatchable(self, setup_ledger, clock):
+        """A byte-identical re-asked AUQ reconstructs the same key; after
+        the prior instance resolved + released, the fresh pick must be able
+        to claim the key again."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        auq_ledger.release_window("@7")
+        clock.tick(60.0)
+        entry = auq_ledger.record("k:1", state="accepted")
+        assert entry.state == "accepted"
+        live = auq_ledger.lookup("k:1")
+        assert live is not None and live.state == "accepted"
+
+    def test_fresh_accept_over_released_replaces_identity(self, setup_ledger, clock):
+        """Hermes P3-1 — a fresh `accepted` over a `released` latest entry is
+        a NEW instance reusing the content-derived key (same-day re-ask or a
+        rare fp8 collision). The new write's identifying fields must replace
+        the dead instance's, not inherit them — otherwise diagnostics for a
+        collision carry the wrong window/user/fingerprint."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        auq_ledger.release_window("@7")
+        clock.tick(60.0)
+        entry = auq_ledger.record(
+            "k:1",
+            **_first_write_kwargs(
+                state="accepted",
+                user_id=77,
+                window_id="@9",
+                full_fingerprint="ab" * 20,
+                option_number=3,
+                option_label="beta",
+            ),
+        )
+        assert entry.user_id == 77
+        assert entry.window_id == "@9"
+        assert entry.full_fingerprint == "ab" * 20
+        assert entry.option_number == 3
+        assert entry.option_label == "beta"
+
+    def test_fresh_accept_over_released_without_fields_inherits(
+        self, setup_ledger, clock
+    ):
+        """Backward-compat pin for the field-less re-accept (the
+        test_same_key_reask_after_release_is_dispatchable shape): with no
+        provided identity, inheritance still applies."""
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        auq_ledger.release_window("@7")
+        clock.tick(60.0)
+        entry = auq_ledger.record("k:1", state="accepted")
+        assert entry.window_id == "@7"
+        assert entry.user_id == 42
+
+    def test_non_released_merge_keeps_strict_inheritance(self, setup_ledger):
+        """The P3-1 replacement is scoped to accepted-over-released ONLY —
+        an ordinary state transition ignores any provided identity fields."""
+        auq_ledger.record("k:1", **_first_write_kwargs())
+        entry = auq_ledger.record(
+            "k:1",
+            state="dispatched",
+            user_id=99,
+            window_id="@99",
+        )
+        assert entry.user_id == 42
+        assert entry.window_id == "@7"
+
+    def test_release_window_is_idempotent(self, setup_ledger):
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        assert auq_ledger.release_window("@7") == 1
+        assert auq_ledger.release_window("@7") == 0
+
+    def test_release_window_skips_out_of_retention_rows(self, setup_ledger, clock):
+        auq_ledger.record("k:1", **_first_write_kwargs(state="dispatched"))
+        clock.tick(auq_ledger.RETENTION_SECONDS + 1.0)
+        assert auq_ledger.release_window("@7") == 0
+
+    def test_release_window_no_rows_returns_zero(self, setup_ledger):
+        assert auq_ledger.release_window("@99") == 0
+
+
+class TestRecordRefreshesAcceptedAt:
+    """Wave 2 fix 13 — a later `accepted` write must refresh accepted_at,
+    else a fresh in-flight dispatch on a key with pre-restart history
+    projects to `unknown` and a concurrent duplicate tap re-renders
+    mid-dispatch instead of holding."""
+
+    def test_re_accept_refreshes_accepted_at(self, setup_ledger, clock):
+        auq_ledger.record("k:1", **_first_write_kwargs())  # accepted @1000
+        clock.tick(500.0)
+        entry = auq_ledger.record("k:1", state="accepted")
+        assert entry.accepted_at == clock(), (
+            "a later `accepted` write must stamp accepted_at=now so the "
+            "in-progress lock holds against process_start_time projection"
+        )
+
+    def test_non_accepted_write_preserves_accepted_at(self, setup_ledger, clock):
+        auq_ledger.record("k:1", **_first_write_kwargs())
+        clock.tick(500.0)
+        entry = auq_ledger.record("k:1", state="dispatched")
+        assert entry.accepted_at == 1000.0

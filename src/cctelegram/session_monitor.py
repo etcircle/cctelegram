@@ -1242,6 +1242,24 @@ class SessionMonitor:
                         window_id,
                         session_id[:8],
                     )
+                    # Wave 2 (Hermes R1 P2-1): the SAME positive proof that
+                    # gates the unlink also releases the resolved window's
+                    # action-ledger rows — the crash window where the bot was
+                    # down between the tool_result and the live release seam
+                    # (bot.handle_new_message's explicit AUQ tool_result
+                    # branch, which never ran; per Hermes R2 P1-1 the generic
+                    # forget_ask_tool_input teardown deliberately does NOT
+                    # release). Without
+                    # this a stale `dispatched` row blocks a same-day
+                    # identical AUQ ("Action already received") until the 24h
+                    # retention. Fires ONLY inside this re-peek-guarded
+                    # proven-resolved block — no new reap authority (the
+                    # finding-25/26 constraint); the TOCTOU-swap path above
+                    # `continue`s before reaching here. Deferred import: the
+                    # ledger is a handlers leaf (utils-only imports).
+                    from .handlers.auq_ledger import release_window
+
+                    release_window(window_id)
                 # else: live BUFFERED tool_use (no tool_result) → PRESERVE.
 
     async def _find_latest_pending_auq(self, jsonl_path: Path) -> dict | None:

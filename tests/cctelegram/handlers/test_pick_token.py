@@ -958,3 +958,94 @@ class TestPeekRouteSource:
         assert pick_token.peek(a[0]) is None  # prior-gen token evicted
         assert (_USER, _THREAD, _WINDOW, "fpB") in pick_token._pick_token_cache
         assert pick_token.peek(b[0]) is not None  # current card intact
+
+
+# ── Wave 2 fix 4: sibling-claimed state filter ───────────────────────────────
+
+
+class TestSiblingClaimedFilter:
+    """`_any_sibling_claimed` must filter by ledger STATE, not mere row
+    presence (finding 4, revised per Hermes R1 P1-1):
+
+      NOT claimed — `not_advanced` (Enter provably never sent), `released`
+      (instance resolved), `failed_before_digit` (legacy pre-send fail).
+      CLAIMED — `dispatched`, `commit_unconfirmed`, legacy `digit_sent` /
+      `failed_after_digit`, and `accepted` REGARDLESS of process epoch (a
+      pre-restart `accepted` is crash-AMBIGUOUS: the crash may have hit
+      between Enter and the terminal write — recovery must DECLINE rather
+      than risk a sibling double-dispatch).
+    """
+
+    _RH = "deadbeef"
+    _FP8 = "cafebabe"
+
+    @pytest.fixture
+    def ledger(self, tmp_path):
+        from cctelegram.handlers import auq_ledger
+
+        auq_ledger.reset_for_tests(path=tmp_path / "ledger.jsonl")
+        yield auq_ledger
+        auq_ledger.reset_for_tests()
+
+    def _seed(self, ledger, opt: int, state: str) -> None:
+        key = ledger.make_ledger_key(self._RH, self._FP8, opt)
+        ledger.record(
+            key,
+            state="accepted",
+            user_id=_USER,
+            window_id=_WINDOW,
+            full_fingerprint="ff" * 20,
+            option_number=opt,
+            option_label=f"opt{opt}",
+        )
+        if state != "accepted":
+            ledger.record(key, state=state)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("state", ["not_advanced", "failed_before_digit"])
+    def test_unclaimed_states_do_not_block(self, ledger, state):
+        self._seed(ledger, 2, state)
+        assert (
+            pick_token._any_sibling_claimed(self._RH, self._FP8, [1, 2, 3]) is False
+        ), f"a sibling {state} row provably committed nothing — must not block"
+
+    def test_released_sibling_does_not_block(self, ledger):
+        self._seed(ledger, 2, "dispatched")
+        assert ledger.release_window(_WINDOW) == 1
+        assert (
+            pick_token._any_sibling_claimed(self._RH, self._FP8, [1, 2, 3]) is False
+        ), "a released (resolved-instance) sibling row must not block a re-ask"
+
+    @pytest.mark.parametrize(
+        "state",
+        ["dispatched", "commit_unconfirmed", "digit_sent", "failed_after_digit"],
+    )
+    def test_claimed_states_block(self, ledger, state):
+        self._seed(ledger, 2, state)
+        assert pick_token._any_sibling_claimed(self._RH, self._FP8, [1, 2, 3]) is True
+
+    def test_current_process_accepted_blocks(self, ledger):
+        self._seed(ledger, 2, "accepted")
+        assert pick_token._any_sibling_claimed(self._RH, self._FP8, [1, 2, 3]) is True
+
+    def test_pre_restart_accepted_sibling_STAYS_CLAIMED_crash_ambiguous(
+        self, ledger, tmp_path
+    ):
+        """REGRESSION PIN (Hermes R1 P1-1 — do NOT 'fix' this): a pre-restart
+        `accepted` row is proof the prior process was INSIDE the danger
+        window (Enter may have been sent before the crash; the terminal
+        write never landed). It must stay CLAIMED — no process_start_time
+        projection here — so sibling recovery DECLINES instead of risking a
+        second dispatch against the same single-select row."""
+        self._seed(ledger, 2, "accepted")
+        # Simulate restart: start_time AFTER the row's accepted_at.
+        ledger.reset_for_tests(
+            path=tmp_path / "ledger.jsonl", start_time=time.time() + 1000.0
+        )
+        row = ledger.lookup(ledger.make_ledger_key(self._RH, self._FP8, 2))
+        assert row is not None and row.accepted_at < ledger.process_start_time()
+        assert (
+            pick_token._any_sibling_claimed(self._RH, self._FP8, [1, 2, 3]) is True
+        ), "pre-restart accepted is crash-AMBIGUOUS — must stay claimed"
+
+    def test_no_rows_is_unclaimed(self, ledger):
+        assert pick_token._any_sibling_claimed(self._RH, self._FP8, [1, 2, 3]) is False

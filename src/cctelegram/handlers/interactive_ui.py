@@ -415,6 +415,17 @@ def forget_ask_tool_input(window_id: str) -> None:
     # recovery-time form/source re-validation + the 24h GC, but tombing here keeps
     # the store hygienic and prevents a resolved card's tokens from recovering.
     pick_intent.teardown_window(window_id)
+    # NOTE (Wave 2 P1-1): the action-ledger `released` tombstone is NOT
+    # written here. `forget_ask_tool_input` is a GENERIC teardown helper —
+    # it also fires from `/clear`, session replacement
+    # (session_monitor._detect_and_cleanup_changes) and the generic
+    # interactive-surface clear in bot.handle_new_message, none of which
+    # prove the AUQ instance reached its tool_result. Releasing here would
+    # mask a genuinely dispatched-but-UNRESOLVED row and remove the durable
+    # single-use brake. `auq_ledger.release_window` is called only at the
+    # two positive-proof seams: the explicit AUQ ``tool_result`` branch in
+    # ``bot.handle_new_message`` and the startup reconciler's
+    # tool_result-proven block in ``session_monitor``.
     # Bug 2: tear down the MessageDisplay live-prose capture for this window's
     # CURRENT session on resolution. This is the primary teardown seam — it
     # fires for BOTH AUQ (the tool_result branch) and ExitPlanMode (via the

@@ -5213,3 +5213,49 @@ class TestArrowNavCardChanges:
             seen[tag] = card
         # All three rendered cards are mutually distinct (cursor moved each time).
         assert len(set(seen.values())) == 3
+
+
+@pytest.mark.usefixtures("_isolated_interactive_state_file")
+class TestForgetDoesNotReleaseLedgerRows:
+    """Wave 2 P1-1 — `forget_ask_tool_input` is a GENERIC teardown helper
+    (also fired from `/clear`, session replacement, and the generic
+    interactive-surface clear in `bot.handle_new_message`) and must NOT
+    release the window's action-ledger rows: a non-resolution teardown is
+    not proof the AUQ reached its `tool_result`, and releasing here would
+    remove the durable single-use brake on a dispatched-but-UNRESOLVED
+    instance (a stale same-fingerprint tap could re-dispatch). The release
+    lives at the positive-proof seams instead: the explicit AUQ
+    ``tool_result`` branch in ``bot.handle_new_message`` (scenario
+    coverage in tests/scenarios/test_auq_cache_lifecycle.py) and the
+    startup reconciler in ``session_monitor``."""
+
+    def _seed(self, tmp_path, key: str, window_id: str):
+        from cctelegram.handlers import auq_ledger
+
+        auq_ledger.reset_for_tests(path=tmp_path / "ledger.jsonl")
+        auq_ledger.record(
+            key,
+            state="accepted",
+            user_id=42,
+            window_id=window_id,
+            full_fingerprint="ff" * 20,
+            option_number=2,
+            option_label="alpha",
+        )
+        auq_ledger.record(key, state="dispatched")
+        return auq_ledger
+
+    def test_forget_keeps_dispatched_rows(self, tmp_path):
+        from cctelegram.handlers import interactive_ui as iui
+
+        ledger = self._seed(tmp_path, "rh:fp:2", "@5")
+        try:
+            iui.forget_ask_tool_input("@5")
+            row = ledger.lookup("rh:fp:2")
+            assert row is not None and row.state == "dispatched", (
+                "generic teardown (forget_ask_tool_input) must NOT release "
+                "the window's ledger rows — release means 'resolved', not "
+                "'we tore down local state'"
+            )
+        finally:
+            ledger.reset_for_tests()

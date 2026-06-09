@@ -980,6 +980,52 @@ class TestAuqCacheClearOnSessionChange:
         # belongs to the dead session and must be dropped.
         assert interactive_ui.resolve_ask_tool_input("@11") is None
 
+    @pytest.mark.asyncio
+    async def test_session_flip_does_not_release_ledger_rows(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """Wave 2 P1-1 regression — session replacement (`/clear`,
+        restart/session-map flip) runs `forget_ask_tool_input(wid)` as
+        GENERIC cleanup with NO AUQ tool_result observed. That is not
+        resolution proof: a `dispatched` ledger row for the window must stay
+        `dispatched`, NOT be released — releasing would remove the durable
+        single-use brake and let a stale same-fingerprint tap re-dispatch.
+        (Release fires only at the positive-proof seams: bot.handle_new_message's
+        AUQ tool_result branch + the startup reconciler.)"""
+        from cctelegram.handlers import auq_ledger
+
+        key = auq_ledger.make_ledger_key("deadbeef", "cafebabe", 2)
+        auq_ledger.reset_for_tests(path=tmp_path / "auq_action_ledger.jsonl")
+        auq_ledger.record(
+            key,
+            state="accepted",
+            user_id=42,
+            window_id="@11",
+            full_fingerprint="ff" * 20,
+            option_number=2,
+            option_label="alpha",
+        )
+        auq_ledger.record(key, state="dispatched")
+
+        monitor._last_session_map = {"@11": "session-old"}
+
+        async def fake_load_current_map():
+            return {"@11": "session-new"}
+
+        monkeypatch.setattr(monitor, "_load_current_session_map", fake_load_current_map)
+
+        try:
+            await monitor._detect_and_cleanup_changes()
+
+            row = auq_ledger.lookup(key)
+            assert row is not None and row.state == "dispatched", (
+                "session replacement with NO AUQ tool_result must NOT release "
+                "the window's ledger rows — the dispatched-but-UNRESOLVED "
+                "instance keeps its durable single-use brake"
+            )
+        finally:
+            auq_ledger.reset_for_tests()
+
     @staticmethod
     def _write_side_file(tmp_path, session_id: str, tool_use_id: str) -> "object":
         pending = tmp_path / "auq_pending"
@@ -1379,6 +1425,134 @@ class TestAuqCacheClearOnSessionChange:
         finally:
             session_manager.window_states.pop("@7", None)
             auq_source.reset_for_tests()
+
+    # ── Wave 2 (Hermes R1 P2-1): reconciler releases the window's ledger ────
+    # rows on the SAME positive proof that gates the side-file unlink. The
+    # crash window: bot down between the AUQ tool_result and
+    # forget_ask_tool_input — the side file lingers AND a stale `dispatched`
+    # ledger row would block a same-day identical AUQ (the content-derived
+    # key reconstructs the same triplet) with "Action already received".
+
+    def _seed_ledger_row(self, tmp_path, window_id: str) -> str:
+        from cctelegram.handlers import auq_ledger
+
+        auq_ledger.reset_for_tests(path=tmp_path / "auq_action_ledger.jsonl")
+        key = auq_ledger.make_ledger_key("deadbeef", "cafebabe", 2)
+        auq_ledger.record(
+            key,
+            state="accepted",
+            user_id=42,
+            window_id=window_id,
+            full_fingerprint="ff" * 20,
+            option_number=2,
+            option_label="alpha",
+        )
+        auq_ledger.record(key, state="dispatched")
+        return key
+
+    @pytest.mark.asyncio
+    async def test_positive_proof_releases_resolved_windows_ledger_rows(
+        self, monitor, tmp_path, monkeypatch
+    ):
+        """RED (Wave 2 / Hermes P2-1): positive proof + unchanged side file
+        must — alongside the unlink — RELEASE the resolved window's ledger
+        rows, so a same-day byte-identical AUQ in the same route is
+        dispatchable again. Window-scoped: another window's rows stay put."""
+        from cctelegram.handlers import auq_ledger, auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "88888888-8888-4888-8888-888888888888"
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_done"), _tool_result_entry("auq_done")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_done")
+        key = self._seed_ledger_row(tmp_path, "@7")
+        other_key = auq_ledger.make_ledger_key("deadbeef", "cafebabe", 3)
+        auq_ledger.record(
+            other_key,
+            state="dispatched",
+            user_id=42,
+            window_id="@9",
+            full_fingerprint="ee" * 20,
+            option_number=3,
+            option_label="other",
+        )
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert not side.exists()
+            assert auq_ledger.lookup(key) is None, (
+                "positive proof of resolution must release the window's "
+                "ledger rows (the crash-window seam)"
+            )
+            sibling = auq_ledger.lookup(other_key)
+            assert sibling is not None and sibling.state == "dispatched", (
+                "release is window-scoped — another window's rows stay"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+            auq_ledger.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_toctou_swap_releases_nothing(self, monitor, tmp_path, monkeypatch):
+        """RED (Wave 2): the TOCTOU-swap case (side file replaced by a fresh
+        live AUQ during the proof scan) must release NOTHING — the proof is
+        stale and the window may have a live card whose rows are load-bearing."""
+        from cctelegram.handlers import auq_ledger, auq_source
+        from cctelegram.session import WindowState, session_manager
+
+        monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
+        auq_source.reset_for_tests()
+
+        sid = "99999999-9999-4999-8999-999999999999"
+        jsonl = tmp_path / "session.jsonl"
+        _write_jsonl(
+            jsonl,
+            [_auq_tool_use_entry("auq_old"), _tool_result_entry("auq_old")],
+        )
+
+        async def fake_scan_projects():
+            return [SessionInfo(session_id=sid, file_path=jsonl)]
+
+        monkeypatch.setattr(monitor, "scan_projects", fake_scan_projects)
+
+        side = self._write_side_file(tmp_path, sid, "auq_old")
+        key = self._seed_ledger_row(tmp_path, "@7")
+
+        real_proof_scan = monitor._auq_tool_result_present
+
+        async def swapping_proof_scan(path, tuid):
+            result = await real_proof_scan(path, tuid)
+            self._write_side_file(tmp_path, sid, "auq_new_live")
+            return result
+
+        monkeypatch.setattr(monitor, "_auq_tool_result_present", swapping_proof_scan)
+
+        session_manager.window_states["@7"] = WindowState(cwd="/r", session_id=sid)
+        try:
+            await monitor._hydrate_ask_tool_input_cache({"@7": sid})
+            assert side.exists()
+            row = auq_ledger.lookup(key)
+            assert row is not None and row.state == "dispatched", (
+                "a stale proof (side file swapped mid-scan) must not release "
+                "the window's ledger rows"
+            )
+        finally:
+            session_manager.window_states.pop("@7", None)
+            auq_source.reset_for_tests()
+            auq_ledger.reset_for_tests()
 
 
 class TestLoadCurrentSessionMapLegacyKeyFilter:

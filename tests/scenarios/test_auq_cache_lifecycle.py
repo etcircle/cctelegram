@@ -225,3 +225,63 @@ async def test_auq_tool_result_forgets_before_card_clear(
         "forget_ask_tool_input must run before the awaited clear_interactive_msg"
     )
     assert wid in forgotten
+
+
+@pytest.mark.asyncio
+async def test_auq_tool_result_releases_window_ledger_rows(
+    scenario: ScenarioHarness,
+) -> None:
+    """Wave 2 fix 3b (P1-1 placement) — the explicit AUQ ``tool_result``
+    branch in ``bot.handle_new_message`` is the positive-resolution seam
+    that releases the window's action-ledger rows, so a same-day
+    byte-identical AUQ (same content-derived ``(route_hash, fp8, opt)``
+    key) is dispatchable again instead of permanently answering
+    "Action already received". Sibling windows' rows must survive
+    (window-scoped release; double-`--resume` siblings keep their cards).
+    """
+    from cctelegram.handlers import auq_ledger
+
+    wid = scenario.add_window(window_name="repo", cwd="/repo")
+    scenario.bind_thread(
+        thread_id=42,
+        window_id=wid,
+        display_name="repo",
+        cwd="/repo",
+        session_id="sess-1",
+    )
+
+    def seed(key: str, window_id: str) -> None:
+        auq_ledger.record(
+            key,
+            state="accepted",
+            user_id=scenario.user_id,
+            window_id=window_id,
+            full_fingerprint="ff" * 20,
+            option_number=2,
+            option_label="alpha",
+        )
+        auq_ledger.record(key, state="dispatched")
+
+    seed("rh:fp:2", wid)
+    seed("rh-sibling:fp:2", "@sibling")
+
+    await bot_module.handle_new_message(
+        NewMessage(
+            session_id="sess-1",
+            text="**AskUserQuestion**(Q?) Answered.",
+            content_type="tool_result",
+            tool_use_id="t-auq-1",
+            tool_name="AskUserQuestion",
+            role="assistant",
+        ),
+        scenario.bot,
+    )
+
+    assert auq_ledger.lookup("rh:fp:2") is None, (
+        "the AUQ tool_result (positive resolution proof) must release the "
+        "window's ledger rows"
+    )
+    sibling = auq_ledger.lookup("rh-sibling:fp:2")
+    assert sibling is not None and sibling.state == "dispatched", (
+        "release is window-scoped — another window's unresolved rows survive"
+    )

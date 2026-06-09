@@ -61,6 +61,7 @@ from .callback_dispatcher.screenshot import (
 from .handlers.directory_browser import (
     clear_browse_state,
 )
+from .handlers.auq_ledger import release_window as auq_ledger_release_window
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
 from .handlers.inbound_aggregator import (
@@ -863,6 +864,26 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             and msg.content_type == "tool_result"
         ):
             forget_ask_tool_input(wid)
+            # Wave 2 fix 3b (P1-1 placement): tombstone this window's
+            # action-ledger rows ONLY here — the AUQ ``tool_result`` is the
+            # positive resolution proof. The ledger key is content-derived
+            # (no per-instance entropy), so a same-day byte-identical AUQ
+            # reconstructs the same (route_hash, fp8, opt) triplet — without
+            # the `released` tombstone a stale `dispatched` row would answer
+            # "Action already received" forever. Deliberately NOT inside
+            # ``forget_ask_tool_input`` (a generic teardown helper also fired
+            # from `/clear` / session replacement / the generic surface clear
+            # below — none of which prove resolution; releasing there would
+            # remove the durable single-use brake on a dispatched-but-
+            # UNRESOLVED instance). ExitPlanMode needs no release: ledger
+            # rows are minted only by AUQ ``aqp:`` picks (pick buttons are
+            # built only for ``content.name == "AskUserQuestion"``). The
+            # crash window (bot down between the tool_result and this seam)
+            # is covered by the startup reconciler's tool_result-proven
+            # release in ``session_monitor``. WINDOW-scoped: a
+            # double-`--resume` sibling window's unresolved card keeps its
+            # rows.
+            auq_ledger_release_window(wid)
 
         # Any non-interactive message means the interaction is complete —
         # delete the UI card. ``has_interactive_surface`` is the bool
