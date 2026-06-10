@@ -6,6 +6,7 @@ from cctelegram.terminal_parser import (
     extract_bash_output,
     extract_context_pct,
     extract_interactive_content,
+    has_pane_chrome,
     is_interactive_ui,
     is_status_active,
     parse_status_line,
@@ -126,6 +127,40 @@ class TestIsStatusActive:
         """Tolerate hypothetical capitalization changes in the marker."""
         pane = "✻ Working\n──────\n  Esc To Interrupt\n"
         assert is_status_active(pane) is True
+
+
+# ── has_pane_chrome ──────────────────────────────────────────────────────
+
+
+class TestHasPaneChrome:
+    """has_pane_chrome is the positive "this is a rendered Claude Code pane"
+    anchor — the chrome separator (``─`` × ≥20 in the last 10 lines), the
+    same anchor parse_status_line/strip_pane_chrome trust. Used by
+    status_polling's idle-clear-only commit as the positive half of
+    "confirmed idle"."""
+
+    def test_rendered_idle_pane_has_chrome(self, chrome: str):
+        pane = f"$ echo done\ndone\n{chrome}"
+        assert has_pane_chrome(pane) is True
+
+    def test_empty_pane_has_no_chrome(self):
+        assert has_pane_chrome("") is False
+
+    def test_malformed_nonempty_pane_has_no_chrome(self):
+        """A truncated/mid-redraw frame with no separator must NOT count as
+        a rendered Claude pane (the hermes round-2 idle-clear class)."""
+        assert has_pane_chrome("some partial garbage\noutput with no chrome\n") is False
+
+    def test_short_dash_run_is_not_chrome(self):
+        """The separator anchor requires ≥20 ``─`` chars — a short dash run
+        in regular output is not chrome."""
+        assert has_pane_chrome("output\n──────\nmore\n") is False
+
+    def test_separator_outside_last_10_lines_not_found(self):
+        """The anchor only scans the last 10 lines (bottom chrome), matching
+        _find_chrome_separator."""
+        pane = "─" * 30 + "\n" + "\n".join(f"line {i}" for i in range(12)) + "\n"
+        assert has_pane_chrome(pane) is False
 
 
 # ── extract_interactive_content ──────────────────────────────────────────

@@ -1864,6 +1864,22 @@ def _find_chrome_separator(lines: list[str]) -> int | None:
     return None
 
 
+def has_pane_chrome(pane_text: str) -> bool:
+    """Return True iff the frame contains Claude Code's bottom-chrome anchor.
+
+    The anchor is the chrome separator — a full line of ``─`` (≥20 chars) in
+    the last 10 lines — the SAME structural anchor ``parse_status_line`` and
+    ``strip_pane_chrome`` already trust to locate the bottom chrome. Its
+    presence is positive evidence the capture is a fully-rendered live
+    Claude Code pane (not an empty/truncated/mid-redraw frame). Used by
+    ``status_polling._process_idle_clear_only`` as the positive half of its
+    "confirmed idle" predicate (chrome present AND not ``is_status_active``).
+    """
+    if not pane_text:
+        return False
+    return _find_chrome_separator(pane_text.split("\n")) is not None
+
+
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 

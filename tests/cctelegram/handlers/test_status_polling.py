@@ -1004,7 +1004,9 @@ class TestRouteRuntimeIdleClearDebounce:
     @pytest.mark.asyncio
     async def test_process_idle_clear_only_never_arms(self, mock_bot: AsyncMock):
         """The watchdog-skipped cleanup path commits a due deadline but never
-        arms one (no pane confirmation)."""
+        arms one (no pane confirmation). Post-fix-5 the commit additionally
+        requires a confirmed-idle RE-CAPTURE, so the tmux seam is patched to
+        return an idle pane."""
         from cctelegram import route_runtime
         from cctelegram.handlers import status_polling
 
@@ -1013,6 +1015,7 @@ class TestRouteRuntimeIdleClearDebounce:
         fake_now = [1000.0]
 
         with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
             patch.object(
                 status_polling, "enqueue_status_update", new_callable=AsyncMock
             ) as mock_enqueue,
@@ -1020,6 +1023,7 @@ class TestRouteRuntimeIdleClearDebounce:
                 status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
             ),
         ):
+            mock_tmux.capture_pane = AsyncMock(return_value=_IDLE_PANE)
             # No deadline armed → cleanup-only path is a no-op.
             await status_polling._process_idle_clear_only(
                 mock_bot, 1, window_id, 42, skip_status=False
@@ -1037,6 +1041,217 @@ class TestRouteRuntimeIdleClearDebounce:
             assert mock_enqueue.await_count == 1
             assert mock_enqueue.await_args[0][3] is None
             assert route_runtime.snapshot(route).run_state is RunState.IDLE_CLEARED
+
+    @pytest.mark.asyncio
+    async def test_idle_clear_only_busy_recapture_does_not_commit_and_rearms(
+        self, mock_bot: AsyncMock
+    ):
+        """Fix 5 RED gate: WATCHDOG_INTERVAL (10s) > IDLE_CLEAR_DELAY_SECONDS
+        (4s) means the cleanup-only path's commit was previously made off a
+        SINGLE armed frame with no second pane observation — one mid-redraw
+        misparse on a RUNNING_TOOL route would wipe ``open_tools`` and drop
+        the Task's eventual tool_result as an unknown id. The fix re-captures
+        the pane when the deadline is due and commits ONLY on a second
+        confirmed-idle frame; a BUSY re-capture must NOT commit — it re-arms
+        the debounce instead, preserving the run-state and open_tools.
+
+        Pre-fix this is RED: ``_process_idle_clear_only`` never captures, so
+        the due deadline commits unconditionally (enqueue fires, RUNNING_TOOL
+        is forced to IDLE_CLEARED)."""
+        from cctelegram import route_runtime, transcript_event_adapter
+        from cctelegram.handlers import status_polling
+        from cctelegram.session_monitor import TranscriptEvent
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        fake_now = [1000.0]
+
+        # Put the route into RUNNING_TOOL with an open tool — the user-visible
+        # stake: a single-frame misparse commit would wipe this.
+        await transcript_event_adapter.dispatch_transcript_event(
+            TranscriptEvent(
+                session_id="sess-1",
+                role="assistant",
+                block_type="tool_use",
+                tool_use_id="task-1",
+                tool_name="Task",
+                stop_reason="tool_use",
+                timestamp=None,
+                text="",
+                image_data=None,
+            ),
+            [route],
+        )
+        assert route_runtime.snapshot(route).run_state is RunState.RUNNING_TOOL
+        assert route_runtime.snapshot(route).open_tools
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            # A (misparsed) confirmed-idle frame armed the deadline...
+            route_runtime.arm_pane_idle_clear(route, now=1000.0)
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 0.1
+
+            # ...but the due-tick re-capture shows Claude actively running.
+            mock_tmux.capture_pane = AsyncMock(return_value=_BUSY_PANE)
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+
+            # NO commit: card untouched, run-state + open_tools preserved.
+            assert mock_enqueue.await_count == 0
+            snap = route_runtime.snapshot(route)
+            assert snap.run_state is RunState.RUNNING_TOOL
+            assert snap.open_tools
+            # Deadline RE-ARMED from this tick (not left due, not cancelled).
+            assert (
+                snap.pane_idle_clear_at
+                == fake_now[0] + status_polling.IDLE_CLEAR_DELAY_SECONDS
+            )
+
+    @pytest.mark.asyncio
+    async def test_idle_clear_only_unparseable_recapture_does_not_commit(
+        self, mock_bot: AsyncMock
+    ):
+        """Fix 5: an EMPTY/failed re-capture cannot confirm idle — the due
+        deadline must not commit; it re-arms for the next due tick."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        fake_now = [1000.0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            route_runtime.arm_pane_idle_clear(route, now=1000.0)
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 0.1
+            mock_tmux.capture_pane = AsyncMock(return_value="")
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+            assert mock_enqueue.await_count == 0
+            assert (
+                route_runtime.snapshot(route).pane_idle_clear_at
+                == fake_now[0] + status_polling.IDLE_CLEAR_DELAY_SECONDS
+            )
+
+    @pytest.mark.asyncio
+    async def test_idle_clear_only_malformed_nonempty_recapture_does_not_commit(
+        self, mock_bot: AsyncMock
+    ):
+        """Fix 5 (hermes round-2 RED gate): a NON-EMPTY malformed/truncated/
+        mid-redraw re-capture is NOT positive idle evidence. "Confirmed idle"
+        requires the frame to look like a live Claude Code pane at rest —
+        the chrome separator anchor present (``has_pane_chrome``, the same
+        ``─``-line anchor ``parse_status_line``/``strip_pane_chrome`` trust)
+        AND no active-run marker. A garbage frame with no parseable status
+        previously slipped the absence-of-active-status predicate and
+        committed, wiping transcript-set ``open_tools`` on a RUNNING_TOOL
+        route. Post-fix: NO commit, run-state + open_tools preserved, the
+        deadline re-arms for the next due tick."""
+        from cctelegram import route_runtime, transcript_event_adapter
+        from cctelegram.handlers import status_polling
+        from cctelegram.session_monitor import TranscriptEvent
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        fake_now = [1000.0]
+
+        # RUNNING_TOOL with an open Task — the stake a misread commit wipes.
+        await transcript_event_adapter.dispatch_transcript_event(
+            TranscriptEvent(
+                session_id="sess-1",
+                role="assistant",
+                block_type="tool_use",
+                tool_use_id="task-1",
+                tool_name="Task",
+                stop_reason="tool_use",
+                timestamp=None,
+                text="",
+                image_data=None,
+            ),
+            [route],
+        )
+        assert route_runtime.snapshot(route).run_state is RunState.RUNNING_TOOL
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            route_runtime.arm_pane_idle_clear(route, now=1000.0)
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 0.1
+            # Non-empty, but no chrome separator: a truncated/mid-redraw frame.
+            mock_tmux.capture_pane = AsyncMock(
+                return_value="some partial garbage\noutput with no chrome\n"
+            )
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+            assert mock_enqueue.await_count == 0
+            snap = route_runtime.snapshot(route)
+            assert snap.run_state is RunState.RUNNING_TOOL
+            assert snap.open_tools
+            assert (
+                snap.pane_idle_clear_at
+                == fake_now[0] + status_polling.IDLE_CLEAR_DELAY_SECONDS
+            )
+
+    @pytest.mark.asyncio
+    async def test_idle_clear_only_idle_recapture_commits(self, mock_bot: AsyncMock):
+        """Fix 5 GREEN side: a due deadline whose re-capture ALSO parses
+        confirmed-idle commits exactly once (the 4s clear UX is preserved —
+        re-capture-at-commit, not two-observation arming)."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        fake_now = [1000.0]
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            route_runtime.arm_pane_idle_clear(route, now=1000.0)
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 0.1
+            mock_tmux.capture_pane = AsyncMock(return_value=_IDLE_PANE)
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+            assert mock_enqueue.await_count == 1
+            assert mock_enqueue.await_args[0][3] is None
+            assert route_runtime.snapshot(route).run_state is RunState.IDLE_CLEARED
+
+            # Latched: a later due-shaped tick is a no-op (sentinel).
+            fake_now[0] += status_polling.IDLE_CLEAR_DELAY_SECONDS + 1.0
+            await status_polling._process_idle_clear_only(
+                mock_bot, 1, window_id, 42, skip_status=False
+            )
+            assert mock_enqueue.await_count == 1
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -2251,3 +2466,345 @@ class TestPollerSourceDriftRemint:
             mock_refresh.assert_awaited_once()
         finally:
             pick_token.reset_for_tests()
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestStaleBindingPollerCacheTeardown:
+    """Fix 14 RED gate: ``_poll_one_binding`` returns on the stale-binding
+    branch (``not w``) BEFORE ever reaching ``update_status_message``'s
+    window-gone teardown, so the poller-local route-keyed caches
+    (``_last_pane_capture`` / ``_last_published_ui_hash`` / ``_absent_streak``
+    / ``_prev_run_state``) survived teardown. A rebound topic reusing the same
+    route key then inherited stale entries — defeating the first-picker
+    content-drain ordering barrier (``route not in _last_published_ui_hash``)
+    and the seed-without-edit semantics of ``_prev_run_state``.
+
+    Pre-fix this is RED: all four dicts retain their entries after the
+    stale-binding sweep."""
+
+    @pytest.mark.asyncio
+    async def test_stale_binding_pops_all_four_poller_caches(self, mock_bot: AsyncMock):
+        from cctelegram.handlers import status_polling
+
+        user_id = 1
+        thread_id = 42
+        window_id = "@5"
+        route = (user_id, thread_id, window_id)
+
+        # Seed every poller-local route-keyed cache as a live binding would.
+        status_polling._last_pane_capture[route] = 1234.5
+        status_polling._last_published_ui_hash[route] = "deadbeef"
+        status_polling._absent_streak[route] = 2
+        status_polling._prev_run_state[route] = RunState.RUNNING
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "clear_topic_state", new_callable=AsyncMock
+            ) as mock_clear_topic,
+            patch.object(
+                status_polling.session_manager, "unbind_thread"
+            ) as mock_unbind,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=None)
+            await status_polling._poll_one_binding(
+                mock_bot, user_id, thread_id, window_id
+            )
+
+        mock_unbind.assert_called_once_with(user_id, thread_id)
+        mock_clear_topic.assert_awaited_once()
+        # All four poller-local caches must start clean for a rebound route.
+        assert route not in status_polling._last_pane_capture
+        assert route not in status_polling._last_published_ui_hash
+        assert route not in status_polling._absent_streak
+        assert route not in status_polling._prev_run_state
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestSiteBSourceDriftRemint:
+    """Fix 15 RED gate: the item-1 source-drift re-mint covered only the
+    same-hash idle branch; preserve-site (b) (``is_picker_anchor_visible`` on a
+    scrolled/compressed Submit screen, ``ui_content`` is None) still refreshed
+    deadlines while PRESERVING the minted source tags. A card preserved there
+    past the side file's read-TTL keeps stale ``side_file`` tokens, so the
+    user's first tap is swallowed as ``source_drift``. The fix applies the SAME
+    drift comparison (re-resolve + ``peek_route_source`` by route vs the live
+    source) at site (b), via one shared helper, with the same loop-safety
+    invariant (exactly ONE re-mint; the next tick sees pane==pane → converges).
+    """
+
+    @staticmethod
+    def _scrolled_submit_pane() -> str:
+        """The site-(b) shape: the tab header has scrolled off, so
+        ``extract_interactive_content`` is None while the Submit tail anchors
+        are visible AND the pane still parses to a review-screen form."""
+        from pathlib import Path
+
+        pane = (
+            Path(__file__).parents[1] / "fixtures" / "auq_multiq_submit_pane.txt"
+        ).read_text()
+        lines = pane.splitlines(keepends=True)
+        return "".join(lines[2:])  # drop the chrome + tab-header lines
+
+    def _setup_route(self, window_id: str = "@5"):
+        from cctelegram.handlers.interactive_ui import (
+            _interactive_mode,
+            _interactive_msgs,
+        )
+
+        ikey = (1, 42)
+        _interactive_mode[ikey] = window_id
+        _interactive_msgs[ikey] = 777  # site (b) requires has_interactive_surface
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        return mock_window
+
+    @pytest.mark.asyncio
+    async def test_site_b_pane_shape_assumptions(self):
+        """Pin the fixture shape this class depends on."""
+        from cctelegram.terminal_parser import (
+            extract_interactive_content,
+            is_picker_anchor_visible,
+            resolve_ask_form,
+        )
+
+        pane = self._scrolled_submit_pane()
+        assert extract_interactive_content(pane) is None
+        assert is_picker_anchor_visible(pane)
+        assert resolve_ask_form(None, pane) is not None
+
+    @pytest.mark.asyncio
+    async def test_site_b_source_drift_remints_card(self, mock_bot: AsyncMock):
+        from cctelegram.handlers import pick_token, status_polling
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            pane = self._scrolled_submit_pane()
+            window_id = "@5"
+            mock_window = self._setup_route(window_id)
+
+            # The displayed card's row was minted from the (now read-TTL-aged /
+            # absent) side file — drifted vs the live pane source. The
+            # fingerprint deliberately differs from the pane form's (the
+            # side-file form carries the question title); the route-based
+            # lookup must still find it.
+            side_fp = "0123456789abcdef"
+            pane_form = resolve_ask_form(None, pane)
+            assert pane_form is not None
+            assert side_fp != pane_form.fingerprint()
+            _pick_token_cache[(1, 42, window_id, side_fp)] = _CacheRow(
+                tokens=["redtok"],
+                row_generation=1,
+                source_kind="side_file",
+                source_fingerprint="sf-fp",
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            # Site (b) must detect the drift and re-mint, NOT refresh stale
+            # side_file tokens.
+            mock_handle_ui.assert_awaited()
+            mock_refresh.assert_not_awaited()
+        finally:
+            pick_token.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_site_b_no_drift_refreshes_deadlines_no_rerender(
+        self, mock_bot: AsyncMock
+    ):
+        """Parity pin: no drift at site (b) → existing behavior byte-for-byte —
+        deadlines refreshed, no re-render, card preserved."""
+        from cctelegram.handlers import auq_source, pick_token, status_polling
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            pane = self._scrolled_submit_pane()
+            window_id = "@5"
+            mock_window = self._setup_route(window_id)
+
+            # Row minted from the REAL live source for this pane → no drift.
+            live = auq_source.resolve_auq_source(window_id, None, pane)
+            form = resolve_ask_form(live.payload, pane)
+            assert form is not None
+            _pick_token_cache[(1, 42, window_id, form.fingerprint())] = _CacheRow(
+                tokens=["livetok"],
+                row_generation=1,
+                source_kind=live.kind,
+                source_fingerprint=live.source_fingerprint,
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+                patch.object(
+                    status_polling, "clear_interactive_msg", new_callable=AsyncMock
+                ) as mock_clear,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            mock_handle_ui.assert_not_awaited()
+            mock_refresh.assert_awaited_once()
+            mock_clear.assert_not_awaited()
+        finally:
+            pick_token.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_site_b_drift_remint_terminates_next_tick(self, mock_bot: AsyncMock):
+        """Loop-safety at site (b): after the drift re-mint, the next tick sees
+        live pane == minted pane → no further re-render (exactly ONE re-mint)."""
+        from cctelegram.handlers import auq_source, pick_token, status_polling
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            pane = self._scrolled_submit_pane()
+            window_id = "@5"
+            mock_window = self._setup_route(window_id)
+
+            # Tick-1 seed: drifted side_file row.
+            _pick_token_cache[(1, 42, window_id, "0123456789abcdef")] = _CacheRow(
+                tokens=["redtok"],
+                row_generation=1,
+                source_kind="side_file",
+                source_fingerprint="sf-fp",
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ),
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                # Tick 1: drift detected → re-mint.
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+                assert mock_handle_ui.await_count == 1
+
+                # Simulate the real mint_row outcome: one pane-sourced row at
+                # the live pane fingerprint (hygiene dropped the side_file row).
+                _pick_token_cache.clear()
+                live = auq_source.resolve_auq_source(window_id, None, pane)
+                pane_form = resolve_ask_form(live.payload, pane)
+                assert pane_form is not None
+                _pick_token_cache[(1, 42, window_id, pane_form.fingerprint())] = (
+                    _CacheRow(
+                        tokens=["panetok"],
+                        row_generation=2,
+                        source_kind=live.kind,
+                        source_fingerprint=live.source_fingerprint,
+                        consumed_generation=None,
+                    )
+                )
+
+                # Tick 2: live pane == minted pane → no drift → NO re-mint.
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+                assert mock_handle_ui.await_count == 1
+        finally:
+            pick_token.reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_site_b_drift_tick_still_promotes_waiting(self, mock_bot: AsyncMock):
+        """Hermes round-2 P3: SET (b) runs BEFORE the drift re-mint early
+        return. Site (b) is pane-confirmed (``is_picker_anchor_visible``)
+        regardless of token-source drift, so a drift tick on an active
+        RUNNING route must still promote it to WAITING_ON_USER — not leave
+        the digest/typing on RUNNING for an extra poll cycle."""
+        from cctelegram import route_runtime
+        from cctelegram.handlers import pick_token, status_polling
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.route_runtime import RunState
+
+        pick_token.reset_for_tests()
+        route_runtime.reset_for_tests()
+        try:
+            pane = self._scrolled_submit_pane()
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = self._setup_route(window_id)
+
+            # Active RUNNING route with empty open_tools — the promotable state.
+            await route_runtime.mark_inbound_sent(route)
+            assert route_runtime.snapshot(route).run_state is RunState.RUNNING
+
+            # Drifted side_file row → the drift re-mint fires this tick.
+            _pick_token_cache[(1, 42, window_id, "0123456789abcdef")] = _CacheRow(
+                tokens=["redtok"],
+                row_generation=1,
+                source_kind="side_file",
+                source_fingerprint="sf-fp",
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ),
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            # Drift re-mint fired AND the promotion landed on the same tick.
+            mock_handle_ui.assert_awaited()
+            snap = route_runtime.snapshot(route)
+            assert snap.interactive_pending is True
+            assert snap.run_state is RunState.WAITING_ON_USER
+        finally:
+            pick_token.reset_for_tests()
+            route_runtime.reset_for_tests()

@@ -41,6 +41,7 @@ from ..route_runtime import IDLE_CLEAR_DELAY_SECONDS as IDLE_CLEAR_DELAY_SECONDS
 from ..session import session_manager
 from ..terminal_parser import (
     extract_interactive_content,
+    has_pane_chrome,
     is_picker_anchor_visible,
     is_status_active,
     parse_status_line,
@@ -199,6 +200,51 @@ def _on_interactive_clear(
 
 
 register_clear_callback(_on_interactive_clear)
+
+
+async def _remint_on_source_drift(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    pane_text: str,
+    *,
+    ui_hash: str | None = None,
+) -> bool:
+    """Item-1 source-drift re-mint, shared by the same-hash idle branch and
+    preserve-site (b) (review finding 15).
+
+    A live card's TOKENS must track its OBSERVED SOURCE: when the PreToolUse
+    side file ages past the read-TTL under a still-displayed card,
+    ``resolve_auq_source`` flips ``side_file`` → ``pane`` while the card's
+    tokens were minted from ``side_file``, so the user's first tap
+    ``source_drift``s (swallowed + a misleading "Form changed, refreshing.").
+    Re-resolve the live source, parse the live form (``resolve_ask_form``
+    gates out non-AUQ panes — Settings / EPM — so we never spuriously
+    re-mint there), look the displayed card up by ROUTE via the pure,
+    tombstone-aware ``pick_token.peek_route_source`` (fingerprint-agnostic —
+    the side-file-form and pane-form fingerprints differ), and on a mismatch
+    re-render via ``handle_interactive_ui`` (re-mint to the CURRENT source).
+
+    Returns True iff the drift re-mint fired — the caller returns without
+    refreshing deadlines. Loop-safe (exactly ONE re-mint): the re-mint
+    fresh-mints the live source and ``mint_row``'s hygiene drops the old
+    row, so the next tick sees live == minted → no further re-render.
+
+    ``ui_hash`` (same-hash branch only): stored in ``_last_published_ui_hash``
+    before the await for parity with the new-UI branch so a concurrent tick
+    doesn't double-publish. Site (b) has no ``ui_content`` and passes None.
+    """
+    live = auq_source.resolve_auq_source(window_id, None, pane_text)
+    if resolve_ask_form(live.payload, pane_text) is None:
+        return False
+    minted = pick_token.peek_route_source(user_id, thread_id, window_id)
+    if minted is None or (live.kind, live.source_fingerprint) == minted:
+        return False
+    if ui_hash is not None:
+        _last_published_ui_hash[(user_id, thread_id or 0, window_id)] = ui_hash
+    await handle_interactive_ui(bot, user_id, window_id, thread_id, from_poller=True)
+    return True
 
 
 async def _drain_content_queue_before_first_picker_publish(
@@ -392,22 +438,12 @@ async def update_status_message(
                 # the live card to the current source so the tokens track it.
                 # mint_row's source-aware reuse prevents a re-render loop (after
                 # the re-mint to pane, the next tick sees pane==pane → no drift).
-                live = auq_source.resolve_auq_source(window_id, None, pane_text)
-                # Only an AUQ pane can carry a pick-token card; bail on non-AUQ
-                # panes (Settings / EPM) — resolve_ask_form returns None there,
-                # so we never spuriously re-mint on them.
-                if resolve_ask_form(live.payload, pane_text) is not None:
-                    minted = pick_token.peek_route_source(user_id, thread_id, window_id)
-                    if minted is not None and (
-                        (live.kind, live.source_fingerprint) != minted
-                    ):
-                        # Set the hash for parity with the new-UI branch so a
-                        # concurrent tick doesn't double-publish.
-                        _last_published_ui_hash[route] = ui_hash
-                        await handle_interactive_ui(
-                            bot, user_id, window_id, thread_id, from_poller=True
-                        )
-                        return
+                # Shared with preserve-site (b) via _remint_on_source_drift
+                # (review finding 15) — same comparison, same loop-safety.
+                if await _remint_on_source_drift(
+                    bot, user_id, thread_id, window_id, pane_text, ui_hash=ui_hash
+                ):
+                    return
                 await pick_token.refresh_route_deadlines(
                     user_id,
                     thread_id,
@@ -464,6 +500,29 @@ async def update_status_message(
         # anchors present → reset the streak, keep the card.
         if is_picker_anchor_visible(pane_text):
             _absent_streak.pop(route, None)
+            # SET (b): scrolled/compressed Submit screen — picker tail anchors
+            # visible. Pane-confirmed → promote + repaint. BEFORE the drift
+            # re-mint early-return below (hermes round 2), mirroring SET (a):
+            # the promotion is pane-confirmed by ``is_picker_anchor_visible``
+            # regardless of token-source drift, and the re-mint path
+            # (``handle_interactive_ui``) never touches the bit — without
+            # this order a drift tick would leave the route RUNNING (wrong
+            # digest + typing) for one extra poll cycle.
+            await route_runtime.mark_interactive_pending(route)
+            await _maybe_repaint_digest_on_transition(
+                bot, user_id, thread_id, window_id
+            )
+            # Item 1 at site (b) (review finding 15): this preserve branch also
+            # keeps a card whose side file may have aged past the read-TTL —
+            # refreshing its deadlines would PRESERVE stale side_file source
+            # tags and the first tap would be swallowed as source_drift. Run
+            # the SAME drift comparison as the same-hash branch BEFORE the
+            # deadline refresh; on a re-mint, return (the next tick converges:
+            # live == minted → no further re-render, then SET (b) re-asserts).
+            if await _remint_on_source_drift(
+                bot, user_id, thread_id, window_id, pane_text
+            ):
+                return
             # D3-β: live (scrolled/compressed) Submit card — keep its tokens
             # alive so a tap after a long idle on this screen still dispatches.
             await pick_token.refresh_route_deadlines(
@@ -471,12 +530,6 @@ async def update_status_message(
                 thread_id,
                 window_id,
                 min_remaining_s=_DEADLINE_REFRESH_MARGIN_S,
-            )
-            # SET (b): scrolled/compressed Submit screen — picker tail anchors
-            # visible. Pane-confirmed → promote + repaint.
-            await route_runtime.mark_interactive_pending(route)
-            await _maybe_repaint_digest_on_transition(
-                bot, user_id, thread_id, window_id
             )
             return
         # The visible pane lacks picker anchors — but the pane is only a
@@ -703,9 +756,31 @@ async def _process_idle_clear_only(
     idle deadline — but the route_runtime-owned debounce still needs to
     advance so a previously-shown "🟡 Busy" status gets cleared on schedule.
 
-    Semantics: NEVER arm here — without a pane scrape we can't confirm idle.
-    Only commit a clear that a prior confirmed-idle tick already armed and
-    that is now due. Everything else is handled the next time we capture.
+    Semantics: NEVER arm a FRESH deadline here — without a confirmed-idle
+    pane scrape we can't start a debounce. Only act on a deadline a prior
+    confirmed-idle tick already armed and that is now due — and even then
+    (review finding 5) commit ONLY after a SECOND confirmed-idle pane
+    observation: ``WATCHDOG_INTERVAL`` (10s) exceeds
+    ``IDLE_CLEAR_DELAY_SECONDS`` (4s), so the deadline armed by ONE capture
+    would otherwise commit with no further pane evidence, and a single
+    mid-redraw misparse on a RUNNING_TOOL route would wipe transcript-set
+    ``open_tools`` (the Task's eventual tool_result then arrives as an
+    unknown id and is dropped). When the deadline is due we RE-CAPTURE the
+    pane and commit ONLY on POSITIVE idle evidence: the frame must look
+    like a live Claude Code pane at rest — ``has_pane_chrome`` (the chrome
+    separator anchor that ``parse_status_line`` / ``strip_pane_chrome``
+    already trust; absent on an empty/truncated/mid-redraw frame) AND not
+    ``is_status_active`` (no ``esc to interrupt`` run marker). Mere
+    absence-of-active-status is NOT enough (hermes round 2): a non-empty
+    malformed frame has no parseable status either and would commit,
+    wiping transcript-set ``open_tools``. Anything short of positive idle
+    (busy / empty / chrome-less) RE-ARMS via the existing arm path (reset
+    first — ``arm_pane_idle_clear`` is a no-op while a deadline is armed)
+    so the next due tick re-validates against a fresh frame. A permanently
+    chrome-less pane therefore never clears its Busy card via THIS path —
+    the full-path watchdog capture still owns that lifecycle. The
+    confirmed-idle commit keeps the 4s clear UX (re-capture-at-commit,
+    not two-observation arming).
     """
     if skip_status:
         return
@@ -713,6 +788,23 @@ async def _process_idle_clear_only(
     route = (user_id, thread_id or 0, window_id)
     now = time.monotonic()
     if not route_runtime.pane_idle_clear_due(route, now=now):
+        return
+    # Second-observation gate (finding 5): never commit off the single frame
+    # that armed the deadline. One extra capture per due deadline only.
+    pane_text = await tmux_manager.capture_pane(window_id)
+    # POSITIVE idle evidence required (see docstring): a rendered Claude
+    # pane (chrome separator anchor) with no active-run marker. Fail closed
+    # on anything else — never treat "couldn't parse a status" as idle.
+    second_frame_idle = (
+        pane_text is not None
+        and has_pane_chrome(pane_text)
+        and not is_status_active(pane_text)
+    )
+    if not second_frame_idle:
+        # Busy, empty, or chrome-less (malformed/truncated/mid-redraw)
+        # re-capture — re-arm instead of committing.
+        route_runtime.reset_pane_idle_clear(route)
+        route_runtime.arm_pane_idle_clear(route, now=now)
         return
     if not await route_runtime.commit_pane_idle_clear(route, now=now):
         # commit no-op'd (activity re-armed) — do not clear the card.
@@ -765,6 +857,19 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
         if not w:
             session_manager.unbind_thread(user_id, thread_id)
             await clear_topic_state(user_id, thread_id, bot)
+            # Pop ALL four poller-local route-keyed caches (review finding 14).
+            # This branch returns before update_status_message, so its
+            # window-gone teardown never runs for a stale binding — without
+            # these pops a rebound topic reusing the same route key inherits
+            # stale entries: a leftover ``_last_published_ui_hash`` skips the
+            # first-picker content-drain ordering barrier, a leftover
+            # ``_prev_run_state`` defeats the seed-without-edit semantics, and
+            # ``_last_pane_capture`` delays the rebound's first watchdog scrape.
+            route = (user_id, thread_id or 0, wid)
+            _last_pane_capture.pop(route, None)
+            _last_published_ui_hash.pop(route, None)
+            _absent_streak.pop(route, None)
+            _prev_run_state.pop(route, None)
             logger.info(
                 "Cleaned up stale binding: user=%d thread=%d window_id=%s",
                 user_id,
