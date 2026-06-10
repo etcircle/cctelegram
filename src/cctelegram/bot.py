@@ -804,6 +804,26 @@ async def _build_context_footer(
     return f"_📊 {format_tokens(usage.tokens)} / {format_max(usage.max_tokens)}_"
 
 
+async def mark_subagent_activity_for_parents(parent_session_ids: set[str]) -> None:
+    """Wave A fan-out: sidechain activity → ``route_runtime.mark_subagent_activity``.
+
+    Called once per monitor tick with the parent session_ids whose sidechain
+    files produced new parsed entries (``pop_sidechain_active_parents``).
+    Resolves bound routes exactly like the parent event fan-out
+    (``find_users_for_session``) and marks each route at most once per tick.
+    Pull-only heartbeat — no lifecycle ingestion, no send-layer authority.
+    """
+    marked: set[route_runtime.Route] = set()
+    for sid in parent_session_ids:
+        active = await session_manager.find_users_for_session(sid)
+        for user_id, wid, thread_id in active:
+            route: route_runtime.Route = (user_id, thread_id or 0, wid)
+            if route in marked:
+                continue
+            marked.add(route)
+            await route_runtime.mark_subagent_activity(route)
+
+
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     """Handle a new assistant message — enqueue for sequential processing.
 
@@ -1189,6 +1209,12 @@ async def post_init(application: Application) -> None:
         # a half-card with the wrong action shape.
 
     monitor.set_event_callback(event_callback)
+
+    # Wave A: sidechain activity keep-alive. The monitor reports which parent
+    # sessions had sidechain writes each tick; the fan-out marks their routes
+    # so a long subagent run survives transient confirmed-idle pane frames
+    # (and resurrects a pane-false-cleared route).
+    monitor.set_subagent_activity_callback(mark_subagent_activity_for_parents)
 
     # Replay tool_use/tool_result pairs from each tracked parent JSONL so
     # tools that were open at the moment of bot shutdown (most painfully,

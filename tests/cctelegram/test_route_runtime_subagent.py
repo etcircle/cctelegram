@@ -398,9 +398,7 @@ async def test_bot_fanout_marks_each_route_once_per_tick(monkeypatch):
         # Both parents resolve to the same (user, window, thread) binding.
         return [(1, "@7", 42)]
 
-    monkeypatch.setattr(
-        bot_module.session_manager, "find_users_for_session", fake_find
-    )
+    monkeypatch.setattr(bot_module.session_manager, "find_users_for_session", fake_find)
 
     await bot_module.mark_subagent_activity_for_parents({"parent-a", "parent-b"})
     assert calls == [(1, 42, "@7")]

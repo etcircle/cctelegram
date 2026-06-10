@@ -75,6 +75,9 @@ Useful behavior knobs:
 
 - `CC_TELEGRAM_SHOW_USER_MESSAGES` — echo user messages from tmux; default `true`.
 - `CC_TELEGRAM_SHOW_TOOL_CALLS` — show tool use/result stream; default `true`.
+  Setting it to `false` suppresses **display only**: sub-agent (sidechain)
+  transcripts are still tailed and their activity still feeds the run-state
+  truth (busy indicator / typing), so a long subagent run doesn't read as idle.
 - `CC_TELEGRAM_SHOW_HIDDEN_DIRS` — show dot-directories in picker; default `false`.
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` — max input shown in `**Tool**(...)`; default `40`.
 - `CC_TELEGRAM_AGENT_PROMPT_PREVIEW_CHARS` — subagent dispatch excerpt; default `400`.

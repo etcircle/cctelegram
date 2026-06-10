@@ -5,6 +5,9 @@ Runs an async polling loop that:
   2. Detects session_map changes (new/changed/deleted windows) and cleans up.
   3. Reads new JSONL lines from each session file using byte-offset tracking.
   4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
+  5. Tails sub-agent (sidechain) JSONLs unconditionally — display emission is
+     gated by show_tool_calls, but per-tick parent activity is always reported
+     (pop_sidechain_active_parents → route_runtime keep-alive).
 
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
@@ -263,6 +266,16 @@ class SessionMonitor:
         # stored in the value and resets the entry when it moves). Popped on
         # skip, on offset progress, and at every session-cleanup site.
         self._unparseable_stalls: dict[str, tuple[int, float, int]] = {}
+        # Wave A: parent session_ids whose sidechain files produced new parsed
+        # entries this tick. Populated by ``check_sidechain_updates``
+        # unconditionally (even with show_tool_calls disabled) and drained via
+        # ``pop_sidechain_active_parents`` — the run-state keep-alive signal.
+        self._sidechain_active_parents: set[str] = set()
+        # Per-tick fan-out for sidechain activity (wired from bot.post_init,
+        # like ``_message_callback`` / ``_event_callback``).
+        self._subagent_activity_callback: (
+            Callable[[set[str]], Awaitable[None]] | None
+        ) = None
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -277,6 +290,22 @@ class SessionMonitor:
         self, callback: Callable[[TranscriptEvent], Awaitable[None]]
     ) -> None:
         self._event_callback = callback
+
+    def set_subagent_activity_callback(
+        self, callback: Callable[[set[str]], Awaitable[None]]
+    ) -> None:
+        """Wire the per-tick sidechain-activity fan-out (Wave A).
+
+        Called from ``_monitor_loop`` with the set of parent session_ids
+        whose sidechains produced new parsed entries this tick.
+        """
+        self._subagent_activity_callback = callback
+
+    def pop_sidechain_active_parents(self) -> set[str]:
+        """Drain (consume-once) the parents with sidechain activity this tick."""
+        parents = self._sidechain_active_parents
+        self._sidechain_active_parents = set()
+        return parents
 
     def register_session(
         self, session_id: str, file_path: Path, offset: int = 0
@@ -729,14 +758,16 @@ class SessionMonitor:
         Files first seen on bot startup begin at EOF (skip historical
         runs). Mid-session discovery is best-effort — a sub-agent whose
         first lines land between two poll ticks will lose those lines.
+
+        Tracking, parsing, and activity reporting run UNCONDITIONALLY —
+        a parent whose sidechains produced new parsed entries this tick is
+        recorded for ``pop_sidechain_active_parents`` (the Wave A run-state
+        keep-alive) regardless of display settings. ``config.show_tool_calls``
+        gates only the ``NewMessage`` EMISSION below: when False, no sidechain
+        messages are emitted (complete display suppression at this point — not
+        bot.py-side filtering).
         """
         new_messages: list[NewMessage] = []
-
-        # Without show_tool_calls there's nothing useful to surface for
-        # sub-agents under option (a) + (ii) — bail early to keep this
-        # consistent with how the parent stream is filtered in bot.py.
-        if not config.show_tool_calls:
-            return new_messages
 
         # Build parent_session_id -> parent_jsonl_path lookup from currently
         # tracked parent sessions. Skip any tracking_key that's itself a
@@ -819,6 +850,16 @@ class SessionMonitor:
                     self._pending_tools[tracking_key] = remaining
                 else:
                     self._pending_tools.pop(tracking_key, None)
+
+                # Wave A: new parsed entries = sidechain activity for the
+                # parent's route, regardless of whether anything is displayed.
+                if parsed_entries:
+                    self._sidechain_active_parents.add(parent_session_id)
+
+                if not config.show_tool_calls:
+                    # Display suppressed — activity already recorded above.
+                    self.state.update_session(tracked)
+                    continue
 
                 for entry in parsed_entries:
                     # Each block (text / thinking / tool_use / tool_result)
@@ -1548,6 +1589,16 @@ class SessionMonitor:
                 )
                 if sidechain_messages:
                     new_messages.extend(sidechain_messages)
+
+                # Wave A: fan sidechain activity out to route_runtime (the
+                # keep-alive heartbeat) — pull-only, once per tick. Never let
+                # it break the dispatch loop.
+                sidechain_parents = self.pop_sidechain_active_parents()
+                if sidechain_parents and self._subagent_activity_callback:
+                    try:
+                        await self._subagent_activity_callback(sidechain_parents)
+                    except Exception as e:
+                        logger.error(f"Subagent activity callback error: {e}")
 
                 # Bug 2: drop the post-resolution copy of any prose already
                 # delivered live before the picker (batch/group dedup against

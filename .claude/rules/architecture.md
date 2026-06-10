@@ -34,6 +34,13 @@
 │  - Parse new lines      │    └──────────────┬─────────────────┘
 │  - Track pending tools  │                   │
 │    across poll cycles   │                   │
+│  - Tail sidechains      │                   │
+│    UNCONDITIONALLY;     │                   │
+│    show_tool_calls only │                   │
+│    gates display; per-  │                   │
+│    tick parent activity │                   │
+│    → mark_subagent_     │                   │
+│    activity keep-alive  │                   │
 └──────────┬──────────────┘                   │
            │                                  │
            ▼                                  ▼
@@ -81,6 +88,38 @@ Additional modules:
                                 bit + mark_interactive_pending / mark_interactive_cleared
                                 (PROMOTE an active RUNNING route → WAITING_ON_USER for a
                                 buffered interactive tool_use; see the concurrency contract).
+                                Busy-signal Wave A: records idle_source
+                                ("transcript" = the authoritative end-of-turn branch;
+                                "pane" = a pane clear that reconciled an ACTIVE route —
+                                a pane clear on an already-idle route preserves the
+                                value; lazy IDLE_RECENT→IDLE_CLEARED decay preserves it;
+                                reset to None on leaving idle / mark_session_reset /
+                                teardown) plus a suspended_tools stash: the pane-idle
+                                reconciliation MOVES open_tools (ids + interactive
+                                flags) into the stash instead of dropping them.
+                                Restore paths: mark_subagent_activity resurrection, and
+                                a transcript tool_result for a suspended id (checked
+                                BEFORE the unknown-id branch — restores+closes via the
+                                normal pairing). Drop paths: authoritative end-of-turn,
+                                user lifecycle event, mark_inbound_sent,
+                                mark_session_reset, route teardown. In-memory only
+                                (restart recovery stays parse_pending_tools_from_jsonl
+                                + seed_open_tools). mark_subagent_activity(route) is
+                                the sidechain keep-alive mutator: on RUNNING /
+                                RUNNING_TOOL it refreshes last_event_at + re-arms the
+                                pane-idle debounce (no open_tools mutation); on idle
+                                with idle_source=="pane" it RESURRECTS (restores the
+                                stash → RUNNING_TOOL, or RUNNING on an empty stash;
+                                clears idle deadlines); on transcript-idle / None it
+                                no-ops; it never overrides WAITING_ON_USER (transcript-
+                                or pane-bit-set) and never seeds an unseen route. Card
+                                claim NARROWED: a status clear already enqueued before
+                                resurrection MAY still delete the Busy card (no queue
+                                generation-guard; no send-layer authority) — it
+                                re-publishes on the next active status tick. Accepted
+                                residual: a quiet sidechain (no writes) + blank pane is
+                                uncovered; pane-spinner activity is the complementary
+                                signal.
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —

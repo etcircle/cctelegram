@@ -64,7 +64,17 @@ Concurrency contract:
     lifecycle events: they preserve ``WAITING_ON_USER``, only clearing
     ``RUNNING`` / ``RUNNING_TOOL`` to ``IDLE_CLEARED`` after the debounce
     delay has elapsed, keeping the visible "🟡 Busy" card and the
-    run-state machine in sync.
+    run-state machine in sync. A pane clear that reconciled an ACTIVE
+    route records ``idle_source="pane"`` and MOVES its open tools into a
+    ``suspended_tools`` stash (in-memory only) instead of dropping them;
+    the authoritative transcript end-of-turn records
+    ``idle_source="transcript"`` and drops the stash.
+  - ``mark_subagent_activity`` is the Wave A sidechain keep-alive: it
+    refreshes an active route like transcript activity and RESURRECTS an
+    ``idle_source="pane"`` route (restoring the stash — sidechain
+    activity is positive proof the pane clear was false). It never
+    resurrects a transcript-idle route, never overrides
+    ``WAITING_ON_USER``, and never seeds an unseen route.
   - A pane/lifecycle signal may also **PROMOTE** an *active* ``RUNNING``
     route (empty ``open_tools``) to ``WAITING_ON_USER`` via
     ``mark_interactive_pending`` — for the window where Claude Code buffers
@@ -253,6 +263,23 @@ class _RouteState:
     # JSONL); cleared by ``mark_interactive_cleared``, the branch-scoped
     # transcript reclaim in ``_apply_lifecycle_event``, and ``mark_session_reset``.
     pane_interactive_pending: bool = False
+    # Why the route is currently idle (Wave A). "transcript" = the assistant's
+    # authoritative end-of-turn; "pane" = a pane-idle reconciliation cleared an
+    # ACTIVE route (the only resurrectable flavor — sidechain activity is
+    # positive proof such a clear was false). None = not idle / no provenance
+    # (reset whenever the route leaves idle, on ``mark_session_reset``, and on
+    # teardown). A pane clear observed on an ALREADY-idle route preserves the
+    # existing value — it reconciled nothing, so it carries no authority.
+    idle_source: Literal["transcript", "pane"] | None = None
+    # Tools MOVED out of ``open_tools`` by a pane-idle reconciliation (Wave A).
+    # The pane has lower authority than the transcript, so the clear must not
+    # destroy tool identity: ``mark_subagent_activity`` restores the stash on
+    # resurrection, and a transcript tool_result for a suspended id
+    # restores+closes it through the normal pairing path. Dropped on
+    # authoritative end-of-turn / user lifecycle event / ``mark_inbound_sent``
+    # / ``mark_session_reset`` / route teardown. In-memory only — restart
+    # recovery stays ``parse_pending_tools_from_jsonl`` + ``seed_open_tools``.
+    suspended_tools: dict[str, bool] = field(default_factory=dict)
     seen: bool = False  # have we ever observed this route?
     # Cached frozensets — invalidated on any open_tools mutation.
     # Most snapshots happen with no open tools (idle route), so the
@@ -418,8 +445,11 @@ def _set_run_state(st: _RouteState, new: RunState) -> None:
     if new is RunState.IDLE_RECENT:
         st.idle_clear_at = st.last_event_at + IDLE_CLEAR_DELAY_SECONDS
     elif new in (RunState.RUNNING, RunState.RUNNING_TOOL, RunState.WAITING_ON_USER):
-        # Active run states clear any pending idle deadline.
+        # Active run states clear any pending idle deadline — and the idle
+        # provenance: leaving idle resets ``idle_source`` (the entering
+        # transition records the new one when the route next idles).
         st.idle_clear_at = None
+        st.idle_source = None
     elif new is RunState.IDLE_CLEARED:
         st.idle_clear_at = None
     st.run_state = new
@@ -462,6 +492,12 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
     # role="user" — block_type + tool_use_id are already specific
     # enough.
     if block == "tool_result" and event.tool_use_id:
+        if event.tool_use_id in st.suspended_tools:
+            # A false pane clear stashed this id (Wave A). Restore it so the
+            # normal pairing below closes it — the late parent tool_result is
+            # NOT "unknown" after a pane-idle reconciliation.
+            st.open_tools[event.tool_use_id] = st.suspended_tools.pop(event.tool_use_id)
+            st.invalidate_tool_cache()
         if event.tool_use_id not in st.open_tools:
             # Unknown id (stale / pre-startup). Preserve run_state AND the pane
             # bit — an unknown tool_result must not strand a pane-set WAITING.
@@ -485,7 +521,11 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
     ):
         # End-of-turn reclaims authority from the pane bit (the turn is over).
         st.pane_interactive_pending = False
+        # A transcript-ended turn never resurrects its tools — drop the stash
+        # and record the authoritative idle provenance.
+        st.suspended_tools.clear()
         _set_run_state(st, RunState.IDLE_RECENT)
+        st.idle_source = "transcript"
         return
 
     # Plain assistant text: at least RUNNING. Preserve RUNNING_TOOL /
@@ -510,9 +550,11 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         return
 
     # User non-tool_result: user prompted Claude — RUNNING. A fresh user turn
-    # supersedes any pane-set WAITING (the prompt was answered or replaced).
+    # supersedes any pane-set WAITING (the prompt was answered or replaced)
+    # and any suspended tools (they belong to the superseded turn).
     if role == "user" and block != "tool_result":
         st.pane_interactive_pending = False
+        st.suspended_tools.clear()
         _set_run_state(st, RunState.RUNNING)
         return
 
@@ -609,6 +651,10 @@ async def mark_inbound_sent(route: Route) -> RouteRuntimeSnapshot:
         else:
             st.last_event_at = _now()
             st.seen = True
+        # A new prompt reaches the route BEFORE its transcript user event —
+        # stale suspended tools must not survive that gap (plan v4, hermes
+        # r3 P3-1).
+        st.suspended_tools.clear()
         # Inbound delivery is real activity — re-arm the pane-idle debounce.
         _rearm_pane_idle_in_place(st)
         snap = _freeze(route, st)
@@ -690,6 +736,60 @@ async def mark_interactive_cleared(route: Route) -> RouteRuntimeSnapshot:
     return snap
 
 
+async def mark_subagent_activity(route: Route) -> RouteRuntimeSnapshot:
+    """Sidechain (sub-agent) JSONL activity observed for this route (Wave A).
+
+    A running sub-agent writes only to its own sidechain file, so the parent
+    transcript is silent and a transient confirmed-idle pane frame can falsely
+    clear the route. This mutator is the keep-alive + bounded self-heal:
+
+      - ``RUNNING`` / ``RUNNING_TOOL`` → refresh ``last_event_at`` and
+        re-arm/cancel the pane-idle debounce (the same treatment as transcript
+        activity). NO ``open_tools`` mutation — this is a heartbeat, not a
+        lifecycle ingestion.
+      - Idle with ``idle_source == "pane"`` → RESURRECT: sidechain activity is
+        positive proof the pane clear was false. Restores ``suspended_tools``
+        into ``open_tools`` and re-derives (``RUNNING_TOOL`` when the parent
+        Agent tool was stashed, ``RUNNING`` on an empty stash), clearing the
+        idle deadlines. The ONLY resurrection path for this mutator.
+      - Idle with ``idle_source == "transcript"`` / ``None`` → no-op (the
+        transcript has spoken; a stray late sidechain write must not resurrect
+        a genuinely ended turn).
+      - ``WAITING_ON_USER`` (transcript- or pane-bit-set) → never overridden.
+      - Unseen route (no ``_RouteState``) → bail; never seeds.
+
+    Card semantics are explicitly NARROWED: a status clear already enqueued
+    before resurrection MAY still delete the visible Busy card —
+    ``mark_subagent_activity`` has no send-layer authority and the queue is
+    not generation-guarded. The card re-publishes on the next active status
+    tick; ``typing_eligible`` and the digest header recover immediately from
+    the snapshot.
+    """
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            return _default_snapshot(route)
+        if st.run_state is RunState.WAITING_ON_USER:
+            return _freeze(route, st)
+        if st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL):
+            st.last_event_at = _now()
+            _rearm_pane_idle_in_place(st)
+            return _freeze(route, st)
+        # Idle: only a pane-sourced idle is resurrectable.
+        if st.idle_source != "pane":
+            return _freeze(route, st)
+        if st.suspended_tools:
+            st.open_tools.update(st.suspended_tools)
+            st.suspended_tools.clear()
+            st.invalidate_tool_cache()
+        # _set_run_state's active branch resets idle_source + idle_clear_at.
+        _set_run_state(st, _state_from_open_tools(st.open_tools))
+        _rearm_pane_idle_in_place(st)
+        snap = _freeze(route, st)
+    return snap
+
+
 def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
     """Reconcile a confirmed-idle route to ``IDLE_CLEARED`` in place.
 
@@ -697,8 +797,13 @@ def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
     events:
 
       - ``WAITING_ON_USER`` is preserved (interactive prompt is open).
-      - Otherwise drops any lingering open tools and transitions to
-        ``IDLE_CLEARED``.
+      - An ACTIVE route (``RUNNING`` / ``RUNNING_TOOL``) is reconciled to
+        ``IDLE_CLEARED`` with ``idle_source="pane"``; its open tools are
+        MOVED into the ``suspended_tools`` stash (not dropped) so a later
+        sidechain resurrection / transcript tool_result can restore them.
+      - An already-idle route stays ``IDLE_CLEARED`` but PRESERVES its
+        ``idle_source`` (the pane clear reconciled nothing, so it must not
+        overwrite "transcript" and open a false resurrection path).
 
     Shared by ``mark_pane_idle`` (immediate reconciliation seam) and
     ``commit_pane_idle_clear`` (the debounced production card-clear) so
@@ -706,9 +811,14 @@ def _reconcile_pane_idle_in_place(st: _RouteState) -> None:
     """
     if st.run_state is RunState.WAITING_ON_USER:
         return
+    was_active = st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL)
+    if was_active and st.open_tools:
+        st.suspended_tools.update(st.open_tools)
     st.open_tools.clear()
     st.invalidate_tool_cache()
     _set_run_state(st, RunState.IDLE_CLEARED)
+    if was_active:
+        st.idle_source = "pane"
 
 
 async def mark_pane_idle(route: Route) -> RouteRuntimeSnapshot:
@@ -866,9 +976,12 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         # Fresh session — drop any pending/completed pane-idle debounce so
         # the new session's first idle stretch arms from scratch.
         _rearm_pane_idle_in_place(st)
-        # The old session's interactive prompt (if any) is gone with it.
+        # The old session's interactive prompt (if any) is gone with it —
+        # as are any suspended tools and the idle provenance.
         st.pane_interactive_pending = False
+        st.suspended_tools.clear()
         _set_run_state(st, RunState.IDLE_CLEARED)
+        st.idle_source = None
         snap = _freeze(route, st)
     return snap
 
@@ -1090,6 +1203,7 @@ __all__ = [
     "mark_session_reset",
     "mark_status_card_cleared",
     "mark_status_card_published",
+    "mark_subagent_activity",
     "pane_idle_clear_due",
     "parse_pending_tools_from_jsonl",
     "reset_for_tests",
