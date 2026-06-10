@@ -27,7 +27,8 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Literal
+from collections.abc import Iterable
+from typing import Any, Literal
 
 from telegram import Bot, ReplyParameters
 from telegram.error import RetryAfter
@@ -79,6 +80,13 @@ class MessageTask:
     # _render_agent_tool_use to extract description / subagent_type / prompt.
     tool_input: dict[str, object] | None = None
     transcript_uuid: str | None = None
+    # Retry-resume cursor (finding 10): number of leading ``parts`` already
+    # delivered. ``_run_with_retry`` re-invokes the processor on the SAME
+    # task object after a RetryAfter, and ``_process_content_task`` skips
+    # parts below this cursor — so a flood-control retry on part 2/3 never
+    # re-sends part 1 as a duplicate. Mutated in place by
+    # ``_process_content_task`` only.
+    parts_sent: int = 0
     # Sub-agent (sidechain) run identifier. When non-None, the task
     # represents an event from one sub-agent JSONL — text/thinking/tool_use/
     # tool_result blocks emitted by the sub-agent itself. The dispatcher
@@ -87,6 +95,18 @@ class MessageTask:
     # per block. The to-do-list digest also gates on this field so a
     # sub-agent's TodoWrites don't paint the parent topic's task card.
     subagent_key: str | None = None
+    # Hermes P2-1: the promoted top-level MessageTask minted by
+    # ``_process_agent_task`` for an Agent tool_use / tool_result. Cached on
+    # the ORIGINAL Agent task (whose object identity survives
+    # ``_run_with_retry`` retries) so a RetryAfter raised AFTER successful
+    # delivery re-enters with the SAME promoted task — preserving its
+    # advanced ``parts_sent`` cursor / saturation instead of minting a fresh
+    # one at ``parts_sent = 0`` (which replayed the tool_use bubble / sent a
+    # duplicate tool_result bubble). Lifecycle: set once on the first
+    # ``_process_agent_task`` attempt and never cleared — it dies with the
+    # task object, which is dropped after ``_run_with_retry`` returns or
+    # exhausts its attempts.
+    agent_promoted: "MessageTask | None" = None
 
 
 @dataclass
@@ -597,6 +617,7 @@ async def _dispatch_task(
     queue: asyncio.Queue[MessageTask],
     lock: asyncio.Lock,
     task: MessageTask,
+    merged_holder: list[MessageTask] | None = None,
 ) -> MessageTask:
     """Run a single task. May raise RetryAfter; the caller decides whether to
     retry (content) or drop (status).
@@ -606,6 +627,13 @@ async def _dispatch_task(
     dispatched form (merged for content, original for everything else),
     and ``_run_with_retry`` reuses it on subsequent attempts via
     ``_dispatch_already_merged`` so retries never re-drain the queue.
+
+    ``merged_holder`` (finding 10): the merged task is recorded there
+    BEFORE processing, because a RetryAfter raises out of this function —
+    a return value alone would lose the merged form, the retry would
+    re-enter ``_merge_content_tasks`` (dropping the first merge's drained
+    tasks and double-counting ``task_done``), and the per-task
+    ``parts_sent`` resume cursor would reset.
     """
     if task.task_type == "content":
         # Sub-agent events route to the per-sidechain editable digest BEFORE
@@ -640,6 +668,8 @@ async def _dispatch_task(
             logger.debug("Merged %d tasks for user %d", merge_count, user_id)
             for _ in range(merge_count):
                 queue.task_done()
+        if merged_holder is not None:
+            merged_holder.append(merged_task)
         await _process_content_task(bot, user_id, merged_task)
         return merged_task
     if task.task_type == "status_update":
@@ -720,8 +750,21 @@ async def _run_with_retry(
         attempts_remaining -= 1
         try:
             if dispatched is None:
-                # First attempt: drain/merge bookkeeping happens here.
-                dispatched = await _dispatch_task(bot, user_id, queue, lock, task)
+                # First attempt: drain/merge bookkeeping happens here. The
+                # holder captures the merged task even when the dispatch
+                # RAISES (finding 10) — without it, ``dispatched`` stayed
+                # None on a RetryAfter and the retry re-entered the merge,
+                # losing the first merge's drained tasks and resetting the
+                # ``parts_sent`` resume cursor.
+                holder: list[MessageTask] = []
+                try:
+                    dispatched = await _dispatch_task(
+                        bot, user_id, queue, lock, task, holder
+                    )
+                except RetryAfter:
+                    if holder:
+                        dispatched = holder[0]
+                    raise
             else:
                 # Retry: reuse the already-merged task; do NOT re-drain.
                 await _dispatch_already_merged(bot, user_id, dispatched)
@@ -793,6 +836,35 @@ async def _drain_pending_ephemeral(
         logger.error("Error processing ephemeral task for route %s: %s", route, e)
 
 
+async def _drain_pending(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    """Cancel + collect the losing ``asyncio.wait`` branches.
+
+    Finding 2: the previous ``for p in pending: await p`` under
+    ``except BaseException: pass`` ate the WORKER's own CancelledError when
+    ``teardown_route``'s ``worker.cancel()`` landed in the window between
+    the racing ``asyncio.wait`` returning and ``inflight.clear()`` (the
+    inflight Event is still SET there, so teardown's ``inflight.wait()``
+    passes immediately). Cancellation is one-shot — eating it resumed the
+    worker, hung ``await worker`` forever, and silently dropped every
+    future message for the route via the tearing-down guard.
+
+    ``asyncio.wait`` never raises the collected tasks' exceptions (or their
+    cancellations) into the waiter, so a CancelledError escaping THIS
+    coroutine can only be the worker's own cancellation — it must
+    propagate. No broad except here, and ``.result()`` is never called on
+    cancelled tasks; real exceptions are retrieved only to keep the event
+    loop from warning about them.
+    """
+    if not tasks:
+        return
+    for t in tasks:
+        t.cancel()
+    done, _ = await asyncio.wait(tasks)
+    for t in done:
+        if not t.cancelled() and t.exception() is not None:
+            logger.warning("queue worker wait-branch task failed: %r", t.exception())
+
+
 async def _message_queue_worker(bot: Bot, route: Route) -> None:
     """Process content + ephemeral tasks for a single route."""
     user_id = route[0]
@@ -816,13 +888,7 @@ async def _message_queue_worker(bot: Bot, route: Route) -> None:
                 kick_wait.cancel()
                 raise
 
-            for p in pending:
-                p.cancel()
-            for p in pending:
-                try:
-                    await p
-                except BaseException:
-                    pass
+            await _drain_pending(pending)
 
             task: MessageTask | None = None
             if content_get in done:
@@ -2116,8 +2182,25 @@ async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None
     ``_tool_msg_ids`` edit machinery + multipart split + status handoff all
     Just Work. After the top-level send, the activity counter is bumped so
     the digest header reflects "M tool calls" including the subagent.
+
+    Hermes P2-1: the promoted task is cached on ``task.agent_promoted`` so
+    a ``_run_with_retry`` retry (which re-invokes with the SAME original
+    Agent task) reuses the SAME promoted task — its ``parts_sent`` cursor
+    and the eager ``_tool_msg_ids`` saturation survive, so a RetryAfter
+    raised AFTER successful delivery (e.g. in ``_check_and_send_status``)
+    cannot replay the tool_use bubble or send a duplicate tool_result
+    bubble. The render + ``_agent_tool_ids`` stash are first-attempt-only
+    (the recorded input is already stashed; the rendered text already lives
+    in the cached promoted task's ``parts``).
     """
     tid = task.thread_id or 0
+    promoted = task.agent_promoted
+    if promoted is not None:
+        await _process_content_task(bot, user_id, promoted)
+        if task.content_type != "tool_use" and task.tool_use_id:
+            _agent_tool_ids.pop((task.tool_use_id, user_id, tid), None)
+        await _bump_agent_activity_counter(bot, user_id, task)
+        return
     rendered: str
     if task.content_type == "tool_use":
         rendered = _render_agent_tool_use(
@@ -2147,8 +2230,12 @@ async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None
             effective_input,
             status,
         )
-        if task.tool_use_id:
-            _agent_tool_ids.pop((task.tool_use_id, user_id, tid), None)
+        # NOTE: the ``_agent_tool_ids`` pop is deferred until the promoted
+        # content task below succeeds (finding 10 / Hermes P2-3). Popping
+        # here meant a RetryAfter raised by ``_process_content_task`` lost
+        # the routing key — the retry's ``_is_agent_tool_result`` then
+        # missed and the Agent tool_result re-routed to the generic
+        # activity digest with the wrong rendering.
 
     promoted = MessageTask(
         task_type="content",
@@ -2162,7 +2249,13 @@ async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None
         tool_name=task.tool_name,
         tool_input=task.tool_input,
     )
+    # Cache BEFORE processing — a RetryAfter raises out of the await below,
+    # and the retry must find the promoted task with its mutated state.
+    task.agent_promoted = promoted
     await _process_content_task(bot, user_id, promoted)
+    if task.content_type != "tool_use" and task.tool_use_id:
+        # Promotion delivered — NOW consume the tool_use's recorded input.
+        _agent_tool_ids.pop((task.tool_use_id, user_id, tid), None)
     await _bump_agent_activity_counter(bot, user_id, task)
 
 
@@ -2271,7 +2364,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
         _tkey = (task.tool_use_id, user_id, tid)
-        edit_msg_id = _tool_msg_ids.pop(_tkey, None)
+        edit_msg_id = _tool_msg_ids.get(_tkey)
         if edit_msg_id is not None:
             # Clear status message first
             await _do_clear_status_message(bot, user_id, tid)
@@ -2289,7 +2382,20 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 role="tool",
                 content_type="tool_result",
             )
+            # Pop only after the edit attempt RETURNED (finding 10): a
+            # raised RetryAfter (from the status clear above or the edit
+            # itself) leaves the entry in place so the retry edits the
+            # SAME message instead of posting a new bubble. A non-OK
+            # outcome (returned, not raised) is a terminal edit failure —
+            # consume the entry and fall through to a fresh send, exactly
+            # as before.
+            _tool_msg_ids.pop(_tkey, None)
             if outcome is TopicSendOutcome.OK:
+                # The edit delivered the full text — mark every part as
+                # sent so a RetryAfter raised by the follow-ups below
+                # can't re-send the body as fresh bubbles on the retry
+                # (the entry above is already consumed by then).
+                task.parts_sent = len(task.parts)
                 # Tool work resumed → user no longer "needed".
                 await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
                 await _send_task_images(bot, chat_id, task, effective_thread_id)
@@ -2303,7 +2409,10 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
-    first_part = True
+    # ``parts_sent`` is the retry-resume cursor (finding 10): parts below it
+    # were already delivered by a previous attempt that then raised
+    # RetryAfter — skip them so the retry never re-sends a delivered part.
+    first_part = task.parts_sent == 0
     first_topic_send_done = False
     last_msg_id: int | None = None
     # Role for the message_refs row: tool_use/tool_result → "tool";
@@ -2315,6 +2424,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     )
     ref_session_id = _session_id_for_window(wid)
     for part_idx, part in enumerate(task.parts):
+        if part_idx < task.parts_sent:
+            continue
         sent = None
 
         # For first part, try to convert status message to content (edit instead of delete)
@@ -2341,6 +2452,12 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
+                # Part delivered via the conversion edit — advance the
+                # retry-resume cursor and record the tool_use edit target
+                # eagerly (a later RetryAfter must not lose it).
+                task.parts_sent = part_idx + 1
+                if task.tool_use_id and task.content_type == "tool_use":
+                    _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
                 # Status-conversion edits the existing status message — no
                 # fresh send happens here, so ``reply_parameters`` cannot
                 # attach (Telegram has no edit-with-reply primitive). The
@@ -2431,10 +2548,22 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
         if sent is not None:
             last_msg_id = sent.message_id
+            # Record the tool_use edit target eagerly (not only at step 3):
+            # a RetryAfter raised AFTER this loop (attention / images /
+            # status) would re-enter with all parts skipped and
+            # ``last_msg_id`` None, so step 3 alone would never record it
+            # and the later tool_result would post as a new bubble.
+            if task.tool_use_id and task.content_type == "tool_use":
+                _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
         elif task.thread_id is not None and outcome in _TOPIC_BROKEN_OUTCOMES:
             await _emergency_dm(
                 bot, user_id, task.thread_id, wid, part, kind="content", outcome=outcome
             )
+        # The part was handled (sent, or terminally failed into the
+        # emergency-DM path — which is not retried either way): advance the
+        # retry-resume cursor. A RetryAfter raised by topic_send above
+        # skips this, so the retry resumes AT this part.
+        task.parts_sent = part_idx + 1
 
     # The attention/dismiss heuristic must run on the logical final text once,
     # not per multipart segment. Otherwise an early part containing a question
