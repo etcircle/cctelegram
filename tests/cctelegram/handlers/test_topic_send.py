@@ -103,7 +103,11 @@ from pathlib import Path  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
 from cctelegram import message_refs  # noqa: E402
-from cctelegram.handlers.message_sender import topic_delete, topic_send  # noqa: E402
+from cctelegram.handlers.message_sender import (  # noqa: E402
+    topic_delete,
+    topic_edit,
+    topic_send,
+)
 
 
 @pytest.fixture
@@ -187,3 +191,118 @@ async def test_topic_delete_removes_message_ref(_refs_db: None) -> None:
     assert outcome is TopicSendOutcome.OK
     await _drain_pending_tasks()
     assert await message_refs.lookup(-100123, 777) is None
+
+
+async def test_topic_edit_message_not_modified_updates_message_ref(
+    _refs_db: None,
+) -> None:
+    """W8 P2-1 provenance: MESSAGE_NOT_MODIFIED is caller-success — the body
+    already matches the intended content — so a status→content repurposing
+    edit must still flip the provenance row's role/content_type, exactly like
+    an OK edit. Otherwise reply enrichment keeps seeing the (now content)
+    message as ``status``."""
+    bot = MagicMock()
+    sent_msg = MagicMock()
+    sent_msg.message_id = 888
+    bot.send_message = AsyncMock(return_value=sent_msg)
+
+    # Seed a status-role row (the pre-conversion state).
+    await topic_send(
+        bot,
+        op="status",
+        user_id=7,
+        chat_id=-100123,
+        thread_id=42,
+        window_id="@0",
+        text="🟡 Busy",
+        role="status",
+        content_type="status",
+    )
+    await _drain_pending_tasks()
+    row = await message_refs.lookup(-100123, 888)
+    assert row is not None and row.role == "status"
+
+    bot.edit_message_text = AsyncMock(
+        side_effect=BadRequest("Bad Request: message is not modified")
+    )
+    outcome = await topic_edit(
+        bot,
+        op="content",
+        user_id=7,
+        chat_id=-100123,
+        thread_id=42,
+        window_id="@0",
+        message_id=888,
+        text="🟡 Busy",
+        role="assistant",
+        content_type="text",
+    )
+    assert outcome is TopicSendOutcome.MESSAGE_NOT_MODIFIED
+    await _drain_pending_tasks()
+    row = await message_refs.lookup(-100123, 888)
+    assert row is not None
+    assert row.role == "assistant", (
+        "MESSAGE_NOT_MODIFIED repurposing edit must flip the provenance row "
+        f"like an OK edit; still {row.role!r}"
+    )
+    assert row.content_type == "text"
+
+
+async def test_topic_edit_message_not_modified_on_plaintext_fallback_updates_ref(
+    _refs_db: None,
+) -> None:
+    """W8 R2 P2-1: topic_edit's plain-text FALLBACK path can also classify
+    MESSAGE_NOT_MODIFIED (formatted attempt fails with a non-shortcircuit
+    outcome, the plain retry hits "message is not modified"). That return
+    site must flip the provenance row too — the caller treats any
+    MESSAGE_NOT_MODIFIED as converted success."""
+    bot = MagicMock()
+    sent_msg = MagicMock()
+    sent_msg.message_id = 889
+    bot.send_message = AsyncMock(return_value=sent_msg)
+
+    await topic_send(
+        bot,
+        op="status",
+        user_id=7,
+        chat_id=-100123,
+        thread_id=42,
+        window_id="@0",
+        text="🟡 Busy",
+        role="status",
+        content_type="status",
+    )
+    await _drain_pending_tasks()
+    row = await message_refs.lookup(-100123, 889)
+    assert row is not None and row.role == "status"
+
+    # Formatted attempt -> generic parse error (OTHER, falls through);
+    # plain-text retry -> "message is not modified".
+    bot.edit_message_text = AsyncMock(
+        side_effect=[
+            BadRequest("Bad Request: can't parse entities"),
+            BadRequest("Bad Request: message is not modified"),
+        ]
+    )
+    outcome = await topic_edit(
+        bot,
+        op="content",
+        user_id=7,
+        chat_id=-100123,
+        thread_id=42,
+        window_id="@0",
+        message_id=889,
+        text="🟡 Busy",
+        role="assistant",
+        content_type="text",
+    )
+    assert outcome is TopicSendOutcome.MESSAGE_NOT_MODIFIED
+    assert bot.edit_message_text.await_count == 2
+    await _drain_pending_tasks()
+    row = await message_refs.lookup(-100123, 889)
+    assert row is not None
+    assert row.role == "assistant", (
+        "fallback-path MESSAGE_NOT_MODIFIED must flip the provenance row "
+        f"like an OK edit; still {row.role!r}"
+    )
+    assert row.content_type == "text"

@@ -233,7 +233,11 @@ class SessionManager:
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
 
-            except (json.JSONDecodeError, ValueError) as e:
+            except (json.JSONDecodeError, ValueError, OSError) as e:
+                # OSError included (finding 19): the singleton constructs at
+                # module import, so an unreadable state.json (permissions /
+                # I/O error) must degrade to empty state instead of putting
+                # launchd into a crash loop.
                 logger.warning("Failed to load state: %s", e)
                 self.window_states = {}
                 self.user_window_offsets = {}

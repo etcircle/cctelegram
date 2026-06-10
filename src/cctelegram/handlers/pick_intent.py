@@ -270,7 +270,13 @@ def _load_from_disk() -> None:
     _live.clear()
     _live.update(working)
     if _lines_read > LRU_CAP:
-        _compact()
+        # Best-effort (finding 24): the lazy compaction is triggered from the
+        # public read/write seams — a disk failure must not raise into the
+        # live render. The in-memory replay above already succeeded.
+        try:
+            _compact()
+        except OSError as exc:
+            logger.warning("pick_intent: compaction of %s failed: %s", path, exc)
 
 
 def _ensure_loaded() -> None:
@@ -285,20 +291,33 @@ def _append_line(obj: dict) -> None:
     line is skipped on read" — NOT a ``PIPE_BUF`` regular-file atomicity claim.
     The full-write loop covers the rare short ``os.write``; single-process so no
     cross-writer interleave.
+
+    Best-effort (finding 24): an ``OSError`` (disk full / read-only config dir)
+    is logged and swallowed so it never raises through the LIVE picker render
+    (``interactive_ui`` calls ``record_row`` on the render path). The in-memory
+    state stays authoritative for this process; only restart-recovery
+    durability is lost — mirroring ``md_capture``'s posture.
     """
     path = _store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, separators=(",", ":"), ensure_ascii=True) + "\n"
     view = memoryview(line.encode("utf-8"))
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        while view:
-            n = os.write(fd, view)
-            if n <= 0:
-                raise OSError("pick_intent: short write to store")
-            view = view[n:]
-    finally:
-        os.close(fd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            while view:
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError("pick_intent: short write to store")
+                view = view[n:]
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        logger.warning(
+            "pick_intent: append to %s failed (%s) — row not durable across restart",
+            path,
+            exc,
+        )
 
 
 def _row_payload(intents: Iterable[PickIntent]) -> dict:

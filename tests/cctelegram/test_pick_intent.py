@@ -186,3 +186,55 @@ def test_compaction_preserves_live_rows(tmp_path: Path) -> None:
         assert pick_intent.lookup_intent("aaaaaaaaaaaa") is None
     finally:
         pick_intent.LRU_CAP = original_cap
+
+
+class TestDiskFailureGraceful:
+    """Finding 24: disk-write failures must not raise into the live render.
+
+    ``record_row`` is called inside the AUQ picker render path
+    (``interactive_ui``); an OSError (disk full / read-only config dir) must
+    degrade to a logged warning + no-op — losing only restart-recovery, never
+    the picker. Same posture for the other public writers (``consume_row``,
+    ``teardown_window``) and the lazy-load ``_compact``.
+    """
+
+    def _blocked_path(self, tmp_path: Path) -> Path:
+        # Parent is a regular FILE → ``mkdir(parents=True, exist_ok=True)``
+        # and ``os.open`` both raise OSError.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        return blocker / "pick_intent.jsonl"
+
+    def test_record_row_disk_failure_does_not_raise(self, tmp_path: Path) -> None:
+        pick_intent.reset_for_tests(
+            path=self._blocked_path(tmp_path), now=lambda: 1000.0
+        )
+        _record(tmp_path)  # must not raise
+
+    def test_consume_and_teardown_disk_failure_does_not_raise(
+        self, tmp_path: Path
+    ) -> None:
+        pick_intent.reset_for_tests(
+            path=self._blocked_path(tmp_path), now=lambda: 1000.0
+        )
+        _record(tmp_path)
+        pick_intent.consume_row("aaaaaaaaaaaa")  # must not raise
+        pick_intent.teardown_window("@1")  # must not raise
+
+    def test_lazy_load_compact_oserror_does_not_raise(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        path = tmp_path / "pick_intent.jsonl"
+        pick_intent.reset_for_tests(path=path, now=lambda: 1000.0)
+        _record(tmp_path)
+        # Force the lazy-load compaction branch and make compaction fail.
+        pick_intent.reset_for_tests(path=path, now=lambda: 1000.0)
+        monkeypatch.setattr(pick_intent, "LRU_CAP", 0)
+
+        def _boom() -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(pick_intent, "_compact", _boom)
+        # Lazy load (triggered by any public read) must swallow the OSError.
+        intent = pick_intent.lookup_intent("aaaaaaaaaaaa")
+        assert intent is not None  # the in-memory replay still succeeded

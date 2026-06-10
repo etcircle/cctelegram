@@ -1338,6 +1338,396 @@ class TestConvertStatusToContentOrdering:
 
 
 @pytest.mark.usefixtures("_clear_queue_state")
+class TestConvertStatusFailureCleanup:
+    """Finding 17: a failed repurposing edit must not orphan the status card.
+
+    ``_convert_status_to_content`` pops ``_status_msg_info`` and marks the
+    card cleared BEFORE the edit. A non-OK, non-gone edit outcome previously
+    returned None with no delete and no re-tracking — a permanent stale
+    "🟡 Busy" bubble. The non-OK branch must best-effort ``topic_delete`` the
+    old card (mirroring the two earlier branches in the same function).
+
+    Wave-4 P3-1 raise path: a ``RetryAfter`` raised by the awaited edit /
+    delete escapes AFTER the pop, so the retry would see no status entry and
+    send fresh, stranding the visible card. On a RetryAfter RAISE the popped
+    entry must be restored (and ``mark_status_card_published`` re-mirrored)
+    before re-raising, so the retry re-converts the same card.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_ok_edit_deletes_orphaned_status_card(self, mock_bot: AsyncMock):
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+        mq._status_msg_info[skey] = (10, window_id, "🟡 Busy")
+
+        topic_delete_calls: list[dict] = []
+
+        async def fake_delete(*args, **kwargs):
+            topic_delete_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=fake_delete)),
+            patch.object(
+                mq,
+                "topic_edit",
+                new=AsyncMock(return_value=mq.TopicSendOutcome.OTHER),
+            ),
+        ):
+            result = await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, window_id, "Final text."
+            )
+
+        assert result is None
+        assert len(topic_delete_calls) == 1, (
+            "non-OK edit must best-effort delete the orphaned status card; "
+            f"got {topic_delete_calls}"
+        )
+        assert topic_delete_calls[0]["message_id"] == 10
+        assert skey not in mq._status_msg_info
+
+    @pytest.mark.asyncio
+    async def test_retry_after_on_edit_restores_status_tracking(
+        self, mock_bot: AsyncMock
+    ):
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+        info = (10, window_id, "🟡 Busy")
+        mq._status_msg_info[skey] = info
+
+        published = MagicMock()
+        with (
+            patch.object(mq, "topic_edit", new=AsyncMock(side_effect=RetryAfter(3))),
+            patch.object(mq.route_runtime, "mark_status_card_published", new=published),
+            pytest.raises(RetryAfter),
+        ):
+            await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, window_id, "Final text."
+            )
+
+        assert mq._status_msg_info.get(skey) == info, (
+            "RetryAfter raise must restore the popped status entry so the "
+            "retry re-converts the same card"
+        )
+        published.assert_called_once_with((user_id, thread_id, window_id), 10)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_on_digest_path_delete_restores_status_tracking(
+        self, mock_bot: AsyncMock
+    ):
+        """Same restore contract on the digest-at-higher-id delete branch."""
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+        info = (10, window_id, "🟡 Busy")
+        mq._status_msg_info[skey] = info
+        mq._activity_msg_info[skey] = mq.ActivityDigestState(
+            message_id=15, window_id=window_id
+        )
+
+        published = MagicMock()
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=RetryAfter(3))),
+            patch.object(mq.route_runtime, "mark_status_card_published", new=published),
+            pytest.raises(RetryAfter),
+        ):
+            await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, window_id, "Final text."
+            )
+
+        assert mq._status_msg_info.get(skey) == info
+        published.assert_called_once_with((user_id, thread_id, window_id), 10)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_on_window_mismatch_delete_restores_status_tracking(
+        self, mock_bot: AsyncMock
+    ):
+        """W8 P3-1: same restore contract on the stored-window-mismatch delete
+        branch — ANY RetryAfter raise out of the conversion must leave tracking
+        restored and re-raise."""
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        skey = (user_id, thread_id)
+        info = (10, "@OLD", "🟡 Busy")
+        mq._status_msg_info[skey] = info
+
+        published = MagicMock()
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=RetryAfter(3))),
+            patch.object(mq.route_runtime, "mark_status_card_published", new=published),
+            pytest.raises(RetryAfter),
+        ):
+            await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, "@7", "Final text."
+            )
+
+        assert mq._status_msg_info.get(skey) == info, (
+            "RetryAfter from the window-mismatch delete must restore the "
+            "popped status entry"
+        )
+        # The restore re-mirrors against the STORED window, not the caller's.
+        published.assert_called_once_with((user_id, thread_id, "@OLD"), 10)
+
+    @pytest.mark.asyncio
+    async def test_retry_after_on_cleanup_delete_restores_status_tracking(
+        self, mock_bot: AsyncMock
+    ):
+        """W8 P3-1: same restore contract on the NEW (Finding 17) non-OK
+        cleanup delete branch — the easiest place for a future refactor to
+        break the pop-before-await restore guarantee."""
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+        info = (10, window_id, "🟡 Busy")
+        mq._status_msg_info[skey] = info
+
+        published = MagicMock()
+        with (
+            patch.object(
+                mq,
+                "topic_edit",
+                new=AsyncMock(return_value=mq.TopicSendOutcome.OTHER),
+            ),
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=RetryAfter(3))),
+            patch.object(mq.route_runtime, "mark_status_card_published", new=published),
+            pytest.raises(RetryAfter),
+        ):
+            await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, window_id, "Final text."
+            )
+
+        assert mq._status_msg_info.get(skey) == info, (
+            "RetryAfter from the cleanup delete must restore the popped "
+            "status entry so the retry re-converts the same card"
+        )
+        published.assert_called_once_with((user_id, thread_id, window_id), 10)
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestConvertStatusMessageNotModified:
+    """W8 P2-1: ``MESSAGE_NOT_MODIFIED`` on the repurposing edit is
+    converted-SUCCESS, not failure.
+
+    ``TopicSendOutcome.MESSAGE_NOT_MODIFIED`` is documented caller-success
+    (message_sender.py): Telegram refused the edit because the body already
+    matches the intended content — i.e. the card already renders the
+    converted message. Returning None made the caller treat it as
+    conversion-failed and send the SAME first part as a fresh message →
+    duplicate content next to the still-visible card.
+
+    NOTE: this duplication is PRE-EXISTING on main — main's
+    ``_convert_status_to_content`` also fell through to ``return None`` for
+    MESSAGE_NOT_MODIFIED (only ``OK`` returned ``msg_id``). The Wave-8
+    cleanup-delete branch merely made the exclusion explicit; this fix
+    corrects the pre-existing duplication too.
+
+    Post-state must match the OK path exactly: entry stays popped
+    (``_status_msg_info``), the card stays ``mark_status_card_cleared`` in
+    route_runtime (no re-publish), and the caller records the converted
+    card's id as ``last_msg_id``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_message_not_modified_returns_msg_id_like_ok(
+        self, mock_bot: AsyncMock
+    ):
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@7"
+        skey = (user_id, thread_id)
+        mq._status_msg_info[skey] = (10, window_id, "🟡 Busy")
+
+        topic_delete_calls: list[dict] = []
+
+        async def fake_delete(*args, **kwargs):
+            topic_delete_calls.append(kwargs)
+            return mq.TopicSendOutcome.OK
+
+        cleared = MagicMock()
+        published = MagicMock()
+        with (
+            patch.object(mq, "topic_delete", new=AsyncMock(side_effect=fake_delete)),
+            patch.object(
+                mq,
+                "topic_edit",
+                new=AsyncMock(return_value=mq.TopicSendOutcome.MESSAGE_NOT_MODIFIED),
+            ),
+            patch.object(mq.route_runtime, "mark_status_card_cleared", new=cleared),
+            patch.object(mq.route_runtime, "mark_status_card_published", new=published),
+        ):
+            result = await mq._convert_status_to_content(
+                mock_bot, user_id, thread_id, window_id, "Final text."
+            )
+
+        assert result == 10, (
+            "MESSAGE_NOT_MODIFIED means the card already renders this exact "
+            "content — that IS the converted message; must return msg_id like "
+            f"OK, got {result}"
+        )
+        assert topic_delete_calls == [], (
+            "must NOT delete a card that already renders the delivered content"
+        )
+        # Post-state identical to the OK path: entry consumed, card cleared
+        # in route_runtime, no re-publish.
+        assert skey not in mq._status_msg_info
+        cleared.assert_called_once_with((user_id, thread_id, window_id))
+        published.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_message_not_modified_caller_does_not_fresh_send(
+        self, mock_bot: AsyncMock
+    ):
+        """End-to-end through ``_process_content_task``: a MESSAGE_NOT_MODIFIED
+        conversion outcome must NOT fall through to a fresh ``topic_send`` of
+        the same part, and ``last_msg_id`` must be the converted card's id
+        (observable via the tool_use message-id recording)."""
+        from cctelegram.handlers import message_queue as mq
+
+        user_id = 1
+        thread_id = 100
+        window_id = "@0"
+        skey = (user_id, thread_id)
+        mq._status_msg_info[skey] = (10, window_id, "🟡 Busy")
+
+        send_calls: list[dict] = []
+
+        async def fake_send(
+            bot, *, op, user_id, chat_id, thread_id, window_id, text, **kw
+        ):
+            send_calls.append({"op": op, "msg_text": text})
+            sent = MagicMock()
+            sent.message_id = 999
+            return sent, mq.TopicSendOutcome.OK
+
+        async def noop(*a, **k):
+            return None
+
+        with (
+            patch.object(mq, "topic_send", side_effect=fake_send),
+            patch.object(
+                mq,
+                "topic_edit",
+                new=AsyncMock(return_value=mq.TopicSendOutcome.MESSAGE_NOT_MODIFIED),
+            ),
+            patch.object(mq, "_check_and_send_status", side_effect=noop),
+            patch.object(mq, "_finalize_activity_digest", side_effect=noop),
+            patch.object(mq, "_maybe_attention_or_dismiss", side_effect=noop),
+            patch.object(mq.session_manager, "resolve_chat_id", return_value=user_id),
+        ):
+            await mq._process_content_task(
+                mock_bot,
+                user_id,
+                mq.MessageTask(
+                    task_type="content",
+                    window_id=window_id,
+                    parts=["⚙️ Bash"],
+                    content_type="tool_use",
+                    tool_use_id="tu-mnm-1",
+                    thread_id=thread_id,
+                ),
+            )
+
+        assert send_calls == [], (
+            "MESSAGE_NOT_MODIFIED conversion must not fall through to a "
+            f"fresh send of the same part (duplicate content); got {send_calls}"
+        )
+        assert mq._tool_msg_ids.get(("tu-mnm-1", user_id, thread_id)) == 10, (
+            "last_msg_id must be the converted card's id (10), proving the "
+            "caller took the converted-success path"
+        )
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
+class TestSpawnBackground:
+    """Finding 23: detached cleanup tasks must be strongly referenced.
+
+    A bare ``asyncio.create_task`` drops the only reference (cpython#91887 —
+    the loop holds a weak ref, so the task can be GC'd mid-run) and swallows
+    exceptions. ``_spawn_background`` retains the task in a module-level
+    strong-ref set with a done-callback that discards it and logs exceptions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_retained_then_discarded_and_exception_logged(self, caplog):
+        from cctelegram.handlers import message_queue as mq
+
+        async def boom():
+            raise RuntimeError("background blew up")
+
+        with caplog.at_level("ERROR", logger="cctelegram.handlers.message_queue"):
+            mq._spawn_background(boom())
+            assert len(mq._background_tasks) == 1, (
+                "task must be strongly referenced while running"
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        assert not mq._background_tasks, "done-callback must discard the task"
+        assert any("background blew up" in r.message for r in caplog.records), (
+            "background task exception must be logged"
+        )
+
+    @pytest.mark.asyncio
+    async def test_emergency_dm_orphan_cleanup_task_is_retained(
+        self, mock_bot: AsyncMock
+    ):
+        from cctelegram.handlers import cleanup as cleanup_mod
+        from cctelegram.handlers import message_queue as mq
+
+        mq._bad_topic_threads.clear()
+        find_window = AsyncMock(return_value=None)
+        with (
+            patch.object(mq.tmux_manager, "find_window_by_id", find_window),
+            patch.object(mq.session_manager, "unbind_thread", MagicMock()),
+            patch.object(
+                mq.session_manager,
+                "get_display_name",
+                MagicMock(return_value="t"),
+            ),
+            patch.object(cleanup_mod, "clear_topic_state", AsyncMock()),
+            patch.object(
+                mq.attention,
+                "should_emit_emergency_dm",
+                MagicMock(return_value=False),
+            ),
+        ):
+            await mq._emergency_dm(
+                mock_bot,
+                user_id=1,
+                thread_id=100,
+                window_id="@0",
+                text="hello",
+                kind="content",
+                outcome=mq.TopicSendOutcome.TOPIC_NOT_FOUND,
+            )
+            assert mq._background_tasks, (
+                "orphan-window cleanup task must be retained in the "
+                "strong-ref set, not spawned bare"
+            )
+            for _ in range(10):
+                await asyncio.sleep(0)
+        assert not mq._background_tasks
+
+
+@pytest.mark.usefixtures("_clear_queue_state")
 class TestActivityDigestHeader:
     """Render the digest header from RunState + context_pct (route_runtime)."""
 

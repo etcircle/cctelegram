@@ -592,6 +592,10 @@ async def topic_edit(
             _log_topic_outcome(
                 op, user_id, chat_id, thread_id, window_id, outcome, "edit", exc
             )
+            if outcome is TopicSendOutcome.MESSAGE_NOT_MODIFIED:
+                # Caller-success (see the formatted-edit branch below): the
+                # provenance row must flip exactly like an OK edit (W8 P2-1).
+                _record_role_change()
             return outcome
     try:
         await bot.edit_message_text(
@@ -622,6 +626,12 @@ async def topic_edit(
             _log_topic_outcome(
                 op, user_id, chat_id, thread_id, window_id, outcome, "edit", exc
             )
+            if outcome is TopicSendOutcome.MESSAGE_NOT_MODIFIED:
+                # Caller-success: the body already matches the intended
+                # content, so a status→content repurposing edit must still
+                # flip the provenance row exactly like an OK edit (W8 P2-1).
+                # The topic-gone outcomes above stay row-untouched.
+                _record_role_change()
             return outcome
     try:
         await bot.edit_message_text(
@@ -642,6 +652,11 @@ async def topic_edit(
         _log_topic_outcome(
             op, user_id, chat_id, thread_id, window_id, outcome, "edit", exc
         )
+        if outcome is TopicSendOutcome.MESSAGE_NOT_MODIFIED:
+            # Caller-success on the plain-text fallback path too — without
+            # this the row stays "status" while the caller treats the edit
+            # as converted success (Hermes W8 R2 P2-1).
+            _record_role_change()
         return outcome
 
 

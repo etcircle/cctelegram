@@ -26,6 +26,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from collections.abc import Iterable
 from typing import Any, Literal
@@ -351,6 +352,31 @@ _flood_until: dict[int, float] = {}
 # a topic is genuinely unreachable. Do NOT add automatic create/reopen here
 # without a real Telegram supergroup smoke path.
 _bad_topic_threads: set[tuple[int, int]] = set()
+
+# Strong refs to detached background tasks (finding 23). A bare
+# ``asyncio.create_task`` with the only reference dropped can be GC'd mid-run
+# (cpython#91887 — the loop holds a weak ref) and silently swallows
+# exceptions. Local copy of ``inbound_aggregator._spawn_background`` (importing
+# it here would create a cycle: the aggregator imports from this module), plus
+# exception logging in the done-callback.
+_background_tasks: set[asyncio.Task[object]] = set()
+
+
+def _on_background_task_done(task: asyncio.Task[object]) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Detached background task failed: %s", exc, exc_info=exc)
+
+
+def _spawn_background(coro: Coroutine[object, object, object]) -> None:
+    """Spawn a detached task retained in a module-level strong-ref set."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_on_background_task_done)
+
 
 # Topic outcomes that should trigger emergency DM fallback. These are the cases
 # where retrying the same topic is futile within the current process.
@@ -1112,8 +1138,8 @@ async def _emergency_dm(
     ):
         # Detached task: clear_topic_state tears down the current worker's
         # route; awaiting it from inside the worker would deadlock on
-        # teardown_route's inflight.wait().
-        asyncio.create_task(
+        # teardown_route's inflight.wait(). Strong-ref retained (finding 23).
+        _spawn_background(
             _orphan_window_for_dead_topic(bot, user_id, thread_id, window_id, outcome)
         )
     display = session_manager.get_display_name(window_id) if window_id else "unknown"
@@ -2638,6 +2664,46 @@ async def _convert_status_to_content(
     # route_runtime's perspective the status card is no longer visible (mq
     # has no record of an editable status surface).
     route_runtime.mark_status_card_cleared((user_id, thread_id_or_0, stored_wid))
+    try:
+        return await _convert_status_to_content_inner(
+            bot,
+            user_id,
+            thread_id_or_0,
+            window_id,
+            content_text,
+            msg_id=msg_id,
+            stored_wid=stored_wid,
+            ref_role=ref_role,
+            ref_content_type=ref_content_type,
+        )
+    except RetryAfter:
+        # Wave-4 P3-1: the entry was popped (and the card marked cleared)
+        # BEFORE the awaited edit/delete, so a RetryAfter raise would leave
+        # the retry seeing no status entry — it would send fresh and strand
+        # the visible card. Restore the popped tracking (and re-mirror the
+        # route_runtime flag) before re-raising so the retry re-converts the
+        # SAME card.
+        _status_msg_info[skey] = info
+        route_runtime.mark_status_card_published(
+            (user_id, thread_id_or_0, stored_wid), msg_id
+        )
+        raise
+
+
+async def _convert_status_to_content_inner(
+    bot: Bot,
+    user_id: int,
+    thread_id_or_0: int,
+    window_id: str,
+    content_text: str,
+    *,
+    msg_id: int,
+    stored_wid: str,
+    ref_role: str,
+    ref_content_type: str,
+) -> int | None:
+    """Body of ``_convert_status_to_content`` after the pop (see wrapper)."""
+    skey = (user_id, thread_id_or_0)
     thread_id = thread_id_or_0 if thread_id_or_0 != 0 else None
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     if stored_wid != window_id:
@@ -2691,8 +2757,29 @@ async def _convert_status_to_content(
         role=ref_role,
         content_type=ref_content_type,
     )
-    if outcome is TopicSendOutcome.OK:
+    if outcome in (TopicSendOutcome.OK, TopicSendOutcome.MESSAGE_NOT_MODIFIED):
+        # MESSAGE_NOT_MODIFIED is caller-success (see message_sender):
+        # Telegram refused the edit because the body ALREADY renders this
+        # exact content — that IS the converted message. Returning None here
+        # would make the caller fresh-send the same part (duplicate content
+        # next to the still-visible card). Pre-existing on main too — main's
+        # version also only returned msg_id on OK. topic_edit flips the
+        # provenance row on this outcome as well, so the post-state matches
+        # OK exactly (entry popped, card cleared, row repurposed).
         return msg_id
+    # Finding 17: the failed repurposing edit left the old status card
+    # visible but untracked (popped above) — a permanent stale "🟡 Busy"
+    # bubble with no self-heal. Best-effort delete it, mirroring the two
+    # earlier delete branches.
+    await topic_delete(
+        bot,
+        op="status",
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=effective_thread_id,
+        window_id=stored_wid,
+        message_id=msg_id,
+    )
     return None
 
 
@@ -3224,3 +3311,9 @@ def reset_for_tests() -> None:
             if not task.done():
                 task.cancel()
         task_map.clear()
+    # Task SET: the strong-ref detached background tasks (finding 23) —
+    # same cancel-then-clear ordering.
+    for task in list(_background_tasks):
+        if not task.done():
+            task.cancel()
+    _background_tasks.clear()

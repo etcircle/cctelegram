@@ -89,7 +89,16 @@ async def test_reset_clears_all_maps_and_cancels_tasks() -> None:
         getattr(mq, name)[("sentinel", name)] = task
         assert getattr(mq, name), f"seed failed for {name}"
 
+    # Task SET (finding 23): a real task in the strong-ref background set.
+    bg_task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(3600))
+    tasks.append(bg_task)
+    mq._background_tasks.add(bg_task)
+
     mq.reset_for_tests()
+
+    assert len(mq._background_tasks) == 0, (
+        "_background_tasks not cleared by reset_for_tests()"
+    )
 
     # (a) Every map / set is empty.
     for name in _DICT_NAMES:

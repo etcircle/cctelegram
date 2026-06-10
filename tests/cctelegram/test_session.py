@@ -283,3 +283,34 @@ class TestIsWindowId:
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+
+
+class TestLoadStateRobustness:
+    """Finding 19: an unreadable ``state.json`` must not crash construction.
+
+    The singleton constructs at module import; an OSError raised by
+    ``read_text`` (permissions, I/O error) previously escaped ``_load_state``
+    and put launchd into a crash loop. The except tuple must include OSError
+    (matching the file's other readers) and degrade to empty state.
+    """
+
+    def test_unreadable_state_file_degrades_to_empty_state(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from cctelegram.config import config
+
+        # A directory: ``exists()`` is True, ``read_text()`` raises
+        # IsADirectoryError (an OSError) — robust even when running as root,
+        # unlike a chmod-000 file.
+        state_dir = tmp_path / "state.json"
+        state_dir.mkdir()
+        monkeypatch.setattr(config, "state_file", state_dir)
+        monkeypatch.setattr(SessionManager, "_save_state", lambda self: None)
+
+        mgr = SessionManager()  # must not raise
+
+        assert mgr.window_states == {}
+        assert mgr.user_window_offsets == {}
+        assert mgr.thread_bindings == {}
+        assert mgr.window_display_names == {}
+        assert mgr.group_chat_ids == {}
