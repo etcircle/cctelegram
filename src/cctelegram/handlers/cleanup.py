@@ -60,6 +60,17 @@ async def clear_topic_state(
       - Topic delete + window killed → ``drop_pending=True``.
       - Stale-binding GC (window killed externally) → ``drop_pending=True``.
     """
+    # Cancel any background ``!``-command pane-capture task for this topic
+    # (review finding 20). Without this, a ≤30s capture loop keeps posting the
+    # OLD window's output into a rebound topic after close/delete/stale-binding
+    # GC — and /unbind, which also routes through clear_topic_state. Lazy
+    # import: inbound_telegram pulls in the heavy handler stack and this module
+    # is imported early by status_polling (mirrors the message_queue→cleanup
+    # lazy-import precedent).
+    from .inbound_telegram import _cancel_bash_capture
+
+    _cancel_bash_capture(user_id, thread_id)
+
     # Tear down any per-route queue first so its in-flight task can record
     # _tool_msg_ids before we sweep them below.
     for route in routes_for_topic(user_id, thread_id):

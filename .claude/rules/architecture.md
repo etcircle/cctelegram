@@ -205,6 +205,13 @@ State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
                              SAME file. Removed on AUQ/EPM resolution
                              (forget_ask_tool_input) / session replacement /
                              /clear / topic close; 1h startup GC backstop.
+  images/ + files/         ─ downloaded photo/document attachments forwarded to
+                             Claude; dir mode 0700, downloads chmod'd 0600 after
+                             write (uploads can carry sensitive content). The
+                             dirs are create-and-REPAIRED to 0700 at import
+                             (mkdir mode is a no-op on an existing dir, so an
+                             upgraded install's 0755 is tightened); a chmod
+                             OSError logs a WARNING and never fails the download.
   message_refs.db          ─ SQLite provenance index for reply-context resolution
   log-archive/             ─ gzipped rotations (only if rotation LaunchAgent installed)
 ```

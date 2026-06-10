@@ -333,13 +333,40 @@ async def _list_unbound_windows(
     ]
 
 
+def _ensure_private_media_dir(path: Path) -> Path:
+    """Create-and-repair an attachment dir at mode 0700 and return it.
+
+    User uploads can carry sensitive content, so these dirs follow the same
+    0700/0600 posture as every other sensitive store (auq_pending/,
+    msg_display/). The chmod ALWAYS runs — ``mkdir(mode=...)`` is a no-op on
+    an existing dir, so an upgraded install's loose 0755 dir must be
+    repaired. OSError → log WARNING + continue (never silent, never fatal).
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError as e:
+        logger.warning("could not ensure %s at mode 0700: %s", path, e)
+    return path
+
+
+def _restrict_download_perms(path: Path) -> None:
+    """Chmod a downloaded attachment to 0600 (owner-only).
+
+    Downloads land with umask defaults (0644); tighten after write. OSError →
+    log WARNING + continue — never fail the download over a perms repair.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError as e:
+        logger.warning("could not chmod %s to mode 0600: %s", path, e)
+
+
 # --- Image directory for incoming photos ---
-_IMAGES_DIR = app_dir() / "images"
-_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+_IMAGES_DIR = _ensure_private_media_dir(app_dir() / "images")
 
 # --- File directory for incoming documents ---
-_FILES_DIR = app_dir() / "files"
-_FILES_DIR.mkdir(parents=True, exist_ok=True)
+_FILES_DIR = _ensure_private_media_dir(app_dir() / "files")
 
 
 async def _apply_reply_context(
@@ -437,6 +464,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
     file_path = _IMAGES_DIR / filename
     await tg_file.download_to_drive(file_path)
+    _restrict_download_perms(file_path)
 
     caption = update.message.caption or ""
     media_group_id = update.message.media_group_id
@@ -707,6 +735,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     tg_file = await document.get_file()
     await tg_file.download_to_drive(file_path)
+    _restrict_download_perms(file_path)
 
     caption = update.message.caption or ""
     media_group_id = update.message.media_group_id
@@ -912,6 +941,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
+    # Must be in a named topic — rejected BEFORE the cross-thread stale-picker
+    # guards below (matching photo_handler/document_handler ordering). PTB
+    # user_data is per-user across chats, so a stray DM/General text would
+    # otherwise evaluate ``pending_tid == None`` → False in those guards and
+    # destroy another topic's in-progress picker flow (clearing its browse
+    # state and deleting its pending attachment files) before dead-ending
+    # here anyway (review finding 8). A DM/General message must touch NOTHING.
+    if thread_id is None:
+        await safe_reply(
+            update.message,
+            "❌ Please use a named topic. Create a new topic to start a session.",
+        )
+        return
+
     text = update.message.text
 
     # §2.5.1: render any reply-context BEFORE the _pending_thread_text stash
@@ -982,14 +1025,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             clear_ignored_stale_threads=False,
         )
         _remember_ignored_stale_thread_id(context.user_data, stale_thread_id)
-
-    # Must be in a named topic
-    if thread_id is None:
-        await safe_reply(
-            update.message,
-            "❌ Please use a named topic. Create a new topic to start a session.",
-        )
-        return
 
     if wid is None:
         # Unbound topic — always show the directory browser. If unbound
