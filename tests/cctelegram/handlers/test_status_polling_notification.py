@@ -21,6 +21,7 @@ Covers the poller seam (plan v2 B4 + v3 B1d + v4 fix 2):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -354,6 +355,52 @@ async def test_running_capture_within_margin_does_not_clear(_env, mock_bot):
     assert snap.run_state is RunState.WAITING_ON_USER
     assert snap.typing_eligible is False
     assert path.exists()  # nothing cleared → nothing unlinked
+
+
+async def test_slow_capture_observing_within_margin_does_not_clear(
+    _env, mock_bot, monkeypatch
+):
+    """Gate-r2 false-clear race: a capture that STARTS (observes the
+    pre-prompt running chrome) inside the margin but RETURNS after it must
+    NOT clear. ``capture_wall`` is stamped BEFORE the capture starts — a
+    conservative lower bound on the observation time — so a slow capture
+    cannot smuggle an inside-the-margin frame past the qualification.
+    """
+    monkeypatch.setattr(status_polling, "NOTIFY_PANE_CLEAR_MARGIN_S", 0.2)
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    set_at = time.time()  # notification fires now; capture starts immediately
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=set_at, generation="g1"
+    )
+    path = _write_record(_env, ts=set_at, generation="g1")
+
+    async def _slow_capture(_wid):
+        # Frame "observed" at call time (inside the margin); return is
+        # delayed past the margin — the post-return clock must not be used.
+        await asyncio.sleep(0.35)
+        return _ACTIVE_PANE
+
+    window = MagicMock()
+    window.window_id = _WID
+    with (
+        patch.object(status_polling, "tmux_manager") as mock_tmux,
+        patch.object(status_polling, "enqueue_status_update", AsyncMock()),
+        patch.object(
+            status_polling.session_manager,
+            "resolve_session_for_window",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        mock_tmux.find_window_by_id = AsyncMock(return_value=window)
+        mock_tmux.capture_pane = AsyncMock(side_effect=_slow_capture)
+        await status_polling.update_status_message(
+            mock_bot, user_id=_USER, window_id=_WID, thread_id=_THREAD
+        )
+
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert path.exists()
 
 
 async def test_idle_pane_after_set_at_does_not_clear(_env, mock_bot):

@@ -489,17 +489,21 @@ async def update_status_message(
         await _process_idle_clear_only(bot, user_id, window_id, thread_id, skip_status)
         return
 
+    # Wall-clock stamp taken BEFORE the capture starts: the pane frame is
+    # observed somewhere between this instant and the await's return, so the
+    # pre-stamp is a conservative LOWER bound on the observation time. The
+    # Wave B notification clear below requires ``capture_wall > set_at +
+    # margin`` — with a pre-stamp this implies the frame itself was observed
+    # after the margin; a post-return stamp would let a slow capture that
+    # observed the old running chrome INSIDE the margin clear the bit
+    # (cumulative-gate r2 false-clear race). Same ``time.time()`` clock the
+    # Notification hook stamps ``ts`` with.
+    capture_wall = time.time()
     pane_text = await tmux_manager.capture_pane(window.window_id)
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
     _last_pane_capture[route] = time.monotonic()
-    # Wall-clock stamp of THIS capture, recorded immediately so the Wave B
-    # notification clear below compares the capture instant (not the later
-    # check instant, which would overstate how long after ``set_at`` the
-    # frame was observed) against ``notification_set_at`` — both on the
-    # ``time.time()`` clock the Notification hook stamps ``ts`` with.
-    capture_wall = time.time()
 
     # Read the next-turn context size from the session's JSONL into the
     # route_runtime context-usage cache. The activity-digest header reads it
