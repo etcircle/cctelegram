@@ -7,6 +7,7 @@ Escape" and /usage presented pane content even when the dispatch was lost.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,6 +39,10 @@ def _make_tmux(
     pane_text: str | None = "some pane content",
 ) -> MagicMock:
     tmux = MagicMock()
+    # Wave 3b: /esc and /usage consult the per-window send lock; a bare
+    # MagicMock attribute would return a truthy ``locked()`` and trip the
+    # reject-if-held branch, so hand out a real (free) asyncio.Lock.
+    tmux.window_send_lock = MagicMock(return_value=asyncio.Lock())
     window = MagicMock()
     window.window_id = "@1"
     tmux.find_window_by_id = AsyncMock(return_value=window)

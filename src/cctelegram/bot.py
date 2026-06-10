@@ -55,6 +55,7 @@ from telegram.ext import (
 from .config import config
 from .callback_dispatcher import DispatcherAdapters, dispatch_callback
 from .callback_dispatcher.effort import build_effort_keyboard as _build_effort_keyboard
+from .callback_dispatcher.interactive import _lock_busy
 from .callback_dispatcher.screenshot import (
     build_screenshot_keyboard as _build_screenshot_keyboard,
 )
@@ -422,8 +423,28 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
 
-    # Send Escape control character (no enter)
-    if not await tmux_manager.send_keys(w.window_id, "\x1b", enter=False):
+    # Wave 3b reject-if-held (Hermes R2 P1-1 — NO bypass): while a multi-
+    # keystroke pane transaction (e.g. an AUQ pick dispatch) holds the
+    # window's send lock, an Escape slipping in mid-transaction could dismiss
+    # the picker between nav-verify and Enter and make ``_classify_advance``
+    # read the disappearance as a confirmed advance — a FALSE ``dispatched``.
+    # The locked section is bounded (~2s of settles + captures), so the brake
+    # is briefly delayed, never lost. The ``_lock_busy`` check (held OR live
+    # waiters — the release→waiter-wakeup gap counts as busy, Hermes Wave-3b
+    # P2-1) is immediately followed by the acquire with no await between them
+    # (atomic on the event loop — a genuine try-acquire); the single Escape is
+    # sent UNDER the lock and all Telegram I/O happens after release (the lock
+    # is a leaf).
+    lock = tmux_manager.window_send_lock(w.window_id)
+    if _lock_busy(lock):
+        await safe_reply(
+            update.message, "⏳ Action in progress — try again in a second"
+        )
+        return
+    async with lock:
+        # Send Escape control character (no enter)
+        sent = await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
+    if not sent:
         await safe_reply(update.message, "❌ Failed to send — window may be gone")
         return
     await safe_reply(update.message, "⎋ Sent Escape")
@@ -448,18 +469,36 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"Window '{wid}' no longer exists.")
         return
 
-    # Send /usage command to Claude Code TUI
-    if not await tmux_manager.send_keys(w.window_id, "/usage"):
-        await safe_reply(update.message, "❌ Failed to send — window may be gone")
+    # Wave 3b compound transaction (Hermes P2-5): hold the window send lock
+    # across the WHOLE send→settle→capture→dismiss sequence so no other writer
+    # (a pick dispatch, user text, a control key) can land inside the /usage
+    # modal window — and conversely /usage can't inject "/usage" + Escape into
+    # someone else's in-flight transaction. Reject-if-held rather than queue:
+    # blocking a user command behind a multi-second transaction would just
+    # pile up surprise keystrokes. All Telegram replies happen strictly AFTER
+    # release (the lock is a leaf — no Telegram I/O while held); the
+    # ``_lock_busy`` check (held OR live waiters — the release→waiter-wakeup
+    # gap counts as busy, Hermes Wave-3b P2-1) + acquire pair has no await
+    # between them (atomic on the event loop — a genuine try-acquire).
+    lock = tmux_manager.window_send_lock(w.window_id)
+    if _lock_busy(lock):
+        await safe_reply(update.message, "⏳ Window busy — try again in a second")
         return
-    # Wait for the modal to render
-    await asyncio.sleep(2.0)
-    # Capture the pane content
-    pane_text = await tmux_manager.capture_pane(w.window_id)
-    # Dismiss the modal
-    if not await tmux_manager.send_keys(
-        w.window_id, "Escape", enter=False, literal=False
-    ):
+    pane_text: str | None = None
+    dismiss_ok = False
+    async with lock:
+        # Send /usage command to Claude Code TUI
+        sent = await tmux_manager.send_keys(w.window_id, "/usage")
+        if sent:
+            # Wait for the modal to render
+            await asyncio.sleep(2.0)
+            # Capture the pane content
+            pane_text = await tmux_manager.capture_pane(w.window_id)
+            # Dismiss the modal
+            dismiss_ok = await tmux_manager.send_keys(
+                w.window_id, "Escape", enter=False, literal=False
+            )
+    if not sent or not dismiss_ok:
         # The window vanished mid-command — don't present the capture as
         # usage output with a modal possibly left stranded on the pane.
         await safe_reply(update.message, "❌ Failed to send — window may be gone")
