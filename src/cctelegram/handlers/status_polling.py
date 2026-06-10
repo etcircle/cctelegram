@@ -25,8 +25,11 @@ Key components:
   - _consume_notification_signal: Wave B Notification side-file consumption
     + the runtime notification TTL, at the TOP of the per-binding path so a
     capture-skipped tick still consumes and a 🔔 transition repaints the
-    digest the same tick; the pane idle→active edge clear lives further
-    down beside ``is_running``.
+    digest the same tick; the pane running-after-set_at clear (level +
+    NOTIFY_PANE_CLEAR_MARGIN_S, not an edge) lives further down beside
+    ``is_running``.
+  - clear_route_caches_for_topic: the topic-teardown seam for the
+    poller-local route-keyed caches, called by cleanup.clear_topic_state.
 """
 
 import asyncio
@@ -161,13 +164,56 @@ _absent_streak: dict[tuple[int, int, str], int] = {}
 _UNSEEN = object()
 _prev_run_state: dict[tuple[int, int, str], object] = {}
 
-# Per-route last pane-running observation, keyed by ``(user_id,
-# thread_id_or_0, window_id)``. Drives the Wave B notification pane-activity
-# clear: an idle→active EDGE (False → True) after ``notification_set_at``
-# means the user acted in the terminal, so the 🔔 bit is retracted +
-# the side file unlinked generation-guarded. First observation seeds only
-# (a restart must not fabricate an edge). Written only on capture ticks.
-_prev_pane_running: dict[tuple[int, int, str], bool] = {}
+# Margin between the notification's hook-fire wall clock (``set_at``) and a
+# pane capture allowed to clear it. The Wave B pane-activity clear is LEVEL +
+# time-qualified — "pane observed RUNNING at a capture taken strictly after
+# set_at + margin" — NOT an idle→active edge. Rationale (gate P2-1): the
+# adaptive watchdog capture can skip the blocked approval frame entirely, so
+# an edge requirement (prev=False → True) strands the 🔔 bit whenever the
+# last capture before the notification was already running (prev stays True,
+# post-approval frame is True→True, no edge ever fires). A blocked approval
+# prompt REPLACES the run chrome — ``is_status_active`` keys on the literal
+# ``esc to interrupt`` hint that Claude Code renders only while a run is in
+# flight (the prompt's footer shows its own dialog text instead) — so a
+# status-active capture strictly after the hook fired is positive proof the
+# user approved and execution resumed, independent of whether the blocked
+# frame was ever observed. The margin (> one 1s poll interval) guards the
+# one race: a capture landing the same tick the hook fired could still show
+# the pre-prompt running frame before the TUI repaints. Fail-safe: even if a
+# future Claude Code version rendered the run hint UNDER a live prompt, a
+# wrong clear only degrades 🔔 → 🟡 (the same degradation as the 30-min
+# runtime TTL) and the prompt stays discoverable on the pane — never a wrong
+# dispatch. A restart cannot fabricate a clear either: the predicate is
+# stateless across ticks (no seeded prev), and a running pane after restart
+# satisfying it means the prompt is genuinely gone.
+NOTIFY_PANE_CLEAR_MARGIN_S = 1.5
+
+
+def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
+    """Pop every poller-local route-keyed cache entry for ``(user, thread)``.
+
+    The topic-teardown seam (gate P3-1): ``cleanup.clear_topic_state`` —
+    topic close / delete / stale-binding GC / ``/unbind`` — tears down
+    message_queue, side-file, interactive, and route_runtime state, and
+    calls this so a rebound topic reusing the same route key never inherits
+    stale poller entries (a leftover ``_last_published_ui_hash`` skips the
+    first-picker content-drain barrier, a leftover ``_prev_run_state``
+    defeats the seed-without-edit repaint semantics, and a stale
+    ``_last_pane_capture`` delays the rebound's first watchdog scrape).
+    Window-scoped within the topic is unnecessary: 1 topic = 1 window, and
+    any historical window's entries under this (user, thread) are equally
+    stale. Called by ``cleanup`` via a lazy import (this module imports
+    ``cleanup`` at the top, so the reverse edge must stay function-local).
+    """
+    caches = (
+        _last_pane_capture,
+        _last_published_ui_hash,
+        _absent_streak,
+        _prev_run_state,
+    )
+    for cache in caches:
+        for key in [k for k in cache if k[0] == user_id and k[1] == thread_id_or_0]:
+            cache.pop(key, None)
 
 
 async def _consume_notification_signal(
@@ -380,7 +426,7 @@ async def update_status_message(
         # Drop the watchdog entry so a re-bind starts fresh.
         _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
         _last_published_ui_hash.pop((user_id, thread_id or 0, window_id), None)
-        _prev_pane_running.pop((user_id, thread_id or 0, window_id), None)
+        _absent_streak.pop((user_id, thread_id or 0, window_id), None)
         # Best-effort teardown of the poller-local repaint-dedup cache (the only
         # _prev_run_state pop; status_polling-local, so import-safe — NOT from
         # message_queue, which would invert the status_polling → message_queue
@@ -448,6 +494,12 @@ async def update_status_message(
         # Transient capture failure - keep existing status message
         return
     _last_pane_capture[route] = time.monotonic()
+    # Wall-clock stamp of THIS capture, recorded immediately so the Wave B
+    # notification clear below compares the capture instant (not the later
+    # check instant, which would overstate how long after ``set_at`` the
+    # frame was observed) against ``notification_set_at`` — both on the
+    # ``time.time()`` clock the Notification hook stamps ``ts`` with.
+    capture_wall = time.time()
 
     # Read the next-turn context size from the session's JSONL into the
     # route_runtime context-usage cache. The activity-digest header reads it
@@ -737,21 +789,24 @@ async def update_status_message(
     # interrupt", and past-tense summaries don't always omit the spinner.
     is_running = bool(status_line) and is_status_active(pane_text)
 
-    # Wave B: a pane idle→active EDGE after the notification's set_at means
-    # the user acted in the terminal — retract 🔔 + unlink the (possibly
-    # still-present) side file generation-guarded. Edge, not level: a level
-    # check would clear on the very capture frame the notification's own
-    # prompt renders under; the first observation only seeds (a restart must
-    # not fabricate an edge). Placed before the ``skip_status`` return so a
-    # busy queue can't defer the clear.
-    prev_running = _prev_pane_running.get(route)
-    _prev_pane_running[route] = is_running
-    if is_running and prev_running is False:
+    # Wave B: a pane observed RUNNING at a capture taken strictly after
+    # ``set_at + NOTIFY_PANE_CLEAR_MARGIN_S`` means the user acted in the
+    # terminal (the blocked prompt replaces the run chrome, so a
+    # status-active frame after the hook fired is positive proof execution
+    # resumed) — retract 🔔 + unlink the (possibly still-present) side file
+    # generation-guarded. Level + margin, NOT an idle→active edge: the
+    # adaptive capture can skip the blocked frame, so an edge requirement
+    # strands the bit when the last pre-notification capture was already
+    # running (gate P2-1); the margin keeps a same-tick capture of the
+    # pre-prompt frame from clearing early (see NOTIFY_PANE_CLEAR_MARGIN_S).
+    # Placed before the ``skip_status`` return so a busy queue can't defer
+    # the clear.
+    if is_running:
         snap = route_runtime.snapshot(route)
         if (
             snap.notification_pending
             and snap.notification_set_at is not None
-            and time.time() > snap.notification_set_at
+            and capture_wall > snap.notification_set_at + NOTIFY_PANE_CLEAR_MARGIN_S
         ):
             cleared_gen = snap.notification_generation
             await route_runtime.mark_notification_cleared(route)
@@ -959,20 +1014,15 @@ async def _poll_one_binding(bot: Bot, user_id: int, thread_id: int, wid: str) ->
         if not w:
             session_manager.unbind_thread(user_id, thread_id)
             await clear_topic_state(user_id, thread_id, bot)
-            # Pop ALL four poller-local route-keyed caches (review finding 14).
+            # Pop ALL poller-local route-keyed caches (review finding 14).
             # This branch returns before update_status_message, so its
             # window-gone teardown never runs for a stale binding — without
-            # these pops a rebound topic reusing the same route key inherits
-            # stale entries: a leftover ``_last_published_ui_hash`` skips the
-            # first-picker content-drain ordering barrier, a leftover
-            # ``_prev_run_state`` defeats the seed-without-edit semantics, and
-            # ``_last_pane_capture`` delays the rebound's first watchdog scrape.
-            route = (user_id, thread_id or 0, wid)
-            _last_pane_capture.pop(route, None)
-            _last_published_ui_hash.pop(route, None)
-            _absent_streak.pop(route, None)
-            _prev_run_state.pop(route, None)
-            _prev_pane_running.pop(route, None)
+            # this a rebound topic reusing the same route key inherits stale
+            # entries (see clear_route_caches_for_topic). clear_topic_state
+            # above also runs the helper (gate P3-1 — it covers topic close /
+            # delete / /unbind too); calling it here keeps this sweep
+            # self-sufficient and is idempotent.
+            clear_route_caches_for_topic(user_id, thread_id or 0)
             logger.info(
                 "Cleaned up stale binding: user=%d thread=%d window_id=%s",
                 user_id,

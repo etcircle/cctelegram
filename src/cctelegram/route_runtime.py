@@ -328,8 +328,9 @@ class _RouteState:
     # docs. Set/cleared ONLY under the route lock (it transitions run_state
     # through the deriver). Cleared by: a ``user`` lifecycle event
     # (unconditional), a strictly-NEWER-timestamped tool_result / end-of-turn
-    # / assistant event, ``mark_notification_cleared`` (pane-activity edge +
-    # runtime TTL), ``mark_session_reset``, and route teardown.
+    # / assistant event, ``mark_notification_cleared`` (pane observed RUNNING
+    # sufficiently after set_at + runtime TTL), ``mark_session_reset``, and
+    # route teardown.
     notification_pending: bool = False
     notification_set_at: float | None = None
     notification_generation: str | None = None
@@ -948,8 +949,11 @@ async def mark_notification_pending(
 async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
     """Retract the notification bit — the poller-side programmatic clear.
 
-    Called by ``status_polling`` on the pane idle→active edge (the user
-    acted in the terminal) and on runtime-TTL expiry, and usable by any
+    Called by ``status_polling`` when the pane is observed RUNNING at a
+    capture sufficiently after ``notification_set_at`` (the user acted in
+    the terminal — level + margin, not an idle→active edge; see
+    ``status_polling.NOTIFY_PANE_CLEAR_MARGIN_S``) and on runtime-TTL
+    expiry, and usable by any
     teardown that holds a route. Re-derives the run state when the bit was
     holding a WAITING with no transcript-interactive id open (a still-set
     pane bit keeps WAITING — independent clears); a transcript-set WAITING

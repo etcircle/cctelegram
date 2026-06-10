@@ -119,6 +119,18 @@ async def clear_topic_state(
     # (hermes round-2 P2). route_runtime owns its own topic-teardown seam.
     route_runtime.clear_routes_for_topic(user_id, thread_id or 0)
 
+    # Pop the status poller's route-local caches for this topic (gate P3-1) —
+    # a rebound topic reusing the same route key must not inherit a stale
+    # ``_last_published_ui_hash`` (skips the first-picker content-drain
+    # barrier), ``_prev_run_state`` (defeats seed-without-edit repaint
+    # semantics), ``_last_pane_capture`` (delays the first watchdog scrape),
+    # or ``_absent_streak``. Lazy import: status_polling imports this module
+    # at the top, so the reverse edge must stay function-local (same
+    # precedent as the inbound_telegram import above).
+    from .status_polling import clear_route_caches_for_topic
+
+    clear_route_caches_for_topic(user_id, thread_id or 0)
+
     # Clear pending thread state from user_data
     if user_data is not None:
         if user_data.get("_pending_thread_id") == thread_id:

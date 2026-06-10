@@ -303,6 +303,31 @@ async def test_subagent_activity_never_overrides_pane_bit_waiting():
     assert snap.interactive_pending is True
 
 
+async def test_subagent_activity_never_overrides_notification_set_waiting():
+    """A×B seam (gate P2-3): a notification-set WAITING_ON_USER (Wave B) is
+    never masked by later sidechain activity (Wave A) — the route stays
+    WAITING, typing stays off, and the notification bit / set_at /
+    generation and open/stash state are all untouched."""
+    await _open_agent_tool()  # RUNNING_TOOL with the Workflow-shaped open id
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=1000.0, generation="gen-1"
+    )
+    assert result is route_runtime.NotificationMarkResult.COMMITTED_LIVE
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    open_before = dict(_st().open_tools)
+    stash_before = dict(_st().suspended_tools)
+
+    snap = await route_runtime.mark_subagent_activity(ROUTE)
+
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.typing_eligible is False
+    assert snap.notification_pending is True
+    assert snap.notification_set_at == 1000.0
+    assert snap.notification_generation == "gen-1"
+    assert _st().open_tools == open_before
+    assert _st().suspended_tools == stash_before
+
+
 # ── keep-alive + race semantics (A4 / narrowed card claim) ──────────────
 
 

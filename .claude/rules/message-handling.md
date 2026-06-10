@@ -141,8 +141,15 @@ and derives WAITING (the second stash-restore path). CLEAR: a transcript
 only when their JSONL timestamp is strictly NEWER than `notification_set_at`
 (None/older preserves — buffered pre-notification JSONL must not re-hide the
 wait; a preserved bit at end-of-turn keeps WAITING instead of idling; an
-unknown `tool_result` preserves); the poller's pane idle→active EDGE after
-`set_at`; the `NOTIFY_TTL_SECONDS` (30 min) runtime TTL evaluated from the
+unknown `tool_result` preserves); the poller's pane-RUNNING observation at a
+capture taken strictly after `set_at + NOTIFY_PANE_CLEAR_MARGIN_S` (LEVEL +
+margin, NOT an idle→active edge — the adaptive capture can skip the blocked
+approval frame, so an edge requirement strands the bit when the last
+pre-notification capture was already running; the blocked prompt replaces
+the run chrome, so a status-active frame sufficiently after the hook fired
+is positive proof the user approved, and the margin keeps a same-tick
+capture of the pre-prompt frame from clearing early); the
+`NOTIFY_TTL_SECONDS` (30 min) runtime TTL evaluated from the
 SNAPSHOT every tick independent of side-file existence (pending-without-
 set_at = invariant violation = expired); and route teardown
 (`mark_session_reset` / `clear_route` / `clear_routes_for_topic`). Side-file

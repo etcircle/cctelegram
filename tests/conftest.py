@@ -729,7 +729,6 @@ def _reset_status_polling() -> None:
         "_last_published_ui_hash",
         "_absent_streak",
         "_prev_run_state",
-        "_prev_pane_running",
     ):
         attr = getattr(sp, name, None)
         if isinstance(attr, dict):

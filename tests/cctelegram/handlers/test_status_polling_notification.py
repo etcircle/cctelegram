@@ -11,8 +11,12 @@ Covers the poller seam (plan v2 B4 + v3 B1d + v4 fix 2):
   - Runtime-state TTL: expiry clears even with the side file already
     gone; pending-without-set_at is treated as expired.
   - An on-disk record older than the TTL is treated absent + unlinked.
-  - Pane idle→active edge after ``notification_set_at`` clears the bit
-    (generation-guarded unlink of a still-present file).
+  - Pane observed RUNNING at a capture sufficiently after
+    ``notification_set_at`` clears the bit (generation-guarded unlink of a
+    still-present file) — LEVEL + time-qualified, NOT an idle→active edge
+    (gate P2-1: the adaptive capture can skip the blocked approval frame
+    entirely, so an edge requirement strands the bit when the last capture
+    before the notification was already running).
 """
 
 from __future__ import annotations
@@ -66,13 +70,11 @@ def _env(tmp_path, monkeypatch):
     route_runtime.reset_for_tests()
     status_polling._last_pane_capture.clear()
     status_polling._prev_run_state.clear()
-    status_polling._prev_pane_running.clear()
     yield tmp_path
     session_manager.window_states.pop(_WID, None)
     route_runtime.reset_for_tests()
     status_polling._last_pane_capture.clear()
     status_polling._prev_run_state.clear()
-    status_polling._prev_pane_running.clear()
 
 
 def _write_record(
@@ -277,31 +279,96 @@ async def test_notification_set_repaints_digest_same_tick(_env, mock_bot):
     mock_refresh.assert_awaited_once()
 
 
-# ── pane idle→active edge clear ──────────────────────────────────────────
+# ── pane running-after-set_at clear (gate P2-1: level + margin, NOT edge) ─
 
 
-async def test_pane_active_edge_clears_bit_and_unlinks(_env, mock_bot):
+async def test_pane_running_after_set_at_clears_bit_and_unlinks(_env, mock_bot):
+    """A running pane at a capture sufficiently after set_at clears the bit.
+
+    The blocked approval prompt REPLACES the run chrome ("esc to interrupt"
+    is rendered only while a run is in flight), so a status-active capture
+    strictly after set_at + margin is positive proof the user approved and
+    execution resumed — no prior idle observation required.
+    """
     await route_runtime.mark_inbound_sent(_ROUTE)
     set_at = time.time() - 30
     await route_runtime.mark_notification_pending(
         _ROUTE, set_at=set_at, generation="g1"
     )
-    # The side file (same generation) is still on disk — the edge clear must
+    # The side file (same generation) is still on disk — the clear must
     # unlink it generation-guarded.
     path = _write_record(_env, ts=set_at, generation="g1")
-    status_polling._prev_pane_running[_ROUTE] = False
     await _tick(mock_bot, pane_text=_ACTIVE_PANE)
     snap = route_runtime.snapshot(_ROUTE)
     assert snap.notification_pending is False
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
     assert not path.exists()
 
 
-async def test_first_active_observation_is_not_an_edge(_env, mock_bot):
+async def test_stranded_bit_clears_without_idle_frame_ever_captured(_env, mock_bot):
+    """The exact gate-P2-1 repro: pane running → notification set with NO
+    blocked/idle frame ever captured (Wave A adaptive capture skipped it) →
+    pane running again after set_at + margin → the bit MUST clear.
+
+    Under the old idle→active EDGE requirement the first tick seeded
+    prev=True, the second tick was True→True, no edge ever fired, and the
+    route stranded WAITING_ON_USER / typing-off until newer transcript
+    activity or the 30m TTL.
+    """
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    # Tick 1: pane already running BEFORE the notification (the pre-prompt
+    # frame) — the only pane observation the poller ever gets pre-approval.
+    await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    set_at = time.time() - 30
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=set_at, generation="g1"
+    )
+    path = _write_record(_env, ts=set_at, generation="g1")
+    assert route_runtime.snapshot(_ROUTE).run_state is RunState.WAITING_ON_USER
+    # Tick 2: post-approval — pane running again. The blocked frame between
+    # the two ticks was never captured.
+    status_polling._last_pane_capture.pop(_ROUTE, None)  # force a capture
+    await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
+    assert not path.exists()
+
+
+async def test_running_capture_within_margin_does_not_clear(_env, mock_bot):
+    """Guard: a running capture at/before set_at + margin must NOT clear —
+    it can be the pre-prompt frame captured the same tick the hook fired
+    (the run chrome was still on the pane when the prompt began rendering).
+    """
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    set_at = time.time()  # notification just fired
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=set_at, generation="g1"
+    )
+    path = _write_record(_env, ts=set_at, generation="g1")
+    await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.typing_eligible is False
+    assert path.exists()  # nothing cleared → nothing unlinked
+
+
+async def test_idle_pane_after_set_at_does_not_clear(_env, mock_bot):
+    """A NON-running capture after set_at preserves the bit — the prompt is
+    (presumably) still on the pane; only positive running proof clears."""
+    idle_pane = (
+        "✻ Cooked for 2s\n"
+        "──────────────────────────────────────\n"
+        "❯ \n"
+        "──────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
     await route_runtime.mark_inbound_sent(_ROUTE)
     await route_runtime.mark_notification_pending(
         _ROUTE, set_at=time.time() - 30, generation="g1"
     )
-    # No prior pane-running observation → seed only, never clear.
-    await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    await _tick(mock_bot, pane_text=idle_pane)
     assert route_runtime.snapshot(_ROUTE).notification_pending is True
-    assert status_polling._prev_pane_running.get(_ROUTE) is True
