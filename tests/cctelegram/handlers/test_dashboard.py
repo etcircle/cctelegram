@@ -594,6 +594,57 @@ async def test_renderer_excludes_unresolvable_chat_binding():
     assert "ghost-repo" not in dashboard.render_dashboard(UID, CHAT_B)
 
 
+@pytest.mark.asyncio
+async def test_dashboard_claim_never_poisons_group_chat_mapping():
+    """R2 P1 (the poisoning path): thread ids are CHAT-LOCAL, so /dashboard in
+    chat B's UNBOUND thread 7 must NOT overwrite the (user, thread 7) → chat A
+    mapping written by chat A's bound-topic message seams. If it did,
+    render_dashboard's chat filter would include chat A's binding on chat B's
+    dashboard — a cross-chat privacy leak."""
+    # Bound topic in chat A, thread 7 — the genuine seam wrote mapping → A.
+    _bind(UID, 7, "@1", "private-a", chat_id=CHAT)
+
+    bot = FakeBot()
+    # /dashboard in chat B, same (chat-local) thread number 7, unbound there.
+    await dashboard.dashboard_command(
+        make_update_command("dashboard", thread_id=7, chat_id=CHAT_B),
+        make_context(bot=bot),
+    )
+
+    # The bound topic's mapping still resolves chat A — never overwritten.
+    assert session_manager.get_group_chat_id(UID, 7) == CHAT
+    # Chat B's dashboard does NOT list chat A's binding (posted message + render).
+    sends = [s for s in bot.sent if s.method == "send_message"]
+    assert len(sends) == 1
+    assert "private-a" not in sends[0].kwargs["text"]
+    assert "private-a" not in dashboard.render_dashboard(UID, CHAT_B)
+    # Chat A's own dashboard still renders its binding.
+    assert "private-a" in dashboard.render_dashboard(UID, CHAT)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_send_targets_command_chat_not_mapping():
+    """The dashboard's own send/persist uses the record's explicit chat (the
+    chat the command came from), never the (user, thread)→chat mapping: claim
+    in chat B posts with chat_id B even though (UID, 7) maps to chat A."""
+    session_manager.set_group_chat_id(UID, 7, CHAT)  # (UID, 7) → chat A
+
+    bot = FakeBot()
+    await dashboard.dashboard_command(
+        make_update_command("dashboard", thread_id=7, chat_id=CHAT_B),
+        make_context(bot=bot),
+    )
+
+    sends = [s for s in bot.sent if s.method == "send_message"]
+    assert len(sends) == 1
+    assert sends[0].kwargs["chat_id"] == CHAT_B
+    assert sends[0].kwargs.get("message_thread_id") == 7
+    rec = session_manager.get_dashboard(CHAT_B, UID)
+    assert rec is not None and rec["msg_id"] == sends[0].message_id
+    # And the mapping was left alone.
+    assert session_manager.get_group_chat_id(UID, 7) == CHAT
+
+
 def test_clear_dashboards_in_thread_is_chat_scoped():
     """P2-3: thread ids are chat-local — clearing (CHAT, 7) must not touch a
     dashboard hosted in CHAT_B's numerically-identical thread 7."""
