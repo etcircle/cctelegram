@@ -485,6 +485,51 @@ concurrent append refreshing the mtime within `max_age` → skip). The predicate
 NEVER imported into `md_capture` (it stays a leaf — only stdlib + `utils`). Pull-only
 throughout (no observer; c313657 forbidden).
 
+## Cross-topic dashboard (Wave C)
+
+One passive, owner-filtered overview message per `(chat_id, owner_user_id)`,
+owned by `handlers/dashboard.py` and persisted as the `dashboards` key in
+`state.json` through SessionManager's single `_load_state`/`_save_state` path
+(sync named mutators: `get/set/clear_dashboard`, `update_dashboard_msg_id`,
+`set_dashboard_pinned`). `/dashboard` in any topic claims THAT topic as the
+host (DM/General rejected; re-run elsewhere MOVES it, old message deleted
+best-effort; `/dashboard pin` is the only pin path — never automatic, persisted
+only on pin-API success). The whole Telegram-I/O-spanning claim/move/self-heal
+flow serializes on a per-`(chat, owner)` `asyncio.Lock` with a post-send
+loser-cleanup re-read (pre-C fix 1).
+
+**Update driver is PULL-ONLY**: `maybe_refresh_dashboards` rides the existing
+1s status-poll sweep (called once per sweep, not per binding — no observer,
+c313657 forbidden). It renders the owner's view from
+`session_manager.iter_thread_bindings()` + `route_runtime.snapshot(route)`,
+hashes the rendered body, and edits only on change — the hash covers state
+lines, display names, and the binding set, so run-state transitions AND
+bind/unbind/rename all repaint without a dedicated trigger; ages are
+minute-coarse so the hash is stable within the minute (the implicit 60s age
+tick). `MESSAGE_NOT_MODIFIED` is success (W8 precedent); edit-404 self-heals
+(re-send + `update_dashboard_msg_id` under the lock); a topic-shaped outcome
+(`TOPIC_NOT_FOUND`/`TOPIC_CLOSED`/`FORBIDDEN`) clears the record — never a
+self-heal loop into a dead topic — and `cleanup.clear_topic_state` →
+`dashboard.clear_dashboards_in_thread(thread_id)` covers the host topic
+closing (the host may have no bound window, so binding-centric cleanup alone
+would miss it; pre-C fix 3).
+
+**🔔 unanswered-turn derivation**: a route renders 🔔 when `run_state` is
+`WAITING_ON_USER`, OR when it is idle and
+`snapshot.last_assistant_turn_ended_at > snapshot.last_user_turn_at` — two
+WALL-CLOCK stamps on the same `time.time()` clock. `last_user_turn_at` is
+mirrored into route_runtime INSIDE `message_queue.set_route_user_turn_at`
+(single writer ⇒ same-ts by construction) at the PRE-SEND delivery seams;
+`last_assistant_turn_ended_at` is written only by the authoritative
+end-of-turn branch from the event's JSONL timestamp, max-monotonic by event
+time (out-of-order resume/rewind events never regress it; `None` timestamp
+never updates). Either stamp `None` ⇒ never classified unanswered — the
+documented **restart degradation**: the stamps are in-memory, so after a
+restart the dashboard renders state-only until fresh turns repopulate them.
+Boundary: `dashboard.py` sends via `message_sender` helpers only and never
+touches message-queue internals or mutates route_runtime. Visibility is
+honest: owner-filtered, NOT private — any forum member can read the message.
+
 ## Rate Limiting
 
 - `AIORateLimiter(max_retries=5)` on the Application (30/s global)

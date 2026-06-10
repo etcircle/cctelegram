@@ -460,9 +460,20 @@ def set_route_user_turn_at(
     ``captured_at``, so ``select_fresh_prose(not_before=...)`` can compare them
     directly: the current turn's prose finalizes AFTER this stamp, a prior
     turn's leftover prose BEFORE it.
+
+    Wave C: the SAME ``ts`` is mirrored into
+    ``route_runtime.stamp_user_turn`` so the dashboard's unanswered-turn
+    derivation (``last_assistant_turn_ended_at > last_user_turn_at``)
+    compares two stamps on one clock. The mirror lives HERE — the single
+    writer — rather than at the three delivery seams (aggregator
+    ``_send_bundle``, ``bot.forward_command_handler``, the ``/effort``
+    callback) so same-ts is guaranteed by construction and a future seam
+    can't forget it.
     """
     route = _route_for(user_id, thread_id, window_id)
-    _route_user_turn_at[route] = time.time()
+    ts = time.time()
+    _route_user_turn_at[route] = ts
+    route_runtime.stamp_user_turn(route, ts)
 
 
 def peek_route_user_turn_at(

@@ -66,6 +66,7 @@ from .interactive_ui import (
     register_clear_callback,
 )
 from .cleanup import clear_topic_state
+from .dashboard import maybe_refresh_dashboards
 from .message_queue import (
     enqueue_status_update,
     get_content_queue,
@@ -1002,6 +1003,13 @@ async def status_poll_loop(bot: Bot) -> None:
                     ),
                     return_exceptions=True,
                 )
+            # Wave C: repaint persisted dashboards ONCE per sweep (not per
+            # binding) when their rendered content changed. Pull-only — the
+            # driver reads route_runtime snapshots + bindings, hashes, and
+            # edits on change; no observer channel. Runs even with zero
+            # bindings so a fully-unbound owner's dashboard still repaints
+            # to its empty state.
+            await maybe_refresh_dashboards(bot)
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

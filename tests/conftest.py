@@ -40,6 +40,7 @@ from cctelegram.handlers import (
     attention,
     auq_ledger,
     auq_source,
+    dashboard,
     inbound_aggregator,
     interactive_ui,
     message_queue,
@@ -721,6 +722,7 @@ def _reset_session_manager() -> None:
     _real_sm.thread_bindings.clear()
     _real_sm.window_display_names.clear()
     _real_sm.group_chat_ids.clear()
+    _real_sm.dashboards.clear()
 
 
 def _reset_aggregator() -> None:
@@ -776,6 +778,7 @@ def _reset_all_handler_state() -> None:
     pick_token.reset_for_tests()
     pick_intent.reset_for_tests()
     auq_source.reset_for_tests()
+    dashboard.reset_for_tests()
     # Re-inject the production JSONL-cache getter (bot.post_init wires this
     # once at startup, but post_init doesn't run under test). Without it the
     # ``jsonl_cache`` resolver branch would no-op and the render path would

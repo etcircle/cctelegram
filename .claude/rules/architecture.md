@@ -123,6 +123,23 @@ Additional modules:
                                 residual: a quiet sidechain (no writes) + blank pane is
                                 uncovered; pane-spinner activity is the complementary
                                 signal.
+                                Wave C dashboard turn stamps: two WALL-CLOCK snapshot
+                                fields on the same time.time() clock as the delivery
+                                stamps — last_user_turn_at (written ONLY by the sync
+                                stamp_user_turn, mirrored from message_queue.
+                                set_route_user_turn_at at the PRE-SEND delivery seams;
+                                never mark_inbound_sent, which is post-send and loses
+                                the fast-transcript race) and
+                                last_assistant_turn_ended_at (written ONLY by the
+                                authoritative end-of-turn branch from the EVENT's
+                                JSONL timestamp, MAX-monotonic by event time —
+                                out-of-order resume/rewind events never regress it;
+                                None timestamp ⇒ no update, never ingest-time).
+                                Cleared on mark_session_reset / clear_route /
+                                clear_routes_for_topic; in-memory only (restart ⇒
+                                dashboard renders state-only until repopulated).
+                                last_event_at stays monotonic and is NEVER used for
+                                the 🔔 unanswered-turn classification (ages only).
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —
@@ -228,6 +245,35 @@ Handler modules (handlers/):
                         read and unlink survives); unlink_for_session is the
                         teardown seam; gc_stale is the 24h startup backstop
                         with the injected is_live_session conservative-skip.
+  dashboard.py        ─ Wave C cross-topic dashboard: one owner-filtered overview
+                        message per (chat_id, owner). Owns /dashboard (claim the
+                        invoking topic as host; re-run elsewhere MOVES it;
+                        /dashboard pin is opt-in), the pure renderer
+                        (render_dashboard — bindings filtered to the owner +
+                        route_runtime.snapshot per route; 🔔 = WAITING_ON_USER or
+                        idle with last_assistant_turn_ended_at >
+                        last_user_turn_at, both non-None; ages minute-coarse from
+                        the monotonic last_event_at), and the PULL-ONLY refresh
+                        driver maybe_refresh_dashboards (called once per
+                        status-poll sweep; rendered-content hash → edit only on
+                        change, so run-state transitions AND bind/unbind/rename
+                        repaint without an observer; MESSAGE_NOT_MODIFIED =
+                        success; edit-404 self-heals via re-send +
+                        update_dashboard_msg_id; a topic-shaped outcome clears
+                        the record — never a self-heal loop into a dead topic).
+                        A per-(chat_id, owner_id) asyncio.Lock serializes the
+                        whole Telegram-I/O-spanning claim/move/self-heal flow
+                        (pre-C fix 1) with a post-send loser-cleanup re-read.
+                        BOUNDARY: reads route_runtime.snapshot + session_manager,
+                        sends via message_sender ONLY; never enqueues status
+                        updates, never touches the message-queue module or its
+                        send-layer caches, never mutates route_runtime, registers
+                        no observer (c313657 forbidden). Persistence is
+                        SessionManager-owned (state.json "dashboards" key, sync
+                        get/set/clear/update_msg_id/set_pinned methods through
+                        the ONE _load_state/_save_state path);
+                        clear_dashboards_in_thread is the topic-teardown seam
+                        wired from cleanup.clear_topic_state.
   pick_intent.py      ─ D2 restart-recovery: durable per-callback-TOKEN AUQ pick
                         mint-intent store (leaf; imports only utils). Append-only
                         JSONL (row + tombstone lines) at pick_intent.jsonl, 24h
@@ -239,7 +285,11 @@ Handler modules (handlers/):
                         tap after a restart.
 
 State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
-  state.json               ─ thread bindings + window states + display names + read offsets
+  state.json               ─ thread bindings + window states + display names +
+                             read offsets + dashboards ("<chat_id>:<owner_id>" →
+                             {thread_id, msg_id, pinned} — the /dashboard host
+                             record; SessionManager-owned so the fixed-dict
+                             state rewrite round-trips it)
   session_map.json         ─ hook-generated window_id→session mapping (SessionStart)
   monitor_state.json       ─ poll progress (byte offset) per JSONL file
   interactive_state.json   ─ persisted picker msg ids + AUQ context markers

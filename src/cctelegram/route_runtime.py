@@ -295,6 +295,18 @@ class RouteRuntimeSnapshot:
     notification_pending: bool
     notification_set_at: float | None
     notification_generation: str | None
+    # Wave C dashboard wall-clock turn stamps — the SAME ``time.time()``
+    # clock as the delivery stamps (never mixed with the monotonic
+    # ``last_event_at``). ``last_user_turn_at`` is written by
+    # ``stamp_user_turn`` mirrored from the PRE-SEND delivery stamp seam
+    # (``message_queue.set_route_user_turn_at``); ``last_assistant_turn_ended_at``
+    # is written ONLY by the authoritative end-of-turn lifecycle branch from
+    # the EVENT's JSONL timestamp, MAX-monotonic by event time (parent JSONL
+    # is not strictly chronological under resume/rewind). Both are in-memory
+    # only: after a restart they are None and the dashboard renders
+    # state-only until fresh turns repopulate them (documented degradation).
+    last_user_turn_at: float | None
+    last_assistant_turn_ended_at: float | None
 
 
 @dataclass
@@ -334,6 +346,12 @@ class _RouteState:
     notification_pending: bool = False
     notification_set_at: float | None = None
     notification_generation: str | None = None
+    # Wave C wall-clock turn stamps (see the snapshot field docs). Written by
+    # ``stamp_user_turn`` (sync side-band, pre-send mirror) and the
+    # authoritative end-of-turn branch (max-monotonic by event time);
+    # cleared by ``mark_session_reset`` and route teardown.
+    last_user_turn_at: float | None = None
+    last_assistant_turn_ended_at: float | None = None
     # Why the route is currently idle (Wave A). "transcript" = the assistant's
     # authoritative end-of-turn; "pane" = a pane-idle reconciliation cleared an
     # ACTIVE route (the only resurrectable flavor — sidechain activity is
@@ -503,6 +521,8 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         notification_pending=st.notification_pending,
         notification_set_at=st.notification_set_at,
         notification_generation=st.notification_generation,
+        last_user_turn_at=st.last_user_turn_at,
+        last_assistant_turn_ended_at=st.last_assistant_turn_ended_at,
     )
 
 
@@ -530,6 +550,8 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         notification_pending=False,
         notification_set_at=None,
         notification_generation=None,
+        last_user_turn_at=None,
+        last_assistant_turn_ended_at=None,
     )
 
 
@@ -639,6 +661,18 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         and stop_reason in _TURN_END_REASONS
         and not st.open_tools
     ):
+        # Wave C: the authoritative end-of-turn is the ONLY writer of
+        # ``last_assistant_turn_ended_at`` — from the EVENT's JSONL wall-clock
+        # timestamp, MAX-monotonic by event time (an out-of-order older
+        # end-of-turn under resume/rewind must not regress the stamp). A
+        # ``None`` timestamp never updates it (no ingest-time fallback — the
+        # dashboard renders state-only for that route).
+        if event.timestamp is not None:
+            if (
+                st.last_assistant_turn_ended_at is None
+                or event.timestamp > st.last_assistant_turn_ended_at
+            ):
+                st.last_assistant_turn_ended_at = event.timestamp
         # End-of-turn reclaims authority from the pane bit (the turn is over).
         st.pane_interactive_pending = False
         # A transcript-ended turn never resurrects its tools — drop the stash
@@ -766,6 +800,8 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
         notification_pending=st.notification_pending,
         notification_set_at=st.notification_set_at,
         notification_generation=st.notification_generation,
+        last_user_turn_at=st.last_user_turn_at,
+        last_assistant_turn_ended_at=st.last_assistant_turn_ended_at,
     )
 
 
@@ -1222,10 +1258,37 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         st.pane_interactive_pending = False
         _clear_notification_in_place(st)
         st.suspended_tools.clear()
+        # The dead session's turn stamps go with it — the dashboard's
+        # unanswered-turn derivation must not survive a /clear.
+        st.last_user_turn_at = None
+        st.last_assistant_turn_ended_at = None
         _set_run_state(st, RunState.IDLE_CLEARED)
         st.idle_source = None
         snap = _freeze(route, st)
     return snap
+
+
+def stamp_user_turn(route: Route, ts: float) -> None:
+    """Record the wall-clock instant a user turn was DELIVERED into tmux.
+
+    Wave C: the route_runtime mirror of the pre-send delivery stamp —
+    ``message_queue.set_route_user_turn_at`` calls this with the SAME
+    ``time.time()`` value it stores, so the dashboard's unanswered-turn
+    derivation (``last_assistant_turn_ended_at > last_user_turn_at``)
+    compares two stamps on one clock. Pre-send by construction (the caller
+    stamps immediately before ``send_to_window``), NOT ``mark_inbound_sent``
+    (post-send — a fast transcript could land the end-of-turn between the
+    delivery and the stamp).
+
+    Synchronous side-band write (no run-state transition, like
+    ``mark_status_card_published``): it never marks the route ``seen`` and
+    never fabricates activity.
+    """
+    st = _state.get(route)
+    if st is None:
+        st = _RouteState()
+        _state[route] = st
+    st.last_user_turn_at = ts
 
 
 def mark_status_card_published(route: Route, msg_id: int) -> None:
@@ -1456,5 +1519,6 @@ __all__ = [
     "reset_pane_idle_clear",
     "seed_open_tools",
     "snapshot",
+    "stamp_user_turn",
     "update_context_usage",
 ]

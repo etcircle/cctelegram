@@ -121,8 +121,13 @@ async def test_non_end_of_turn_events_do_not_stamp_assistant_ended():
     await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
     await route_runtime.ingest_transcript_event(
         ROUTE,
-        _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash",
-             timestamp=1000.0),
+        _evt(
+            "assistant",
+            "tool_use",
+            tool_use_id="t1",
+            tool_name="Bash",
+            timestamp=1000.0,
+        ),
     )
     # end_turn text while a tool is open — NOT the authoritative branch.
     await route_runtime.ingest_transcript_event(ROUTE, _end_of_turn(2000.0))

@@ -29,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from unittest.mock import AsyncMock
 
 import pytest
 from telegram.error import BadRequest
@@ -333,9 +332,7 @@ async def test_concurrent_double_dashboard_single_record():
     deletes = [s for s in bot.sent if s.method == "delete_message"]
     # One live message: every send but the final winner was deleted.
     assert len(sends) - len(deletes) == 1
-    live_ids = {s.message_id for s in sends} - {
-        s.kwargs["message_id"] for s in deletes
-    }
+    live_ids = {s.message_id for s in sends} - {s.kwargs["message_id"] for s in deletes}
     assert live_ids == {rec["msg_id"]}
 
 
@@ -478,11 +475,20 @@ async def test_driver_message_not_modified_is_success():
     bot = _EditRaisesBot("Message is not modified")
     _bind(UID, 10, "@1", "repo")
     rec = await _claim(bot)
+    # Content change so the driver attempts the edit, which raises the
+    # benign "not modified" — must be treated as success.
+    await _make_state((UID, 10, "@1"), "running")
     await dashboard.maybe_refresh_dashboards(bot)
-    # Treated success: record intact, NO self-heal re-send.
+    # Treated success: record intact, NO self-heal re-send, hash advanced
+    # (the next tick does not retry the edit).
     assert session_manager.get_dashboard(CHAT, UID) == rec
     sends = [s for s in bot.sent if s.method == "send_message"]
     assert len(sends) == 1  # only the original claim
+    attempts = [s for s in bot.sent if s.method == "edit_message_text_attempt"]
+    await dashboard.maybe_refresh_dashboards(bot)
+    assert len([s for s in bot.sent if s.method == "edit_message_text_attempt"]) == len(
+        attempts
+    )
 
 
 @pytest.mark.asyncio
@@ -490,6 +496,8 @@ async def test_driver_edit_404_self_heals_and_persists_new_msg_id():
     bot = _EditRaisesBot("Message to edit not found")
     _bind(UID, 10, "@1", "repo")
     rec = await _claim(bot)
+    # Content change so the driver attempts the (failing) edit this tick.
+    await _make_state((UID, 10, "@1"), "running")
     await dashboard.maybe_refresh_dashboards(bot)
     new_rec = session_manager.get_dashboard(CHAT, UID)
     assert new_rec is not None
@@ -503,6 +511,8 @@ async def test_driver_topic_broken_clears_record_no_loop():
     bot = _EditRaisesBot("Message thread not found")
     _bind(UID, 10, "@1", "repo")
     await _claim(bot)
+    # Content change so the driver attempts the (failing) edit this tick.
+    await _make_state((UID, 10, "@1"), "running")
     await dashboard.maybe_refresh_dashboards(bot)
     assert session_manager.get_dashboard(CHAT, UID) is None
     # No self-heal send into the dead topic.
@@ -577,7 +587,9 @@ async def test_two_owners_same_chat_independent_dashboards(monkeypatch):
     assert rec_a is not None and rec_b is not None
     assert rec_a["msg_id"] != rec_b["msg_id"]
 
-    sends = {s.message_id: s.kwargs["text"] for s in bot.sent if s.method == "send_message"}
+    sends = {
+        s.message_id: s.kwargs["text"] for s in bot.sent if s.method == "send_message"
+    }
     assert "mine" in sends[rec_a["msg_id"]]
     assert "theirs" not in sends[rec_a["msg_id"]]
     assert "theirs" in sends[rec_b["msg_id"]]

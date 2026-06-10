@@ -176,6 +176,12 @@ class SessionManager:
     window_states: dict[str, WindowState] = field(default_factory=dict)
     user_window_offsets: dict[int, dict[str, int]] = field(default_factory=dict)
     thread_bindings: dict[int, dict[int, str]] = field(default_factory=dict)
+    # "<chat_id>:<owner_user_id>" -> {"thread_id": int, "msg_id": int,
+    # "pinned": bool} — the Wave C cross-topic dashboard record (one dashboard
+    # message per (chat, owner)). Owned HERE so it round-trips through the ONE
+    # _load_state/_save_state path; the unknown-key-dropping state.json
+    # rewrite is exactly why an ad-hoc second writer is forbidden.
+    dashboards: dict[str, dict[str, Any]] = field(default_factory=dict)
     # window_id -> display name (window_name)
     window_display_names: dict[str, str] = field(default_factory=dict)
     # "user_id:thread_id" -> group chat_id (for supergroup forum topic routing)
@@ -203,6 +209,7 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "dashboards": self.dashboards,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -232,6 +239,7 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.dashboards = self._parse_dashboards(state.get("dashboards", {}))
 
             except (json.JSONDecodeError, ValueError, OSError) as e:
                 # OSError included (finding 19): the singleton constructs at
@@ -244,7 +252,33 @@ class SessionManager:
                 self.thread_bindings = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
+                self.dashboards = {}
                 pass
+
+    @staticmethod
+    def _parse_dashboards(raw: Any) -> dict[str, dict[str, Any]]:
+        """Validate the persisted ``dashboards`` map; drop malformed entries.
+
+        A malformed entry (bad key shape / non-int ids) is dropped rather than
+        failing the whole load — the user just re-runs ``/dashboard``.
+        """
+        parsed: dict[str, dict[str, Any]] = {}
+        if not isinstance(raw, dict):
+            return parsed
+        for key, rec in raw.items():
+            try:
+                chat_str, owner_str = str(key).split(":", 1)
+                _ = (int(chat_str), int(owner_str))  # key-shape validation
+                if not isinstance(rec, dict):
+                    raise ValueError("record is not a dict")
+                parsed[str(key)] = {
+                    "thread_id": int(rec["thread_id"]),
+                    "msg_id": int(rec["msg_id"]),
+                    "pinned": bool(rec.get("pinned", False)),
+                }
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning("Dropping malformed dashboard entry %r: %s", key, e)
+        return parsed
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
@@ -518,6 +552,77 @@ class SessionManager:
             if group_id is not None:
                 return group_id
         return user_id
+
+    # --- Dashboard record management (Wave C cross-topic dashboard) ---
+    #
+    # One dashboard message per (chat_id, owner_user_id). All methods are
+    # SYNCHRONOUS (mutate + _save_state, no await inside — the bind/unbind
+    # style) so a caller holding the dashboard module's per-(chat, owner)
+    # asyncio operation lock can persist without a suspension point. The
+    # Telegram-I/O-spanning claim/move/self-heal flow lives in
+    # ``handlers.dashboard``; this is only the durable record.
+
+    @staticmethod
+    def _dashboard_key(chat_id: int, owner_id: int) -> str:
+        return f"{chat_id}:{owner_id}"
+
+    def get_dashboard(self, chat_id: int, owner_id: int) -> dict[str, Any] | None:
+        """Return a copy of the (chat, owner) dashboard record, or None."""
+        rec = self.dashboards.get(self._dashboard_key(chat_id, owner_id))
+        return dict(rec) if rec is not None else None
+
+    def set_dashboard(
+        self, chat_id: int, owner_id: int, thread_id: int, msg_id: int
+    ) -> None:
+        """Claim/move the (chat, owner) dashboard to ``thread_id``/``msg_id``.
+
+        A fresh claim is never pinned — pinning is opt-in via
+        ``/dashboard pin`` (``set_dashboard_pinned``).
+        """
+        self.dashboards[self._dashboard_key(chat_id, owner_id)] = {
+            "thread_id": int(thread_id),
+            "msg_id": int(msg_id),
+            "pinned": False,
+        }
+        self._save_state()
+        logger.info(
+            "Dashboard set: chat=%d owner=%d thread=%d msg=%d",
+            chat_id,
+            owner_id,
+            thread_id,
+            msg_id,
+        )
+
+    def clear_dashboard(self, chat_id: int, owner_id: int) -> None:
+        """Drop the (chat, owner) dashboard record (host topic dead / moved)."""
+        if self.dashboards.pop(self._dashboard_key(chat_id, owner_id), None):
+            self._save_state()
+            logger.info("Dashboard cleared: chat=%d owner=%d", chat_id, owner_id)
+
+    def update_dashboard_msg_id(self, chat_id: int, owner_id: int, msg_id: int) -> None:
+        """Repoint the record at a re-sent message (edit-404 self-heal)."""
+        rec = self.dashboards.get(self._dashboard_key(chat_id, owner_id))
+        if rec is None:
+            return
+        rec["msg_id"] = int(msg_id)
+        self._save_state()
+
+    def set_dashboard_pinned(self, chat_id: int, owner_id: int, pinned: bool) -> None:
+        """Record pin state — called only AFTER a successful pin API call."""
+        rec = self.dashboards.get(self._dashboard_key(chat_id, owner_id))
+        if rec is None:
+            return
+        rec["pinned"] = bool(pinned)
+        self._save_state()
+
+    def iter_dashboards(self) -> Iterator[tuple[int, int, dict[str, Any]]]:
+        """Iterate all dashboards as ``(chat_id, owner_id, record_copy)``."""
+        for key, rec in list(self.dashboards.items()):
+            try:
+                chat_str, owner_str = key.split(":", 1)
+                yield int(chat_str), int(owner_str), dict(rec)
+            except ValueError:  # pragma: no cover - load already validates
+                continue
 
     async def wait_for_session_map_entry(
         self, window_id: str, timeout: float = 5.0, interval: float = 0.5

@@ -17,6 +17,7 @@ from .. import md_capture, route_runtime
 from ..session import session_id_for_window, session_manager
 
 from . import attention, notify_source, pick_intent
+from .dashboard import clear_dashboards_in_thread
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
 from .message_queue import (
@@ -108,6 +109,11 @@ async def clear_topic_state(
 
     # Drop any live attention card state — fresh topic gets a fresh episode.
     attention.clear(user_id, thread_id)
+
+    # Wave C: a dashboard hosted in this thread dies with the topic (the host
+    # topic may have no bound window, so binding-centric cleanup alone would
+    # miss it — pre-C fix 3). The user re-runs /dashboard elsewhere.
+    clear_dashboards_in_thread(thread_id)
 
     # Tear down ALL route_runtime state for this topic — run-state, open_tools,
     # context_usage, and pane_interactive_pending. ``teardown_route`` above only
