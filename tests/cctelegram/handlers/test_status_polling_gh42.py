@@ -40,7 +40,11 @@ def mock_bot() -> AsyncMock:
 
 async def _make_waiting(route: route_runtime.Route) -> None:
     """Drive ``route`` to a notification-set WAITING over an open tool —
-    the incident's exact flavor."""
+    the incident's exact flavor. ``set_at`` is NOW on the wall clock: the
+    poller's consume path enforces the runtime TTL against ``time.time()``,
+    so a synthetic old set_at would be cleared as ttl-expired mid-test."""
+    import time as _time
+
     await route_runtime.ingest_transcript_event(
         route,
         TranscriptLifecycleEvent(
@@ -51,7 +55,9 @@ async def _make_waiting(route: route_runtime.Route) -> None:
             stop_reason=None,
         ),
     )
-    await route_runtime.mark_notification_pending(route, set_at=500.0, generation="g1")
+    await route_runtime.mark_notification_pending(
+        route, set_at=_time.time(), generation="g1"
+    )
     assert route_runtime.snapshot(route).run_state is RunState.WAITING_ON_USER
 
 

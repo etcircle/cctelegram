@@ -250,6 +250,11 @@ async def _consume_notification_signal(
         snap.notification_set_at is None
         or now - snap.notification_set_at > route_runtime.NOTIFY_TTL_SECONDS
     ):
+        logger.info(
+            "notification_pending cleared reason=ttl-expiry route=%s set_at=%s",
+            route,
+            snap.notification_set_at,
+        )
         await route_runtime.mark_notification_cleared(route)
         snap = route_runtime.snapshot(route)
 
@@ -416,6 +421,19 @@ async def update_status_message(
     # directions; pull-only and a no-op when no digest is on screen, so it is
     # cheap on the common idle tick.
     await _maybe_repaint_digest_on_transition(bot, user_id, thread_id, window_id)
+    # GH #42 leg 2 (W2b, decoupled card clear): a 🟡 Busy status card
+    # published BEFORE a WAITING transition must still clear while the
+    # pane-idle net is frozen (the net no longer consumes/latches on
+    # WAITING — see commit_pane_idle_clear). Placed before EVERY
+    # capture-gating / skip_status early return so a backed-up content
+    # queue can't strand the card (hermes r2). Self-limiting: the enqueue
+    # repeats only until the published clear flips status_card_visible.
+    _snap_waiting = route_runtime.snapshot((user_id, thread_id or 0, window_id))
+    if (
+        _snap_waiting.run_state is route_runtime.RunState.WAITING_ON_USER
+        and _snap_waiting.status_card_visible
+    ):
+        await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
     if window is None:
         window = await tmux_manager.find_window_by_id(window_id)
     if not window:
@@ -824,6 +842,11 @@ async def update_status_message(
             and capture_wall > snap.notification_set_at + NOTIFY_PANE_CLEAR_MARGIN_S
         ):
             cleared_gen = snap.notification_generation
+            logger.info(
+                "notification_pending cleared reason=pane-running route=%s set_at=%s",
+                route,
+                snap.notification_set_at,
+            )
             await route_runtime.mark_notification_cleared(route)
             await _maybe_repaint_digest_on_transition(
                 bot, user_id, thread_id, window_id
@@ -915,6 +938,18 @@ async def _drive_pane_idle_clear(
         route_runtime.reset_pane_idle_clear(route)
         return
 
+    if (
+        route_runtime.snapshot(route).run_state
+        is route_runtime.RunState.WAITING_ON_USER
+    ):
+        # GH #42 leg 2 (W2b): freeze the pane-idle net while WAITING —
+        # never arm or commit (commit would no-op anyway per W2a, but
+        # arming would leave a due deadline burning a re-validation every
+        # tick). The WAITING retract seams re-enable the net (W2c); the
+        # visible-card clear is handled in update_status_message, decoupled
+        # from the net.
+        return
+
     now = time.monotonic()
     if route_runtime.pane_idle_clear_due(route, now=now):
         if not has_pane_chrome(pane_text):
@@ -988,6 +1023,15 @@ async def _process_idle_clear_only(
     route = (user_id, thread_id or 0, window_id)
     now = time.monotonic()
     if not route_runtime.pane_idle_clear_due(route, now=now):
+        return
+    if (
+        route_runtime.snapshot(route).run_state
+        is route_runtime.RunState.WAITING_ON_USER
+    ):
+        # GH #42 leg 2 (W2b): a WAITING route is frozen for the net — skip
+        # the second-observation capture AND the commit (which would no-op
+        # per W2a but burn a pane scrape every due tick). Checked after the
+        # cheap due-gate so the hot path stays snapshot-free.
         return
     # Second-observation gate (finding 5): never commit off the single frame
     # that armed the deadline. One extra capture per due deadline only.

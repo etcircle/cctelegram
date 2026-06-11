@@ -64,7 +64,9 @@ def _reset():
     transcript_event_adapter.reset_for_tests()
 
 
-async def _ingest(event: TranscriptLifecycleEvent) -> route_runtime.RouteRuntimeSnapshot:
+async def _ingest(
+    event: TranscriptLifecycleEvent,
+) -> route_runtime.RouteRuntimeSnapshot:
     return await route_runtime.ingest_transcript_event(ROUTE, event)
 
 
@@ -84,7 +86,12 @@ async def _replay_fixture_per_line() -> route_runtime.RouteRuntimeSnapshot:
         for entry in parsed:
             if entry.role not in ("user", "assistant"):
                 continue
-            if entry.content_type not in ("text", "thinking", "tool_use", "tool_result"):
+            if entry.content_type not in (
+                "text",
+                "thinking",
+                "tool_use",
+                "tool_result",
+            ):
                 continue
             event = TranscriptEvent(
                 session_id="gh42-fixture-session",

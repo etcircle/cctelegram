@@ -121,9 +121,7 @@ async def test_notification_ttl_retract_resets_latched_net():
     snap = route_runtime.arm_pane_idle_clear(ROUTE, now=900.0)
     assert snap.pane_idle_clear_at == 900.0 + _DELAY
     # And the full incident tail: the due commit reconciles to idle.
-    assert (
-        await route_runtime.commit_pane_idle_clear(ROUTE, now=900.0 + _DELAY) is True
-    )
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=900.0 + _DELAY) is True
     assert route_runtime.snapshot(ROUTE).run_state is RunState.IDLE_CLEARED
 
 
@@ -190,9 +188,7 @@ async def test_incident_sequence_end_to_end_reaches_idle():
     )
     # Pane net clears the phantom-busy route: idle(pane) + stash.
     route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
-    assert (
-        await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
-    )
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
     assert route_runtime.snapshot(ROUTE).run_state is RunState.IDLE_CLEARED
     # Notification lands on idle(pane)+stash → resurrect → WAITING.
     res = await route_runtime.mark_notification_pending(
@@ -213,7 +209,5 @@ async def test_incident_sequence_end_to_end_reaches_idle():
     # The net must now work: fresh arm (or surviving deadline) → commit →
     # the route finally idles instead of typing for 31 minutes.
     route_runtime.arm_pane_idle_clear(ROUTE, now=400.0)
-    assert (
-        await route_runtime.commit_pane_idle_clear(ROUTE, now=400.0 + _DELAY) is True
-    )
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=400.0 + _DELAY) is True
     assert route_runtime.snapshot(ROUTE).run_state is RunState.IDLE_CLEARED

@@ -291,14 +291,24 @@ async def test_commit_then_arm_is_noop_until_activity():
 
 async def test_commit_preserves_waiting_on_user():
     """An open interactive prompt must survive a debounced clear, exactly
-    like mark_pane_idle."""
+    like mark_pane_idle.
+
+    GH #42 leg 2 (W2a) tightened the contract: commit on a WAITING route
+    now returns False WITHOUT consuming the deadline or latching the
+    cleared sentinel — the pre-fix consume+latch (True) permanently
+    disarmed the net when a notification-TTL retract later dropped the
+    route back to an active state (the 2026-06-11 stuck-route incident)."""
     await route_runtime.ingest_transcript_event(
         ROUTE,
         _evt("assistant", "tool_use", tool_use_id="auq", tool_name="AskUserQuestion"),
     )
     route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
-    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
-    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    assert (
+        await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.pane_idle_clear_at == 100.0 + _DELAY  # NOT consumed (W2a)
 
 
 async def test_transcript_activity_rearms_pending_clear():
@@ -653,18 +663,19 @@ async def test_known_tool_result_reclaim_is_bit_safe():
 async def test_pane_idle_clear_preserves_pane_set_waiting():
     """A pane-set WAITING survives a due pane-idle card-clear (the same
     preservation as a transcript-set WAITING; ``_reconcile_pane_idle_in_place``
-    is unchanged). ``commit_pane_idle_clear`` returns True — it latches the
-    debounce sentinel — consistent with ``test_commit_preserves_waiting_on_user``;
-    the run-state is what matters and it stays WAITING. (The plan's draft test
-    table said the commit returns False; that conflicts with the existing
-    transcript-WAITING contract and the documented no-change to the reconciler,
-    so the invariant asserted here is preservation of WAITING + the bit.)"""
+    is unchanged). GH #42 leg 2 (W2a): the commit now returns False on ANY
+    WAITING flavor — deadline left armed, sentinel left open — consistent
+    with ``test_commit_preserves_waiting_on_user``; the run-state stays
+    WAITING and the bit survives."""
     await _pane_set_waiting(ROUTE)
     route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
-    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is True
+    assert (
+        await route_runtime.commit_pane_idle_clear(ROUTE, now=100.0 + _DELAY) is False
+    )
     snap = route_runtime.snapshot(ROUTE)
     assert snap.run_state is RunState.WAITING_ON_USER
     assert snap.interactive_pending is True
+    assert snap.pane_idle_clear_at == 100.0 + _DELAY  # NOT consumed (W2a)
 
 
 async def test_mark_interactive_pending_rearms_stale_pane_idle_deadline():
