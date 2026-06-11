@@ -141,8 +141,10 @@ PRESETS: dict[str, OutputPrefs] = {
 }
 
 PRESET_NAMES: tuple[str, ...] = ("verbose", "standard", "compact", "quiet")
-# PR-2 flips this to "standard" (plan v4 §8 decision 1).
-DEFAULT_PRESET = "verbose"
+# The fallback preset for invalid stored/env values — and, via config's
+# CC_TELEGRAM_VERBOSITY default, the preset a fresh user resolves to.
+# Flipped to "standard" in PR-2 (plan v4 §8 decision 1).
+DEFAULT_PRESET = "standard"
 
 # Per-knob overrides the /settings panel exposes (validated on read AND at
 # the callback seam). Values are the callback-token → stored-value mapping.
@@ -150,11 +152,25 @@ KNOB_CHOICES: dict[str, dict[str, Any]] = {
     "lines": {"64": 64, "160": 160, "400": 400},  # digest_line_chars
     "echo": {"on": True, "off": False},  # user_echo
     "footer": {"on": True, "off": False},  # context_footer
+    # W1/W2 collapse policies (PR-2; deferred from PR-1 so the controls
+    # never shipped before their mechanics — codex PR-1 review P2-1).
+    "done": {
+        "keep": DIGEST_ON_DONE_KEEP,
+        "summary": DIGEST_ON_DONE_SUMMARY,
+        "delete": DIGEST_ON_DONE_DELETE,
+    },
+    "subcards": {
+        "keep": SUBAGENT_CARDS_KEEP,
+        "summary": SUBAGENT_CARDS_SUMMARY,
+        "off": SUBAGENT_CARDS_OFF,
+    },
 }
 _KNOB_FIELDS: dict[str, str] = {
     "lines": "digest_line_chars",
     "echo": "user_echo",
     "footer": "context_footer",
+    "done": "digest_on_done",
+    "subcards": "subagent_cards",
 }
 
 

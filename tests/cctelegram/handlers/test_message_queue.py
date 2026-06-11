@@ -2329,6 +2329,10 @@ class TestReplyParametersAnchor:
             state = message_queue.ActivityDigestState(message_id=0, window_id="@0")
             state.tool_count = 1
             state.lines = ["⚙️ Read(some_file.py)"]
+            # PR-2 slot-identity guard: the upsert's documented precondition
+            # is that the caller bound the state into _activity_msg_info
+            # first — an unbound state is treated as superseded and no-ops.
+            message_queue._activity_msg_info[(1, 100)] = state
             await message_queue._upsert_activity_digest(mock_bot, 1, 100, state)
         assert len(send_calls) == 1
         assert send_calls[0]["op"] == "activity"

@@ -179,8 +179,10 @@ Handler modules (handlers/):
                         frozen OutputPrefs snapshot per recipient, layering
                         "stored user override > EXPLICITLY-set legacy env
                         default > preset" (env vars are defaults, never
-                        ceilings). PRESETS verbose (≡ pre-settings behavior;
-                        PR-1 default) / standard / compact / quiet. Stateless
+                        ceilings). PRESETS verbose (≡ pre-settings behavior)
+                        / standard (the production default since PR-2; the
+                        TEST SUITE pins verbose via conftest so the floor
+                        stays today-shaped) / compact / quiet. Stateless
                         leaf (imports config + session only); resolve(user_id)
                         is consulted at every emission point: the per-recipient
                         👤-echo gate in bot.handle_new_message (top of the
@@ -212,8 +214,30 @@ Handler modules (handlers/):
                         stg:<field>:<value>:<owner_user_id> callbacks in
                         callback_dispatcher/settings.py — owner check rejects
                         another allowed user's tap; preset tap = clean-slate
-                        replace_user_settings. digest_on_done / subagent_cards
-                        "summary" collapse mechanics land in PR-2.
+                        replace_user_settings. A STORED preset choice
+                        overrides the ENTIRE env layer (env = defaults for
+                        the un-chosen, never ceilings — hermes PR-1 P1).
+                        PR-2 wires the collapse policies: W1
+                        digest_on_done (keep / summary / delete) at
+                        _finalize_activity_digest — summary = ONE-line
+                        terminal render (run-state header survives, so a
+                        post-turn 🔔 still shows; counts + duration frozen
+                        on state at finalize for edit-stable repaints);
+                        delete = the cancellation-safe removal protocol
+                        (shield wraps the LOCK-HOLDING flush in both
+                        debounce schedulers so cancel only lands in the
+                        sleep; upsert re-checks tombstone + slot identity
+                        under the lock; finalize-delete takes the lock,
+                        tombstones, deletes best-effort, pops the slot —
+                        restart-orphan accepted residual). W2
+                        subagent_cards summary: the sidechain's own
+                        end-of-turn (MessageTask.stop_reason, plumbed from
+                        the NewMessage) collapses its ↳ card to one line
+                        via the synchronous _collapse_subagent_digest;
+                        _finalize_activity_digest is the backstop sweep for
+                        empty-final sidechains; the collapsed slot is a
+                        tombstone (late blocks never re-inflate; the 🤖✅
+                        report is untouched).
   message_queue.py    ─ Per-user queue + worker (merge, status dedup)
   status_polling.py   ─ Background status line polling (1s interval). Its
                         pane-absent AUQ-card clear gate consults

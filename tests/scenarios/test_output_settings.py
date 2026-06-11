@@ -376,25 +376,18 @@ async def test_digest_line_budget_follows_recipient_preset(
         scenario.bot,
     )
     await _drain_route(route)
-    # Finalize via end-of-turn text so the digest flushes synchronously.
-    await bot_module.handle_new_message(
-        NewMessage(
-            session_id="sess-1",
-            text="done",
-            content_type="text",
-            role="assistant",
-            stop_reason="end_turn",
-        ),
-        scenario.bot,
+    # Flush the LIVE card (PR-2's standard preset collapses the body on
+    # finalize, so the line budget is observable only while running).
+    await message_queue._flush_activity_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID
     )
-    await _drain_route(route)
 
     digest_sends = [
         s
         for s in scenario.bot.sent
         if s.method == "send_message" and "Activity:" in s.kwargs.get("text", "")
     ]
-    assert digest_sends, "digest must flush on finalize"
+    assert digest_sends, "the live digest must have been painted"
     digest_text = digest_sends[0].kwargs["text"]
     line = next(ln for ln in digest_text.split("\n") if "Bash" in ln)
     # 160-char budget: the rendered line is truncated with … well below the

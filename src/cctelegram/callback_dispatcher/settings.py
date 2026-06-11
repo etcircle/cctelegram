@@ -61,6 +61,14 @@ def build_settings_keyboard(prefs: OutputPrefs, owner_id: int) -> InlineKeyboard
         mark = "✅ " if str(prefs.digest_line_chars) == token else ""
         return _btn(f"{mark}{LINE_LABELS[token]} ({token})", "lines", token, owner_id)
 
+    def done_btn(token: str, label: str) -> InlineKeyboardButton:
+        mark = "✅ " if prefs.digest_on_done == token else ""
+        return _btn(f"{mark}{label}", "done", token, owner_id)
+
+    def subcards_btn(token: str, label: str) -> InlineKeyboardButton:
+        mark = "✅ " if prefs.subagent_cards == token else ""
+        return _btn(f"{mark}{label}", "subcards", token, owner_id)
+
     echo_flip = "off" if prefs.user_echo else "on"
     footer_flip = "off" if prefs.context_footer else "on"
     return InlineKeyboardMarkup(
@@ -68,6 +76,16 @@ def build_settings_keyboard(prefs: OutputPrefs, owner_id: int) -> InlineKeyboard
             [preset_btn("verbose"), preset_btn("standard")],
             [preset_btn("compact"), preset_btn("quiet")],
             [line_btn("64"), line_btn("160"), line_btn("400")],
+            [
+                done_btn("keep", "Done: keep"),
+                done_btn("summary", "collapse"),
+                done_btn("delete", "delete"),
+            ],
+            [
+                subcards_btn("keep", "Subagents: keep"),
+                subcards_btn("summary", "collapse"),
+                subcards_btn("off", "off"),
+            ],
             [
                 _btn(
                     f"👤 Echo: {'on' if prefs.user_echo else 'off'}",
@@ -93,6 +111,7 @@ def render_settings_text(prefs: OutputPrefs) -> str:
         f"Preset: *{PRESET_LABELS.get(prefs.verbosity, prefs.verbosity)}*",
         f"Tool line length: {prefs.digest_line_chars} chars · "
         f"live lines: {prefs.digest_live_lines}",
+        f"Done card: {prefs.digest_on_done} · sub-agent cards: {prefs.subagent_cards}",
         f"👤 Echo: {'on' if prefs.user_echo else 'off'} · "
         f"📊 Footer: {'on' if prefs.context_footer else 'off'}",
         "",

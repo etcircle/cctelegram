@@ -724,6 +724,13 @@ def _reset_session_manager() -> None:
     _real_sm.group_chat_ids.clear()
     _real_sm.dashboards.clear()
     _real_sm.user_settings.clear()
+    # Pin the suite's default preset to "verbose" (≡ pre-settings behavior)
+    # so the existing scenario floor keeps testing today's output shape after
+    # PR-2 flipped the production default to "standard" (plan v4 §9). Tests
+    # exercising the new presets set a stored user setting explicitly.
+    from cctelegram.config import config as _cfg
+
+    _cfg.default_verbosity = "verbose"
 
 
 def _reset_aggregator() -> None:

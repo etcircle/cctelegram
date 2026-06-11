@@ -30,6 +30,13 @@ def _clean_settings(monkeypatch: pytest.MonkeyPatch):
 _UID = 4242
 
 
+def test_production_default_preset_is_standard():
+    """PR-2 flips the no-choice default to `standard` (plan v4 §8 decision 1).
+    The suite-wide conftest pin keeps the FLOOR testing verbose; this pins
+    the production fallback constant itself."""
+    assert output_prefs.DEFAULT_PRESET == "standard"
+
+
 def test_default_resolves_verbose_preset():
     prefs = output_prefs.resolve(_UID)
     assert prefs.verbosity == "verbose"
@@ -128,10 +135,11 @@ def test_junk_stored_values_are_inert():
 
 
 def test_unhashable_stored_verbosity_is_inert():
-    """Dual r2 P2: {"verbosity": []} must fall back to the default preset,
-    not raise TypeError from the `in PRESETS` membership test."""
+    """Dual r2 P2: {"verbosity": []} must fall back to the configured
+    default (the fixture pins "verbose"), not raise TypeError from the
+    `in PRESETS` membership test."""
     session_manager.user_settings[_UID] = {"verbosity": []}
-    assert output_prefs.resolve(_UID).verbosity == output_prefs.DEFAULT_PRESET
+    assert output_prefs.resolve(_UID).verbosity == "verbose"
 
 
 def test_bool_knob_validation_is_type_strict():

@@ -22,6 +22,43 @@ status / interactive prompts in another.)
 - tool_result breaks the merge chain and is edited into the tool_use message (preventing order confusion)
 - Merging stops when combined length exceeds 3800 characters (to avoid pagination)
 
+## Per-user output verbosity + post-turn digest collapse (plan v4)
+
+`handlers/output_prefs.resolve(user_id)` is the single per-recipient
+verbosity authority (stored `/settings` choice > explicitly-set legacy env
+default > preset; a stored PRESET choice overrides the entire env layer).
+Production default preset is `standard`; the TEST SUITE pins `verbose`
+(≡ pre-settings behavior) in conftest so the scenario floor stays
+today-shaped. Digest renderers take per-recipient line/snippet/live-line
+budgets; quiet (`digest_card=False`) never creates digest state (including
+the Agent counter path — images + attention-dismiss still fire).
+
+**W1 collapse-on-done** (`digest_on_done`): at `_finalize_activity_digest`,
+`summary` (default) collapses the activity card to ONE line — run-state
+header (a post-turn 🔔 survives) + tool/sub-agent counts + duration, all
+frozen on state at finalize so repaints are edit-stable; `keep` is today's
+full card; `delete` removes the card via the cancellation-safe protocol:
+both debounce schedulers shield the LOCK-HOLDING flush (a cancel only ever
+lands in the sleep), the upsert re-checks tombstone + slot identity under
+the lock before any send, and the finalize-delete takes the lock,
+tombstones, deletes best-effort (a RetryAfter never wedges content), and
+pops the slot — no resurrection by `refresh_activity_digest_if_present` or
+the poller repaint. Restart-mid-protocol orphan = accepted residual
+(digest state is in-memory, matching today's restart behavior).
+
+**W2 sub-agent collapse** (`subagent_cards`): the sidechain's own
+end-of-turn — a final visible text whose `MessageTask.stop_reason` (plumbed
+from `NewMessage`) is end-turn — triggers the synchronous
+`_collapse_subagent_digest` (cancel pending debounce, render the one-line
+`↳ Sub-agent · xxx ✅ N tools` under the per-key lock, `last_text` =
+collapsed render). `_finalize_activity_digest` is the BACKSTOP sweep for
+empty-final sidechains (`lifecycle_only` end markers never reach the
+display path). The collapsed slot is a tombstone: late re-detected blocks
+never re-inflate the play-by-play; a new run has a new key. `off` never
+creates a card. The 🤖✅ report message (full, expandable) is untouched at
+every policy; sidechain keep-alive (Wave A) fires from session_monitor and
+is unaffected.
+
 ## Status Message Handling
 
 **Conversion**: The status message is edited into the first content message, reducing message count:

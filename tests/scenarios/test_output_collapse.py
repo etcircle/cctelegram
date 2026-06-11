@@ -170,6 +170,10 @@ async def test_delete_policy_removes_card_without_resurrection(
     scenario.session_manager.set_user_setting(scenario.user_id, "done", "delete")
 
     await _tool_turn(scenario, route)
+    # Force the debounced live card out so the delete is observable.
+    await message_queue._flush_activity_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID
+    )
     digest_sends = [
         s
         for s in scenario.bot.sent
@@ -190,6 +194,9 @@ async def test_delete_policy_removes_card_without_resurrection(
 
     # Next turn paints a fresh card.
     await _tool_turn(scenario, route, tool_use_id="t2")
+    await message_queue._flush_activity_digest_now(
+        scenario.bot, scenario.user_id, _THREAD_ID
+    )
     fresh = [
         s
         for s in scenario.bot.sent[sent_count:]
@@ -228,7 +235,7 @@ async def test_subagent_card_collapses_on_its_end_of_turn(
     live = [
         s
         for s in scenario.bot.sent
-        if s.method == "send_message" and "↳ Sub-agent" in s.kwargs.get("text", "")
+        if s.method == "send_message" and "↳ Sub" in s.kwargs.get("text", "")
     ]
     assert live, "the live sub-agent card must exist"
 
@@ -248,7 +255,7 @@ async def test_subagent_card_collapses_on_its_end_of_turn(
     sub_paints = [
         s.kwargs.get("text", "")
         for s in scenario.bot.sent
-        if "↳ Sub-agent" in s.kwargs.get("text", "")
+        if "↳ Sub" in s.kwargs.get("text", "")
     ]
     final = sub_paints[-1]
     assert "✅" in final
@@ -289,7 +296,7 @@ async def test_parent_finalize_backstop_collapses_straggler_subagent_card(
     sub_paints = [
         s.kwargs.get("text", "")
         for s in scenario.bot.sent
-        if "↳ Sub-agent" in s.kwargs.get("text", "")
+        if "↳ Sub" in s.kwargs.get("text", "")
     ]
     assert sub_paints, "the sub-agent card must have been painted"
     final = sub_paints[-1]
@@ -320,7 +327,7 @@ async def test_late_sidechain_block_does_not_reinflate_collapsed_card(
     )
     await _drain_route(route)
     paints_before = len(
-        [s for s in scenario.bot.sent if "↳ Sub-agent" in s.kwargs.get("text", "")]
+        [s for s in scenario.bot.sent if "↳ Sub" in s.kwargs.get("text", "")]
     )
 
     await bot_module.handle_new_message(
@@ -342,7 +349,7 @@ async def test_late_sidechain_block_does_not_reinflate_collapsed_card(
     paints_after = [
         s.kwargs.get("text", "")
         for s in scenario.bot.sent
-        if "↳ Sub-agent" in s.kwargs.get("text", "")
+        if "↳ Sub" in s.kwargs.get("text", "")
     ]
     assert len(paints_after) == paints_before or "•" not in paints_after[-1], (
         "a collapsed card must never re-show play-by-play lines"

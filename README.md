@@ -13,8 +13,8 @@ Each Telegram topic maps to one tmux window running one Claude Code process. The
 - **Waiting-on-you detection** — a `Notification` hook writes a window-keyed marker when Claude blocks on a permission / approval prompt (including the Workflow tool's Bash-approval gate, which leaves no JSONL trace), so the topic shows "🔔 Waiting on you" instead of an eternal "🟡 Busy".
 - **Streaming output** — assistant text, thinking, tool use/result summaries, interactive prompts, and local command output flow into Telegram.
 - **Per-route queues** — each `(user_id, thread_id, window_id)` has its own worker, so one noisy topic does not stall another.
-- **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state.
-- **Per-user output verbosity** — `/settings` (any topic or DM) opens a personal panel with presets (`verbose` / `standard` / `compact` / `quiet`) plus quick knobs (tool-line length, 👤 echo, 📊 footer). Choices persist in `state.json` and apply to everything the bot sends *to you*, in every topic; another allowed user tapping your panel changes nothing. Errors, interactive prompts, and the 🤖✅ sub-agent report stay visible at every preset.
+- **Run-state digest** — compact activity digests show tool activity, context-window percentage, and busy/waiting state. When the turn finishes, the digest **collapses to a one-line summary** (`✅ Done — repo · 14 tools · 2 sub-agents · 3m 41s`) by default — the play-by-play is valuable live, scrollback noise afterwards; `/history` keeps the full log. Per-sub-agent cards collapse the same way when the sub-agent finishes (its 🤖✅ report message stays, full and expandable).
+- **Per-user output verbosity** — `/settings` (any topic or DM) opens a personal panel with presets (`verbose` / `standard` / `compact` / `quiet`) plus quick knobs (tool-line length, done-card policy keep/collapse/delete, sub-agent cards keep/collapse/off, 👤 echo, 📊 footer). Choices persist in `state.json` and apply to everything the bot sends *to you*, in every topic; another allowed user tapping your panel changes nothing. Default preset is `standard`; `verbose` restores the pre-settings behavior exactly. Errors, interactive prompts, and the 🤖✅ sub-agent report stay visible at every preset.
 - **Cross-topic dashboard** — `/dashboard` run inside any forum topic claims that topic as your dashboard host: one passive message listing every topic you have bound **in that forum** (per-chat scoped — a dashboard never lists another chat's topics, and a topic whose chat can't be resolved is excluded, fail-closed), grouped needs-attention-first (🔔 waiting on you · 🟡 running · ⚪ idle), repainted by the status poller when content changes. Re-running `/dashboard` in another topic moves it; `/dashboard pin` pins the message (opt-in only — never automatic). 🔔 also covers an idle topic whose last assistant turn ended after your last message (the "unanswered turn"); after a bot restart those in-memory wall-clock stamps are gone, so the dashboard renders state-only until fresh turns repopulate them. **Visibility note:** the dashboard is owner-*filtered*, not private — any member of the shared forum can read it.
 - **Reply context** — Telegram replies/quotes are injected into Claude with fenced, role-aware context for text, voice, photo, and document messages.
 - **Photos and voice** — photos are forwarded as base64 image blocks; voice notes are transcribed through OpenAI-compatible transcription.
@@ -78,8 +78,10 @@ Useful behavior knobs:
 
 - `CC_TELEGRAM_VERBOSITY` — default output preset (`verbose` / `standard` /
   `compact` / `quiet`) for users who have not picked one via `/settings`;
-  default `verbose`. Per-user `/settings` choices always win over env
-  defaults — the env vars below are knob-precise **defaults, not ceilings**.
+  default `standard` (collapsed post-turn digests, 160-char tool lines, user
+  echo off — `verbose` restores the pre-settings firehose). Per-user
+  `/settings` choices always win over env defaults — the env vars below are
+  knob-precise **defaults, not ceilings**.
 - `CC_TELEGRAM_SHOW_USER_MESSAGES` — echo user messages from tmux; default `true`.
   When set explicitly it becomes the default for the per-user 👤-echo
   preference; a user's stored `/settings` choice overrides it.

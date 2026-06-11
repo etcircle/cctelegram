@@ -102,7 +102,7 @@ class Config:
         # DEFAULTS (not ceilings) — applied only when explicitly set, which
         # the env_*_set flags below record. A stored per-user override wins
         # over both.
-        self.default_verbosity = os.getenv("CC_TELEGRAM_VERBOSITY", "verbose")
+        self.default_verbosity = os.getenv("CC_TELEGRAM_VERBOSITY", "standard")
         self.env_show_user_messages_set = (
             os.getenv("CC_TELEGRAM_SHOW_USER_MESSAGES") is not None
         )

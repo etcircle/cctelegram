@@ -75,6 +75,10 @@ class MessageTask:
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    # JSONL ``message.stop_reason`` (W2, plan v4 §3): a sidechain text task
+    # carrying an end-of-turn stop_reason is the sub-agent's own "I'm done"
+    # signal — the primary collapse trigger for its digest card.
+    stop_reason: str | None = None
     # §2.7: surfaced for tool_use tasks so the dispatcher can promote
     # Agent / Task subagent invocations to the top-level message surface.
     tool_name: str | None = None
@@ -122,6 +126,16 @@ class ActivityDigestState:
     completed_count: int = 0
     last_text: str = ""
     done: bool = False
+    # W1 collapse-on-done (plan v4 §2): wall-clock stamps frozen at first
+    # event / finalize so the collapsed summary's duration is stable across
+    # repaints, plus the Agent-run counter for the "N sub-agents" part.
+    started_at: float = 0.0
+    finalized_at: float = 0.0
+    subagent_count: int = 0
+    # Set under the per-key lock by the delete path; the upsert re-checks it
+    # (with slot identity) before any send so a straggler flush can neither
+    # repaint nor re-send a deleted card (codex r2 P1-2 protocol).
+    tombstoned: bool = False
 
 
 @dataclass
@@ -143,6 +157,12 @@ class SubagentDigestState:
     tool_count: int = 0
     completed_count: int = 0
     last_text: str = ""
+    # W2 (plan v4 §3): True once the card collapsed to its one-line summary
+    # (the sidechain's own end-of-turn, or the parent-finalize backstop).
+    # The slot is KEPT as a tombstone — a late re-detected block must not
+    # re-inflate the play-by-play; a genuinely new run has a new key.
+    collapsed: bool = False
+    tombstoned: bool = False
 
 
 @dataclass
@@ -313,6 +333,10 @@ def _todo_tool_ids_record(key: tuple[str, int, int]) -> None:
             TODO_TOOL_IDS_MAX,
         )
 
+
+# Mirrors bot._TURN_END_STOP_REASONS (bot imports this module, so the tiny
+# constant is duplicated here rather than imported back).
+_TURN_END_STOP_REASONS = frozenset({"end_turn", "stop_sequence"})
 
 ACTIVITY_DIGEST_CONTENT_TYPES = {"tool_use", "tool_result", "thinking"}
 ACTIVITY_DIGEST_MAX_LINES = 10
@@ -1291,12 +1315,38 @@ def _context_pct_suffix(pct: int | None) -> str:
     return f" · ctx {pct}%"
 
 
+def _format_duration(seconds: float) -> str:
+    """Compact duration for the collapsed digest summary: "41s" / "3m 41s"."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m {total % 60:02d}s"
+
+
+def _render_collapsed_activity_summary(
+    state: ActivityDigestState, status: str, display: str, suffix: str
+) -> str:
+    """One-line W1 summary: header + frozen counts + frozen duration."""
+    parts = [f"{status} — {display}{suffix}"]
+    if state.tool_count:
+        parts.append(f"{state.tool_count} tool{'s' if state.tool_count != 1 else ''}")
+    if state.subagent_count:
+        parts.append(
+            f"{state.subagent_count} sub-agent"
+            f"{'s' if state.subagent_count != 1 else ''}"
+        )
+    if state.started_at and state.finalized_at:
+        parts.append(_format_duration(state.finalized_at - state.started_at))
+    return " · ".join(parts)
+
+
 def _render_activity_digest(
     state: ActivityDigestState,
     *,
     waiting: bool = False,
     route: Route | None = None,
     live_lines: int = ACTIVITY_DIGEST_MAX_LINES,
+    collapse_done: bool = False,
 ) -> str:
     """Render the editable activity digest card.
 
@@ -1308,6 +1358,13 @@ def _render_activity_digest(
     ``live_lines`` is the recipient's body budget (plan v4 §5): 0 renders
     header + counts ONLY — no body lines and no hidden-events line (the
     ``compact`` preset's header-only card).
+
+    ``collapse_done`` (W1, plan v4 §2): when True and the turn has
+    finalized, the card collapses to the one-line summary. The header part
+    STILL comes from the run-state snapshot, so a post-turn 🔔
+    (notification / unanswered turn) survives the collapse — only the body
+    is dropped. Counts and duration are frozen state, so the collapsed text
+    is stable across later refresh repaints.
     """
     display = _display_name(state.window_id)
     if route is not None:
@@ -1331,6 +1388,8 @@ def _render_activity_digest(
         else:
             status = "🟡 Busy"
         suffix = ""
+    if collapse_done and state.done:
+        return _render_collapsed_activity_summary(state, status, display, suffix)
     lines = [f"{status} — {display}{suffix}"]
     if state.tool_count or state.completed_count:
         lines.append(
@@ -1365,13 +1424,24 @@ async def _upsert_activity_digest(
     may have written during the in-flight ``topic_send`` (window rebind),
     leaving the next flush editing a message in the now-stale topic.
     """
+    # Cancellation-safe collapse protocol (codex r2 P1-2): a tombstoned or
+    # superseded slot must neither send nor edit — the delete path set the
+    # flag under the same per-key lock the caller holds, so a straggler
+    # flush that raced the finalize lands here and no-ops.
+    if (
+        state.tombstoned
+        or _activity_msg_info.get((user_id, thread_id or 0)) is not state
+    ):
+        return
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     route = _route_for(user_id, thread_id, state.window_id)
+    prefs = output_prefs.resolve(user_id)
     text = _render_activity_digest(
         state,
         waiting=attention.is_waiting(user_id, thread_id),
         route=route,
-        live_lines=output_prefs.resolve(user_id).digest_live_lines,
+        live_lines=prefs.digest_live_lines,
+        collapse_done=prefs.digest_on_done == output_prefs.DIGEST_ON_DONE_SUMMARY,
     )
     if text == state.last_text:
         return
@@ -1453,6 +1523,15 @@ def _schedule_activity_flush(
     if pending is not None and not pending.done():
         pending.cancel()
 
+    async def _locked_flush() -> None:
+        # Re-read the slot INSIDE the shielded section: a teardown/collapse
+        # that won the race already popped or tombstoned it.
+        state = _activity_msg_info.get(key)
+        if state is None:
+            return
+        async with _get_activity_lock(user_id, tid):
+            await _upsert_activity_digest(bot, user_id, thread_id, state)
+
     async def _delayed() -> None:
         try:
             await asyncio.sleep(ACTIVITY_FLUSH_DEBOUNCE_SECONDS)
@@ -1462,12 +1541,13 @@ def _schedule_activity_flush(
         # starts a fresh debounce window rather than coalescing into the one
         # currently being sent.
         _activity_flush_tasks.pop(key, None)
-        state = _activity_msg_info.get(key)
-        if state is None:
-            return
         try:
-            async with _get_activity_lock(user_id, tid):
-                await _upsert_activity_digest(bot, user_id, thread_id, state)
+            # Shield wraps the LOCK HOLDER (codex r3 P2-2, the todo-path
+            # precedent): a cancel() can only ever interrupt the sleep
+            # above — never mid-`topic_send` with the lock released, which
+            # could create a Telegram message that is never recorded into
+            # ``state.message_id`` and orphan the delete protocol.
+            await asyncio.shield(_locked_flush())
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pragma: no cover - background task safety
@@ -1539,7 +1619,7 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
 
     state = _activity_msg_info.get((user_id, tid))
     if state is None or state.window_id != wid or state.done:
-        state = ActivityDigestState(message_id=0, window_id=wid)
+        state = ActivityDigestState(message_id=0, window_id=wid, started_at=time.time())
 
     line = _compact_activity_line(
         task,
@@ -1665,9 +1745,15 @@ def _render_subagent_digest(
     """Render the editable per-sub-agent digest card.
 
     ``live_lines`` mirrors the activity digest's recipient budget; 0 renders
-    header + counts only (no body lines, no hidden-events line).
+    header + counts only (no body lines, no hidden-events line). A
+    ``collapsed`` state (W2) renders the one-line summary regardless — the
+    🤖✅ report message is the run's artifact; this card's play-by-play is
+    only valuable live.
     """
     sid = _short_subagent_id(state.subagent_key)
+    if state.collapsed:
+        tools = f"{state.tool_count} tool{'s' if state.tool_count != 1 else ''}"
+        return f"↳ Sub-agent · {sid} ✅ {tools}"
     header = f"↳ Sub-agent · {sid}"
     if state.tool_count or state.completed_count:
         progress = (
@@ -1714,6 +1800,11 @@ async def _upsert_subagent_digest(
     the same sub-agent key), leaving the next flush editing a message in the
     now-stale topic.
     """
+    # Same tombstone + slot-identity guard as the activity upsert (codex r2
+    # P1-2): a popped/tombstoned slot must neither send nor edit.
+    skey = (user_id, thread_id or 0, state.subagent_key)
+    if state.tombstoned or _subagent_msg_info.get(skey) is not state:
+        return
     chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
     text = _render_subagent_digest(
         state,
@@ -1782,18 +1873,24 @@ def _schedule_subagent_flush(
     if pending is not None and not pending.done():
         pending.cancel()
 
+    async def _locked_flush() -> None:
+        state = _subagent_msg_info.get(key)
+        if state is None:
+            return
+        async with _get_subagent_lock(user_id, tid, subagent_key):
+            await _upsert_subagent_digest(bot, user_id, thread_id, state)
+
     async def _delayed() -> None:
         try:
             await asyncio.sleep(ACTIVITY_FLUSH_DEBOUNCE_SECONDS)
         except asyncio.CancelledError:
             return
         _subagent_flush_tasks.pop(key, None)
-        state = _subagent_msg_info.get(key)
-        if state is None:
-            return
         try:
-            async with _get_subagent_lock(user_id, tid, subagent_key):
-                await _upsert_subagent_digest(bot, user_id, thread_id, state)
+            # Same shield-wraps-the-lock-holder shape as the activity path
+            # (codex r3 P2-2 / hermes r2 P1-3): cancel only ever interrupts
+            # the sleep, never a mid-send upsert.
+            await asyncio.shield(_locked_flush())
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pragma: no cover - background task safety
@@ -1827,6 +1924,11 @@ async def _process_subagent_activity_task(
     subagent_key = task.subagent_key
     state_key = (user_id, tid, subagent_key)
     state = _subagent_msg_info.get(state_key)
+    # W2 tombstone: a block re-detected AFTER the card collapsed must not
+    # re-inflate the play-by-play (plan v4 §3) — a genuinely new run has a
+    # new subagent_key, so the kept slot only ever blocks stragglers.
+    if state is not None and state.window_id == wid and state.collapsed:
+        return
     if state is None or state.window_id != wid:
         state = SubagentDigestState(
             message_id=0,
@@ -1866,7 +1968,71 @@ async def _process_subagent_activity_task(
             state.lines.append(line)
 
     _subagent_msg_info[state_key] = state
+
+    # W2 primary trigger (plan v4 §3): the sidechain's own end-of-turn — a
+    # final visible text with an end-turn stop_reason. Collapse instead of
+    # scheduling another play-by-play paint. Only the ``summary`` policy
+    # collapses; ``keep`` (verbose) leaves the card as-is.
+    if (
+        task.content_type == "text"
+        and task.stop_reason in _TURN_END_STOP_REASONS
+        and prefs.subagent_cards == output_prefs.SUBAGENT_CARDS_SUMMARY
+    ):
+        await _collapse_subagent_digest(bot, user_id, task.thread_id, subagent_key)
+        return
+
     _schedule_subagent_flush(bot, user_id, task.thread_id, subagent_key)
+
+
+async def _collapse_subagent_digest(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    subagent_key: str,
+) -> None:
+    """Synchronously collapse one sub-agent card to its one-line summary.
+
+    The synchronous collapse path hermes r1 P2-7 asked for: cancel the
+    pending debounce FIRST (it can only be interrupted in its sleep — the
+    flush phase is shielded), then render exactly once under the per-key
+    lock. The collapsed render becomes ``last_text`` so any straggler
+    dedups instead of repainting the play-by-play.
+    """
+    tid = thread_id or 0
+    key = (user_id, tid, subagent_key)
+    pending = _subagent_flush_tasks.pop(key, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+    state = _subagent_msg_info.get(key)
+    if state is None or state.collapsed:
+        return
+    state.collapsed = True
+    async with _get_subagent_lock(user_id, tid, subagent_key):
+        await _upsert_subagent_digest(bot, user_id, thread_id, state)
+
+
+async def _flush_subagent_digest_now(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    subagent_key: str,
+) -> None:
+    """Cancel any pending debounce and flush one sub-agent card synchronously.
+
+    Mirror of ``_flush_activity_digest_now`` at per-sidechain granularity —
+    the lock is the real serializer; cancelling just skips a still-sleeping
+    debounce.
+    """
+    tid = thread_id or 0
+    key = (user_id, tid, subagent_key)
+    pending = _subagent_flush_tasks.pop(key, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+    state = _subagent_msg_info.get(key)
+    if state is None:
+        return
+    async with _get_subagent_lock(user_id, tid, subagent_key):
+        await _upsert_subagent_digest(bot, user_id, thread_id, state)
 
 
 # ── To-do list digest ────────────────────────────────────────────────────
@@ -2281,9 +2447,12 @@ async def _bump_agent_activity_counter(
     tid = task.thread_id or 0
     state = _activity_msg_info.get((user_id, tid))
     if state is None or state.window_id != wid or state.done:
-        state = ActivityDigestState(message_id=0, window_id=wid)
+        state = ActivityDigestState(message_id=0, window_id=wid, started_at=time.time())
     if task.content_type == "tool_use":
         state.tool_count += 1
+        # W1 summary's "N sub-agents" part — Agent/Task runs counted here
+        # (this is the only digest seam Agent tool_use passes through).
+        state.subagent_count += 1
     elif task.content_type == "tool_result":
         state.completed_count += 1
     state.done = False
@@ -2396,6 +2565,58 @@ async def _process_agent_task(bot: Bot, user_id: int, task: MessageTask) -> None
     await _bump_agent_activity_counter(bot, user_id, task)
 
 
+async def _delete_activity_digest(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+) -> None:
+    """W1 ``delete`` policy — remove the finished card, cancellation-safe.
+
+    Protocol (codex r2 P1-2): cancel the pending debounce FIRST (its flush
+    phase is shielded, so a cancel only ever lands in the sleep), then take
+    the per-key lock — any shielded in-flight flush has completed and
+    recorded its ``message_id`` by the time we hold it — tombstone the
+    state, delete the message best-effort, and pop the slot. With the slot
+    gone, the refresh/repaint paths are no-ops; the upsert's tombstone +
+    slot-identity guard stops any straggler still holding the state object.
+    A delete failure (RetryAfter / transient) never wedges content delivery
+    — the slot is popped regardless and the orphan ages out as a normal
+    chat message.
+    """
+    tid = thread_id or 0
+    key = (user_id, tid)
+    pending = _activity_flush_tasks.pop(key, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+    async with _get_activity_lock(user_id, tid):
+        state = _activity_msg_info.get(key)
+        if state is None:
+            return
+        state.tombstoned = True
+        msg_id = state.message_id
+        _activity_msg_info.pop(key, None)
+        if msg_id:
+            chat_id, effective_thread_id = _delivery_target(user_id, thread_id)
+            try:
+                await topic_delete(
+                    bot,
+                    op="activity_done_delete",
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    thread_id=effective_thread_id,
+                    window_id=state.window_id,
+                    message_id=msg_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "activity digest delete failed user=%d thread=%s msg=%d: %s",
+                    user_id,
+                    thread_id,
+                    msg_id,
+                    e,
+                )
+
+
 async def _finalize_activity_digest(
     bot: Bot,
     user_id: int,
@@ -2408,15 +2629,37 @@ async def _finalize_activity_digest(
     digest is finalized to its terminal value driven by ``RunState`` (Done /
     Waiting on you). The previous attention-heuristic short-circuit is gone —
     it left the digest stuck on Busy whenever a card never raised.
+
+    W1 (plan v4 §2): the recipient's ``digest_on_done`` policy decides the
+    terminal shape — ``keep`` (today's full card), ``summary`` (the one-line
+    collapse, rendered by the same upsert path), or ``delete`` (the
+    cancellation-safe removal). The finalize is also the W2 BACKSTOP: any
+    sub-agent card of this (user, thread) not yet collapsed (an empty-final
+    sidechain whose end-of-turn never reached the display path) collapses
+    here under the ``summary`` sub-agent policy.
     """
     tid = thread_id or 0
+    prefs = output_prefs.resolve(user_id)
+
+    # W2 backstop sweep — before the parent card finalizes, so the topic
+    # settles in one pass. Only the summary policy collapses; ``keep``
+    # leaves play-by-play cards as today, ``off`` never created any.
+    if prefs.subagent_cards == output_prefs.SUBAGENT_CARDS_SUMMARY:
+        for (s_uid, s_tid, s_key), s_state in list(_subagent_msg_info.items()):
+            if s_uid == user_id and s_tid == tid and not s_state.collapsed:
+                await _collapse_subagent_digest(bot, user_id, thread_id, s_key)
+
     state = _activity_msg_info.get((user_id, tid))
     if not state or state.window_id != window_id or state.done:
         return
     state.done = True
-    # Synchronous flush: assistant text is about to land and the user must
-    # see the digest in its terminal "done" state before the reply, not 5s
-    # after. Cancels any pending debounce so we don't double-send.
+    state.finalized_at = time.time()
+    if prefs.digest_on_done == output_prefs.DIGEST_ON_DONE_DELETE:
+        await _delete_activity_digest(bot, user_id, thread_id)
+        return
+    # ``keep`` and ``summary`` share the synchronous flush — the render
+    # picks the shape from the policy. Assistant text is about to land and
+    # the user must see the terminal state before the reply, not 5s after.
     await _flush_activity_digest_now(bot, user_id, thread_id)
 
 
@@ -3081,6 +3324,7 @@ async def enqueue_content_message(
     tool_input: dict[str, object] | None = None,
     transcript_uuid: str | None = None,
     subagent_key: str | None = None,
+    stop_reason: str | None = None,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -3117,6 +3361,7 @@ async def enqueue_content_message(
         tool_input=tool_input,
         transcript_uuid=transcript_uuid,
         subagent_key=subagent_key,
+        stop_reason=stop_reason,
     )
     queue.put_nowait(task)
 

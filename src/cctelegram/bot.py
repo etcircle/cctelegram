@@ -1044,6 +1044,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             tool_input=msg.tool_input,
             transcript_uuid=msg.transcript_uuid,
             subagent_key=msg.subagent_key,
+            stop_reason=msg.stop_reason,
         )
 
         # Update user's read offset to current file position
