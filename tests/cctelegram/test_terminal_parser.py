@@ -68,6 +68,38 @@ class TestParseStatusLine:
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
 
+    def test_task_progress_block_between_spinner_and_chrome(self, chrome: str):
+        """v2.1.168 renders the spinner's attached task-progress block
+        (``⎿ ✔ …`` / ``✔ …`` / ``◼ …`` lines) BETWEEN the spinner line and
+        the chrome separator while a run is in flight. The walk above the
+        separator must skip those lines (like blanks) and still find the
+        spinner — returning None here read an ACTIVE pane as idle and let
+        the pane-idle clear falsely commit mid-Bash (2026-06-11 @4 stuck
+        route)."""
+        pane = (
+            "✻ Building wave 5… (2h 4m 6s · ↓ 198.9k tokens)\n"
+            "  ⎿ \xa0✔ W3: first wave done\n"
+            "     ✔ W4: second wave done\n"
+            "     ◼ W5: third wave running\n"
+            "\n" + chrome
+        )
+        assert (
+            parse_status_line(pane)
+            == "Building wave 5… (2h 4m 6s · ↓ 198.9k tokens)"
+        )
+
+    def test_task_progress_block_idle_pane_still_none(self, chrome: str):
+        """A task-progress block with NO spinner above it (idle / scrolled
+        content) must still return None — the skip must not manufacture a
+        status out of plain output."""
+        pane = (
+            "⏺ Bash(some command)\n"
+            "  ⎿ \xa0✔ step one done\n"
+            "     ◼ step two\n"
+            "\n" + chrome
+        )
+        assert parse_status_line(pane) is None
+
 
 # ── is_status_active ─────────────────────────────────────────────────────
 
@@ -128,6 +160,52 @@ class TestIsStatusActive:
         pane = "✻ Working\n──────\n  Esc To Interrupt\n"
         assert is_status_active(pane) is True
 
+    def test_active_with_task_list_footer_below_chrome(self):
+        """v2.1.168 renders the agent task-list footer BELOW the bottom
+        chrome line. With enough agent rows the ``esc to interrupt`` marker
+        is pushed above a fixed bottom window — the scan must anchor on the
+        chrome separator instead, or an ACTIVE pane reads idle (the
+        2026-06-11 @4 false pane-idle commit class)."""
+        sep = "─" * 40
+        task_rows = "\n".join(
+            f"  ◯ general-purpose  Implement wave {i}                 {i}m 02s"
+            for i in range(6)
+        )
+        pane = (
+            "✻ Building wave 5… (12m 6s · ↓ 8.9k tokens)\n"
+            "\n"
+            f"{sep}\n"
+            "❯ \n"
+            f"{sep}\n"
+            "  ⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ctrl+t to hide\n"
+            "\n"
+            "  ⏺ main                                ↑/↓ to select · Enter to view\n"
+            f"{task_rows}\n"
+        )
+        assert is_status_active(pane) is True
+
+    def test_idle_with_task_list_footer_below_chrome(self):
+        """The chrome-anchored scan must not fabricate activity: an idle
+        pane with the same task-list footer (no ``esc to interrupt``) stays
+        False."""
+        sep = "─" * 40
+        task_rows = "\n".join(
+            f"  ◯ general-purpose  Implement wave {i}                 done"
+            for i in range(6)
+        )
+        pane = (
+            "✻ Cooked for 17s\n"
+            "\n"
+            f"{sep}\n"
+            "❯ \n"
+            f"{sep}\n"
+            "  ⏵⏵ bypass permissions on · 2 shells · ctrl+t to hide tasks\n"
+            "\n"
+            "  ⏺ main                                ↑/↓ to select · Enter to view\n"
+            f"{task_rows}\n"
+        )
+        assert is_status_active(pane) is False
+
 
 # ── has_pane_chrome ──────────────────────────────────────────────────────
 
@@ -156,11 +234,20 @@ class TestHasPaneChrome:
         in regular output is not chrome."""
         assert has_pane_chrome("output\n──────\nmore\n") is False
 
-    def test_separator_outside_last_10_lines_not_found(self):
-        """The anchor only scans the last 10 lines (bottom chrome), matching
+    def test_separator_outside_last_20_lines_not_found(self):
+        """The anchor only scans the last 20 lines (bottom chrome region,
+        sized for the v2.1.168 task-list footer below the chrome), matching
         _find_chrome_separator."""
-        pane = "─" * 30 + "\n" + "\n".join(f"line {i}" for i in range(12)) + "\n"
+        pane = "─" * 30 + "\n" + "\n".join(f"line {i}" for i in range(22)) + "\n"
         assert has_pane_chrome(pane) is False
+
+    def test_separator_with_task_list_footer_found(self):
+        """A v2.1.168 task-list footer below the chrome must not push the
+        separator out of the scan window for a realistic agent count."""
+        sep = "─" * 40
+        footer = "\n".join(f"  ◯ agent row {i}" for i in range(8))
+        pane = f"output\n{sep}\n❯ \n{sep}\n  ⏵⏵ bypass\n\n{footer}\n"
+        assert has_pane_chrome(pane) is True
 
 
 # ── extract_interactive_content ──────────────────────────────────────────

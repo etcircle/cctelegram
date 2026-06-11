@@ -1043,7 +1043,7 @@ class TestRouteRuntimeIdleClearDebounce:
             assert route_runtime.snapshot(route).run_state is RunState.IDLE_CLEARED
 
     @pytest.mark.asyncio
-    async def test_idle_clear_only_busy_recapture_does_not_commit_and_rearms(
+    async def test_idle_clear_only_busy_recapture_does_not_commit_and_cancels(
         self, mock_bot: AsyncMock
     ):
         """Fix 5 RED gate: WATCHDOG_INTERVAL (10s) > IDLE_CLEAR_DELAY_SECONDS
@@ -1052,8 +1052,10 @@ class TestRouteRuntimeIdleClearDebounce:
         misparse on a RUNNING_TOOL route would wipe ``open_tools`` and drop
         the Task's eventual tool_result as an unknown id. The fix re-captures
         the pane when the deadline is due and commits ONLY on a second
-        confirmed-idle frame; a BUSY re-capture must NOT commit — it re-arms
-        the debounce instead, preserving the run-state and open_tools.
+        confirmed-idle frame; a positively-BUSY re-capture must NOT commit —
+        it CANCELS the deadline (2026-06-11: matching the full path's running
+        branch; an unknown frame still re-arms), preserving the run-state and
+        open_tools.
 
         Pre-fix this is RED: ``_process_idle_clear_only`` never captures, so
         the due deadline commits unconditionally (enqueue fires, RUNNING_TOOL
@@ -1109,11 +1111,13 @@ class TestRouteRuntimeIdleClearDebounce:
             snap = route_runtime.snapshot(route)
             assert snap.run_state is RunState.RUNNING_TOOL
             assert snap.open_tools
-            # Deadline RE-ARMED from this tick (not left due, not cancelled).
-            assert (
-                snap.pane_idle_clear_at
-                == fake_now[0] + status_polling.IDLE_CLEAR_DELAY_SECONDS
-            )
+            # Deadline CANCELLED outright: a positively-ACTIVE re-capture
+            # ("esc to interrupt" visible) is the same evidence as the full
+            # path's running branch — a fresh idle stretch must re-arm from a
+            # new confirmed-idle scrape. (Pre-2026-06-11 this re-armed instead,
+            # keeping a rolling deadline alive for the whole run — the fuel for
+            # the cross-path false commit on the @4 stuck route.)
+            assert snap.pane_idle_clear_at is None
 
     @pytest.mark.asyncio
     async def test_idle_clear_only_unparseable_recapture_does_not_commit(
@@ -1252,6 +1256,186 @@ class TestRouteRuntimeIdleClearDebounce:
                 mock_bot, 1, window_id, 42, skip_status=False
             )
             assert mock_enqueue.await_count == 1
+
+
+# Genuinely ACTIVE v2.1.168 pane during a long foreground Bash run: the
+# spinner's attached task-progress block sits BETWEEN the spinner line and the
+# chrome separator, and the agent task-list footer renders BELOW the bottom
+# chrome line. Mirrors the live ccbot:@4 capture from the 2026-06-11 stuck-route
+# incident (anonymized).
+_ACTIVE_TASK_BLOCK_PANE = (
+    "✻ Building wave 5… (2h 4m 6s · ↓ 198.9k tokens)\n"
+    "  ⎿ \xa0✔ W3: first wave done\n"
+    "     ✔ W4: second wave done\n"
+    "     ◼ W5: third wave running\n"
+    "\n"
+    + "─" * 40
+    + "\n"
+    + "❯ \n"
+    + "─" * 40
+    + "\n"
+    + "  ⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ctrl+t to hide\n"
+    "\n"
+    "  ⏺ main                                ↑/↓ to select · Enter to view\n"
+    "  ◯ general-purpose  Implement wave 5                          10m 59s\n"
+)
+
+# Active-run marker visible but NO parseable spinner status line at all — a
+# parser-hostile-but-unambiguously-active frame (future chrome variants). The
+# full-path commit must treat this as running, never as confirmed idle.
+_ACTIVE_NO_STATUS_PANE = (
+    "⏺ Bash(long foreground run)\n"
+    "  ⎿  Running…\n"
+    "\n"
+    + "─" * 40
+    + "\n"
+    + "❯ \n"
+    + "─" * 40
+    + "\n"
+    + "  ⏵⏵ bypass permissions on · esc to interrupt\n"
+)
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestActivePaneNeverCommitsIdleClear:
+    """2026-06-11 stuck-route RCA (route (6427984308, 378, '@4')): during a
+    ~4-minute quiet foreground Bash, every watchdog capture computed
+    ``is_running=False`` because v2.1.168's task-progress block broke
+    ``parse_status_line`` — the full capture path armed the pane-idle
+    deadline on an ACTIVE pane and, unlike ``_process_idle_clear_only``
+    (which re-validates with positive idle evidence), committed the clear
+    with NO gate as soon as a watchdog tick landed past the rolling
+    deadline. RUNNING_TOOL was falsely reconciled to IDLE_CLEARED(pane) and
+    typing/digest went dark until the next transcript event (~3.5 min).
+
+    Two invariants pinned here:
+      1. the real v2.1.168 active frame parses as running (no arm at all);
+      2. even when the status line is unparseable, a frame whose active-run
+         marker is visible must never arm/commit on the FULL path (the same
+         positive-evidence rule the cleanup-only path already enforces).
+    """
+
+    def _open_bash(self):
+        from cctelegram.session_monitor import TranscriptEvent
+
+        return TranscriptEvent(
+            session_id="sess-1",
+            role="assistant",
+            block_type="tool_use",
+            tool_use_id="bash-1",
+            tool_name="Bash",
+            stop_reason="tool_use",
+            timestamp=None,
+            text="",
+            image_data=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_block_frame_keeps_route_running_tool(
+        self, mock_bot: AsyncMock
+    ):
+        """The live incident frame: RUNNING_TOOL with an open Bash, watchdog
+        captures returning the ACTIVE task-block pane across ticks spanning
+        the debounce delay — the route must stay RUNNING_TOOL (typing
+        eligible) and no card clear may be enqueued."""
+        from cctelegram import route_runtime, transcript_event_adapter
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        fake_now = [1000.0]
+
+        await transcript_event_adapter.dispatch_transcript_event(
+            self._open_bash(), [route]
+        )
+        assert route_runtime.snapshot(route).run_state is RunState.RUNNING_TOOL
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=_ACTIVE_TASK_BLOCK_PANE)
+
+            # Several watchdog-spaced capture ticks, each > the debounce delay.
+            for _ in range(3):
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+                fake_now[0] += status_polling.WATCHDOG_INTERVAL + 0.1
+
+            snap = route_runtime.snapshot(route)
+            assert snap.run_state is RunState.RUNNING_TOOL
+            assert snap.typing_eligible is True
+            assert snap.open_tools == frozenset({"bash-1"})
+            # No deadline may be left armed on an active pane, and no clear
+            # (text=None) may ever have been enqueued.
+            assert snap.pane_idle_clear_at is None
+            for call in mock_enqueue.await_args_list:
+                assert call[0][3] is not None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_status_but_active_marker_never_commits(
+        self, mock_bot: AsyncMock
+    ):
+        """Defense in depth for the NEXT parser-hostile chrome variant: with
+        a deadline already due, a full-path capture whose status line is
+        unparseable but whose active-run marker is visible must NOT commit
+        the pane-idle clear — mirror of the cleanup-only path's positive
+        idle evidence rule."""
+        from cctelegram import route_runtime, transcript_event_adapter
+        from cctelegram.handlers import status_polling
+
+        window_id = "@5"
+        route = (1, 42, window_id)
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        fake_now = [1000.0]
+
+        await transcript_event_adapter.dispatch_transcript_event(
+            self._open_bash(), [route]
+        )
+
+        with (
+            patch.object(status_polling, "tmux_manager") as mock_tmux,
+            patch.object(
+                status_polling, "enqueue_status_update", new_callable=AsyncMock
+            ) as mock_enqueue,
+            patch.object(
+                status_polling, "handle_interactive_ui", new_callable=AsyncMock
+            ),
+            patch.object(
+                status_polling.time, "monotonic", side_effect=lambda: fake_now[0]
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=_ACTIVE_NO_STATUS_PANE)
+
+            # A deadline armed by a prior (misread) tick, now overdue.
+            route_runtime.arm_pane_idle_clear(route, now=1000.0)
+            fake_now[0] += status_polling.WATCHDOG_INTERVAL + 0.1
+
+            await status_polling.update_status_message(
+                mock_bot, user_id=1, window_id=window_id, thread_id=42
+            )
+
+            snap = route_runtime.snapshot(route)
+            assert snap.run_state is RunState.RUNNING_TOOL
+            assert snap.typing_eligible is True
+            assert snap.open_tools == frozenset({"bash-1"})
+            # Active marker ⇒ the stale deadline is cancelled, not committed.
+            assert snap.pane_idle_clear_at is None
+            assert mock_enqueue.await_count == 0
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")

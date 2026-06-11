@@ -1047,3 +1047,98 @@ def test_replay_then_seed_open_tools_round_trip(tmp_path):
     pending = route_runtime.parse_pending_tools_from_jsonl(str(p))
     route_runtime.seed_open_tools(ROUTE, pending)
     assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING_TOOL
+
+
+# ── 2026-06-11 stuck-route RCA: post-false-pane-clear recovery sequence ──
+
+
+async def test_false_pane_clear_then_transcript_sequence_reactivates():
+    """Pins the Q2 finding of the 2026-06-11 @4 incident: after a FALSE
+    pane-idle commit stashes an open Bash into ``suspended_tools``
+    (IDLE_CLEARED / idle_source="pane"), the live JSONL sequence —
+    tool_result for the suspended id, then thinking, then a fresh tool_use —
+    must walk the route straight back to RUNNING_TOOL with
+    ``typing_eligible`` True. Event shapes mirror the session
+    fd08a1ff JSONL timeline (Bash tool_use 08:38:03.764Z, tool_result
+    08:42:21.652Z, thinking stop_reason='tool_use' 08:42:34.230Z, Read
+    tool_use 08:42:35.361Z).
+
+    Verified against the live log: typing for the route resumed at
+    09:42:24 local, ~2s after the tool_result ingest — the restore+close
+    pairing works as contracted, so the ONLY live bug was the false commit
+    itself (Q1, covered in test_status_polling / test_terminal_parser).
+    """
+    t0 = 1_762_000_000.0  # arbitrary wall-clock epoch base
+
+    # Open Bash → RUNNING_TOOL.
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE,
+        TranscriptLifecycleEvent(
+            role="assistant",
+            block_type="tool_use",
+            tool_use_id="bash-hermes",
+            tool_name="Bash",
+            stop_reason="tool_use",
+            timestamp=t0,
+        ),
+    )
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.typing_eligible is True
+
+    # False pane-idle clear commits (deadline armed + due): the open Bash is
+    # MOVED to suspended_tools and the route reads IDLE_CLEARED(pane).
+    route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
+    assert await route_runtime.commit_pane_idle_clear(ROUTE, now=105.0) is True
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state is RunState.IDLE_CLEARED
+    assert snap.open_tools == frozenset()
+    assert snap.typing_eligible is False
+
+    # tool_result for the SUSPENDED id: restore + close through the normal
+    # pairing → empty open set on an active turn → RUNNING.
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE,
+        TranscriptLifecycleEvent(
+            role="user",
+            block_type="tool_result",
+            tool_use_id="bash-hermes",
+            tool_name="Bash",
+            stop_reason=None,
+            timestamp=t0 + 258.0,
+        ),
+    )
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
+    assert snap.open_tools == frozenset()
+
+    # Mid-stream thinking (stop_reason carries 'tool_use' in live JSONL —
+    # NOT a turn end): stays RUNNING.
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE,
+        TranscriptLifecycleEvent(
+            role="assistant",
+            block_type="thinking",
+            tool_use_id=None,
+            tool_name=None,
+            stop_reason="tool_use",
+            timestamp=t0 + 270.5,
+        ),
+    )
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
+
+    # Fresh tool_use: derives RUNNING_TOOL.
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE,
+        TranscriptLifecycleEvent(
+            role="assistant",
+            block_type="tool_use",
+            tool_use_id="read-1",
+            tool_name="Read",
+            stop_reason="tool_use",
+            timestamp=t0 + 271.6,
+        ),
+    )
+    assert snap.run_state is RunState.RUNNING_TOOL
+    assert snap.typing_eligible is True
+    assert snap.open_tools == frozenset({"read-1"})
