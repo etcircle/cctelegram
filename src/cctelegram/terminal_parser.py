@@ -1973,18 +1973,24 @@ def parse_background_jobs(pane_text: str) -> int | None:
     if not pane_text:
         return None
     lines = pane_text.split("\n")
-    chrome_idx = _find_chrome_separator(lines)
-    if chrome_idx is None:
+    if _find_chrome_separator(lines) is None:
         return None
+
+    # All separator lines in the bottom scan window. The input box renders
+    # as a PAIR (top + bottom separator); anchoring the churn scan on the
+    # second-to-last separator — not the topmost — keeps a quoted ``────``
+    # inside body output from hijacking the anchor (hermes GH #43 diff P3).
+    search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
+    sep_idxs = [
+        i
+        for i in range(search_start, len(lines))
+        if len(lines[i].strip()) >= 20 and all(c == "─" for c in lines[i].strip())
+    ]
 
     counts: list[int] = []
 
     # Status bar: first ⏵ line below the LAST separator in the frame.
-    last_sep = chrome_idx
-    for i in range(chrome_idx + 1, len(lines)):
-        stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
-            last_sep = i
+    last_sep = sep_idxs[-1]
     for i in range(last_sep + 1, len(lines)):
         line = lines[i].strip()
         if not line:
@@ -1995,9 +2001,11 @@ def parse_background_jobs(pane_text: str) -> int | None:
                 counts.append(int(m.group(1)))
             break
 
-    # Churn line: the spinner line above the TOP separator (same bounded
-    # walk-up as parse_status_line — blanks and task-progress lines skipped).
-    for i in range(chrome_idx - 1, max(chrome_idx - 16, -1), -1):
+    # Churn line: the spinner line above the input box's TOP separator
+    # (the second-to-last separator when the pair is visible), same bounded
+    # walk-up as parse_status_line — blanks and task-progress lines skipped.
+    churn_anchor = sep_idxs[-2] if len(sep_idxs) >= 2 else sep_idxs[-1]
+    for i in range(churn_anchor - 1, max(churn_anchor - 16, -1), -1):
         line = lines[i].strip()
         if not line:
             continue

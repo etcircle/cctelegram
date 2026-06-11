@@ -53,13 +53,17 @@ def _evt(
 
 @pytest.fixture(autouse=True)
 def _reset():
-    from cctelegram.handlers import pane_signals
+    from cctelegram.handlers import pane_signals, status_polling
 
     route_runtime.reset_for_tests()
     pane_signals.reset_for_tests()
+    status_polling._last_pane_capture.clear()
+    status_polling._prev_run_state.clear()
     yield
     route_runtime.reset_for_tests()
     pane_signals.reset_for_tests()
+    status_polling._last_pane_capture.clear()
+    status_polling._prev_run_state.clear()
 
 
 # ── W4a: parser ──────────────────────────────────────────────────────────
@@ -347,7 +351,10 @@ async def test_poller_records_bg_jobs_and_repaints_on_change():
         assert pane_signals.peek_background_jobs(route, now=time.time()) == 1
         first_refreshes = mock_refresh.await_count
         assert first_refreshes >= 1  # changed (first observation) → repaint
-        # Same count again → no additional change-repaint.
+        # Same count again → no additional change-repaint. Pop the watchdog
+        # stamp so the second tick genuinely re-captures (the adaptive gate
+        # would otherwise skip the capture and make this assertion vacuous).
+        status_polling._last_pane_capture.pop(route, None)
         await status_polling.update_status_message(
             AsyncMock(), user_id=1, window_id=window_id, thread_id=42
         )
@@ -367,3 +374,88 @@ async def test_topic_teardown_clears_bg_jobs():
     pane_signals.record_background_jobs(route, 1, now=time.time())
     await cleanup.clear_topic_state(uid, 42)
     assert pane_signals.peek_background_jobs(route, now=time.time()) is None
+
+
+# ── dual-PASS r1 review deltas ───────────────────────────────────────────
+
+
+def test_pane_signals_stale_to_fresh_same_count_is_changed():
+    """hermes diff P2: the change detection compares RENDERED values — a
+    record that went stale (suffix hidden at next render) re-observed at the
+    SAME count must report changed so the repaint brings the ⏳ back."""
+    from cctelegram.handlers import pane_signals
+
+    assert pane_signals.record_background_jobs(ROUTE, 1, now=1000.0) is True
+    # Re-observed fresh at the same count → no change.
+    assert pane_signals.record_background_jobs(ROUTE, 1, now=1005.0) is False
+    # Re-observed AFTER the staleness horizon at the same count → changed.
+    later = 1005.0 + pane_signals.BG_JOBS_MAX_AGE_S + 1.0
+    assert pane_signals.record_background_jobs(ROUTE, 1, now=later) is True
+
+
+def test_parser_churn_anchor_survives_quoted_separator_in_body():
+    """hermes diff P3: a quoted ``────`` + churn-like text in body output
+    inside the bottom scan window must not hijack the churn anchor."""
+    frame = (
+        "some prose\n"
+        "✻ fake · 3 shells still running\n"
+        "──────────────────────────────────────\n"  # quoted body separator
+        "──────────────────────────────────────\n"  # input box top
+        "❯ \n"
+        "──────────────────────────────────────\n"  # input box bottom
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+    assert parse_background_jobs(frame) == 0
+
+
+@pytest.mark.asyncio
+async def test_poller_one_to_zero_drops_suffix_and_repaints():
+    """hermes diff P3: the loss path — a later capture with chrome and NO
+    token records 0 and triggers the repaint that drops the ⏳."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from cctelegram.handlers import pane_signals, status_polling
+
+    window_id = "@7"
+    route: route_runtime.Route = (1, 42, window_id)
+    await _idle_route(route)
+
+    mock_window = MagicMock()
+    mock_window.window_id = window_id
+    frame_one = FIXTURE.read_text()
+    frame_zero = (
+        "⏺ Started sleep in the background\n"
+        "✻ Brewed for 6s\n"
+        "\n"
+        "──────────────────────────────────────\n"
+        "❯ \n"
+        "──────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+    )
+
+    with (
+        patch.object(status_polling, "tmux_manager") as mock_tmux,
+        patch.object(status_polling, "enqueue_status_update", new_callable=AsyncMock),
+        patch.object(status_polling, "handle_interactive_ui", new_callable=AsyncMock),
+        patch.object(
+            status_polling,
+            "refresh_activity_digest_if_present",
+            new_callable=AsyncMock,
+        ) as mock_refresh,
+    ):
+        mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+        mock_tmux.capture_pane = AsyncMock(return_value=frame_one)
+        await status_polling.update_status_message(
+            AsyncMock(), user_id=1, window_id=window_id, thread_id=42
+        )
+        after_one = mock_refresh.await_count
+        assert pane_signals.peek_background_jobs(route, now=time.time()) == 1
+        # The shell finished — next capture has chrome but no token. Pop
+        # the watchdog stamp so this tick re-captures.
+        status_polling._last_pane_capture.pop(route, None)
+        mock_tmux.capture_pane = AsyncMock(return_value=frame_zero)
+        await status_polling.update_status_message(
+            AsyncMock(), user_id=1, window_id=window_id, thread_id=42
+        )
+        assert pane_signals.peek_background_jobs(route, now=time.time()) == 0
+        assert mock_refresh.await_count > after_one  # 1→0 repainted

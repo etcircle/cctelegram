@@ -58,13 +58,28 @@ def record_background_jobs(route: Route, count: int, *, now: float) -> bool:
     chrome / failed capture) must not reach here — the caller skips them so
     a bad frame can't erase a fresh count.
 
-    Returns True iff the rendered value changed (count differs from the
-    previous record, or first observation) — the caller uses it to trigger
-    a digest repaint; a same-count refresh only re-stamps freshness.
+    Returns True iff the RENDERED value changed (hermes GH #43 diff P2):
+    what renders is "fresh count>0 → suffix" vs "stale / 0 / absent → no
+    suffix", so the comparison is between rendered states, not raw counts —
+    a record that went STALE and is now re-observed at the same count must
+    repaint (the card dropped nothing while stale only because nothing
+    re-rendered; the next render after this record must be triggered).
+    The caller uses True to fire a digest repaint; a same-rendered-value
+    refresh only re-stamps freshness.
     """
     prev = _signals.get(route)
+    prev_shown = (
+        prev is not None
+        and prev.count > 0
+        and (now - prev.captured_at) <= BG_JOBS_MAX_AGE_S
+    )
+    new_shown = count > 0
     _signals[route] = BackgroundJobs(count=count, captured_at=now)
-    return prev is None or prev.count != count
+    if prev is None:
+        return True
+    if prev_shown != new_shown:
+        return True
+    return new_shown and prev.count != count
 
 
 def peek_background_jobs(
