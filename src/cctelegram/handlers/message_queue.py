@@ -1926,8 +1926,13 @@ async def _process_subagent_activity_task(
     state = _subagent_msg_info.get(state_key)
     # W2 tombstone: a block re-detected AFTER the card collapsed must not
     # re-inflate the play-by-play (plan v4 §3) — a genuinely new run has a
-    # new subagent_key, so the kept slot only ever blocks stragglers.
+    # new subagent_key, so the kept slot only ever blocks stragglers. The
+    # RE-FLUSH (not a pure return) makes the collapse retry-safe (codex
+    # PR-2 P1-2): a RetryAfter raised out of the collapse upsert re-enters
+    # this task via ``_run_with_retry`` and must re-attempt the collapsed
+    # delivery; a delivered collapse dedups on ``last_text`` (no API call).
     if state is not None and state.window_id == wid and state.collapsed:
+        await _flush_subagent_digest_now(bot, user_id, task.thread_id, subagent_key)
         return
     if state is None or state.window_id != wid:
         state = SubagentDigestState(
@@ -2644,16 +2649,31 @@ async def _finalize_activity_digest(
     # W2 backstop sweep — before the parent card finalizes, so the topic
     # settles in one pass. Only the summary policy collapses; ``keep``
     # leaves play-by-play cards as today, ``off`` never created any.
+    # Already-collapsed cards are RE-FLUSHED, not skipped (codex PR-2 P1-2):
+    # a RetryAfter may have aborted the collapse delivery after the
+    # ``collapsed`` mark; the flush dedups on ``last_text`` so a delivered
+    # collapse is a no-op.
     if prefs.subagent_cards == output_prefs.SUBAGENT_CARDS_SUMMARY:
         for (s_uid, s_tid, s_key), s_state in list(_subagent_msg_info.items()):
-            if s_uid == user_id and s_tid == tid and not s_state.collapsed:
+            if s_uid != user_id or s_tid != tid:
+                continue
+            if s_state.collapsed:
+                await _flush_subagent_digest_now(bot, user_id, thread_id, s_key)
+            else:
                 await _collapse_subagent_digest(bot, user_id, thread_id, s_key)
 
     state = _activity_msg_info.get((user_id, tid))
-    if not state or state.window_id != window_id or state.done:
+    if not state or state.window_id != window_id:
         return
-    state.done = True
-    state.finalized_at = time.time()
+    # Retry-safe (codex PR-2 P1-1): the stamps are first-call-only, but the
+    # flush below runs on EVERY call — a RetryAfter raised out of the flush
+    # makes ``_run_with_retry`` re-enter this finalize, and an early-return
+    # on ``state.done`` would permanently skip the terminal collapse while
+    # the assistant text still delivered. Repeat flushes are free: the
+    # upsert dedups on ``last_text``.
+    if not state.done:
+        state.done = True
+        state.finalized_at = time.time()
     if prefs.digest_on_done == output_prefs.DIGEST_ON_DONE_DELETE:
         await _delete_activity_digest(bot, user_id, thread_id)
         return

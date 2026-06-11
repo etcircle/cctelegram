@@ -4071,3 +4071,103 @@ class TestRouteUserTurnAt:
         assert message_queue.peek_route_user_turn_at(1, 100, "@0") is not None
         message_queue.reset_for_tests()
         assert message_queue.peek_route_user_turn_at(1, 100, "@0") is None
+
+
+class TestCollapseRetrySafety:
+    """W1/W2 terminal collapse must survive a RetryAfter (codex PR-2 P1s).
+
+    The stamps (``done`` / ``collapsed``) are intent, not delivery — a
+    RetryAfter raised out of the terminal flush re-enters via
+    ``_run_with_retry``, and the re-entered finalize/task must RE-FLUSH
+    (the ``last_text`` dedup makes a delivered collapse free) instead of
+    early-returning on the stamp.
+    """
+
+    @staticmethod
+    def _flaky_topic_send(sent_texts: list[str]):
+        from cctelegram.handlers.message_sender import TopicSendOutcome
+
+        attempts = {"n": 0}
+
+        async def fake_send(
+            bot, *, op, user_id, chat_id, thread_id, window_id, text, **kw
+        ):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RetryAfter(timedelta(seconds=1))
+            sent_texts.append(text)
+            msg = MagicMock()
+            msg.message_id = 777
+            return msg, TopicSendOutcome.OK
+
+        return fake_send
+
+    @pytest.mark.asyncio
+    async def test_finalize_summary_collapse_retried_after_retry_after(
+        self, mock_bot: AsyncMock
+    ):
+        from cctelegram.session import session_manager
+
+        sent: list[str] = []
+        session_manager.user_settings[1] = {"verbosity": "standard"}
+        state = message_queue.ActivityDigestState(
+            message_id=0, window_id="@0", started_at=time.time()
+        )
+        state.tool_count = 2
+        state.completed_count = 2
+        state.lines = ["⚙️ **Bash**(ls)"]
+        message_queue._activity_msg_info[(1, 100)] = state
+        with (
+            patch.object(
+                message_queue, "topic_send", side_effect=self._flaky_topic_send(sent)
+            ),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            with pytest.raises(RetryAfter):
+                await message_queue._finalize_activity_digest(mock_bot, 1, 100, "@0")
+            # _run_with_retry re-enters the content task → finalize again.
+            await message_queue._finalize_activity_digest(mock_bot, 1, 100, "@0")
+        assert sent, "the retried finalize must deliver the collapsed card"
+        assert "2 tools" in sent[-1]
+        assert "•" not in sent[-1]
+        assert "Activity:" not in sent[-1]
+        session_manager.user_settings.clear()
+        message_queue._activity_msg_info.clear()
+
+    @pytest.mark.asyncio
+    async def test_subagent_collapse_retried_after_retry_after(
+        self, mock_bot: AsyncMock
+    ):
+        from cctelegram.session import session_manager
+
+        sent: list[str] = []
+        session_manager.user_settings[1] = {"verbosity": "standard"}
+        task = message_queue.MessageTask(
+            task_type="content",
+            text="final report",
+            window_id="@0",
+            parts=["final report"],
+            content_type="text",
+            thread_id=100,
+            subagent_key="sub:parent:agent-xyz789",
+            stop_reason="end_turn",
+        )
+        with (
+            patch.object(
+                message_queue, "topic_send", side_effect=self._flaky_topic_send(sent)
+            ),
+            patch.object(
+                message_queue.session_manager, "resolve_chat_id", return_value=1
+            ),
+        ):
+            with pytest.raises(RetryAfter):
+                await message_queue._process_subagent_activity_task(mock_bot, 1, task)
+            # The retried task hits the collapsed tombstone and RE-FLUSHES.
+            await message_queue._process_subagent_activity_task(mock_bot, 1, task)
+        assert sent, "the retried task must deliver the collapsed card"
+        assert "✅" in sent[-1]
+        assert "•" not in sent[-1]
+        session_manager.user_settings.clear()
+        message_queue._subagent_msg_info.clear()
