@@ -54,6 +54,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .. import route_runtime
+from . import pane_signals
 from ..config import config
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
@@ -545,6 +546,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # open_tools / context_usage / pane_interactive_pending) — unbind_thread
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
+        pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -628,6 +630,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # open_tools / context_usage / pane_interactive_pending) — unbind_thread
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
+        pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -801,6 +804,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # open_tools / context_usage / pane_interactive_pending) — unbind_thread
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
+        pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
@@ -1070,6 +1074,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # open_tools / context_usage / pane_interactive_pending) — unbind_thread
         # alone leaks it. ``or 0`` matches the SET-path key in status_polling.
         route_runtime.clear_route((user.id, thread_id or 0, wid))
+        pane_signals.clear_route((user.id, thread_id or 0, wid))  # GH #43
         await safe_reply(
             update.message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"

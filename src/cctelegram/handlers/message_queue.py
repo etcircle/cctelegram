@@ -41,6 +41,7 @@ from ..terminal_parser import is_status_active, parse_status_line
 from ..tmux_manager import tmux_manager
 from . import attention
 from . import output_prefs
+from . import pane_signals
 from ..route_runtime import RunState
 from .message_sender import (
     TopicSendOutcome,
@@ -1324,9 +1325,19 @@ def _format_duration(seconds: float) -> str:
 
 
 def _render_collapsed_activity_summary(
-    state: ActivityDigestState, status: str, display: str, suffix: str
+    state: ActivityDigestState,
+    status: str,
+    display: str,
+    suffix: str,
+    bg_jobs: int | None = None,
 ) -> str:
-    """One-line W1 summary: header + frozen counts + frozen duration."""
+    """One-line W1 summary: header + frozen counts + frozen duration.
+
+    ``bg_jobs`` (GH #43) appends a live ``⏳ N background job(s)`` decoration
+    — the one non-frozen part: it appears while the pane reports running
+    background shells on an idle route and disappears when they finish (the
+    poller repaints on count change; staleness hides it otherwise).
+    """
     parts = [f"{status} — {display}{suffix}"]
     if state.tool_count:
         parts.append(f"{state.tool_count} tool{'s' if state.tool_count != 1 else ''}")
@@ -1337,6 +1348,8 @@ def _render_collapsed_activity_summary(
         )
     if state.started_at and state.finalized_at:
         parts.append(_format_duration(state.finalized_at - state.started_at))
+    if bg_jobs:
+        parts.append(f"⏳ {bg_jobs} background job{'s' if bg_jobs != 1 else ''}")
     return " · ".join(parts)
 
 
@@ -1389,7 +1402,19 @@ def _render_activity_digest(
             status = "🟡 Busy"
         suffix = ""
     if collapse_done and state.done:
-        return _render_collapsed_activity_summary(state, status, display, suffix)
+        # GH #43: idle routes decorate the collapsed card with the pane's
+        # background-shell count (pull-read from the pane_signals leaf;
+        # active routes never render it — Busy/typing already say "work in
+        # flight").
+        bg_jobs: int | None = None
+        if route is not None and route_runtime.snapshot(route).run_state in (
+            RunState.IDLE_RECENT,
+            RunState.IDLE_CLEARED,
+        ):
+            bg_jobs = pane_signals.peek_background_jobs(route, now=time.time())
+        return _render_collapsed_activity_summary(
+            state, status, display, suffix, bg_jobs=bg_jobs
+        )
     lines = [f"{status} — {display}{suffix}"]
     if state.tool_count or state.completed_count:
         lines.append(
@@ -3531,6 +3556,7 @@ async def teardown_route(route: Route, *, drop_pending: bool) -> None:
         # anchor so a re-bound route can't carry a stale turn boundary.
         _route_user_turn_at.pop(route, None)
         route_runtime.clear_route(route)
+        pane_signals.clear_route(route)  # GH #43
         # Cancel any pending activity-digest debounce so we don't fire an
         # edit against a torn-down route. Also drop the upsert lock — a
         # fresh route gets a fresh lock.

@@ -369,6 +369,28 @@ Handler modules (handlers/):
                         / teardown_window / reset_for_tests. pick_token.
                         recover_and_consume reads it to re-dispatch a token-less
                         tap after a restart.
+  pane_signals.py     ─ GH #43 pane-derived per-route DECORATION store (true
+                        leaf — imports nothing from the app; in-memory only).
+                        Holds the latest pane-parsed background-shell count per
+                        route (terminal_parser.parse_background_jobs: chrome-
+                        region anchored — status-bar `· N shell` primary, churn
+                        `· N shell(s) still running` fallback, MAX on conflict;
+                        0 = chrome-present-no-token, None = no chrome → caller
+                        skips so a bad frame never erases a fresh count).
+                        Written by status_polling on every full capture
+                        (record_background_jobs returns CHANGED → poller fires
+                        refresh_activity_digest_if_present — pull-side repaint,
+                        no observer); read by the collapsed done-card renderer
+                        (`⏳ N background job(s)` suffix, IDLE routes only) and
+                        /dashboard (⏳ replaces ⚪ on idle+fresh-count>0; 🔔
+                        outranks). peek staleness BG_JOBS_MAX_AGE_S=30s (3× the
+                        capture watchdog). NEVER a run_state input, NEVER
+                        typing (recorded user decision). Teardown beside every
+                        route_runtime clear seam: poller window-gone,
+                        cleanup.clear_topic_state (topic-wide), inbound stale-
+                        window unbinds, message_queue.teardown_route, bot
+                        /clear + session_monitor rotation (mark_session_reset
+                        sites).
 
 State files (~/.cc-telegram/ or $CC_TELEGRAM_DIR/):
   state.json               ─ thread bindings + window states + display names +

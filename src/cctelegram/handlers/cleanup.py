@@ -16,7 +16,7 @@ from telegram import Bot
 from .. import md_capture, route_runtime
 from ..session import session_id_for_window, session_manager
 
-from . import attention, notify_source, pick_intent
+from . import attention, notify_source, pane_signals, pick_intent
 from .dashboard import clear_dashboards_in_thread
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
@@ -130,6 +130,10 @@ async def clear_topic_state(
     # e.g. a pane-set WAITING_ON_USER after the topic is closed / the window is gone
     # (hermes round-2 P2). route_runtime owns its own topic-teardown seam.
     route_runtime.clear_routes_for_topic(user_id, thread_id or 0)
+    # GH #43: drop the topic's pane-derived background-job records beside
+    # the route_runtime teardown (same ownership rationale — pull-only
+    # leaf state keyed by route must not survive the topic).
+    pane_signals.clear_routes_for_topic(user_id, thread_id or 0)
 
     # Pop the status poller's route-local caches for this topic (gate P3-1) —
     # a rebound topic reusing the same route key must not inherit a stale

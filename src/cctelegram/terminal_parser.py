@@ -1938,6 +1938,89 @@ def parse_status_line(pane_text: str) -> str | None:
     return None
 
 
+_RE_BG_SHELLS_BAR = re.compile(r"(?:^|·\s)(\d+)\s+shells?(?=\s*·|\s*$)")
+_RE_BG_SHELLS_CHURN = re.compile(r"·\s*(\d+)\s+shells?\s+still\s+running\b")
+
+
+def parse_background_jobs(pane_text: str) -> int | None:
+    """Extract Claude Code's background-shell count from a pane frame (GH #43).
+
+    A turn that ends with a backgrounded shell still executing shows the
+    count in two chrome-region places (v2.1.168, real-fixture verified):
+
+      - the status bar below the bottom separator:
+        ``⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage``
+      - the churn/spinner line above the top separator:
+        ``✻ Brewed for 6s · 1 shell still running``
+
+    The scan is anchored to the CHROME REGION ONLY (never body prose — a
+    ``· 3 shells ·`` string in Claude's output must not count): the status
+    bar is the first ``⏵`` line below the LAST separator; the churn line is
+    the spinner line found by the same bounded walk-up
+    ``parse_status_line`` uses. The status bar is the primary anchor (the
+    2026-06-11 incident frame defeated ``parse_status_line`` via the
+    task-progress overlay while its status bar still showed ``· 1 shell``);
+    on conflicting tokens the MAX wins.
+
+    Returns ``None`` when no chrome separator is visible (untrusted /
+    truncated frame — callers must not record), and ``0`` when the chrome
+    is present but neither token is (positively no background shells).
+    NOTE: a mid-run frame may read 0 even with live shells (the running
+    status bar truncates and the active spinner carries no token) — callers
+    only RENDER the count on idle routes, where the idle frame restores it
+    within one capture watchdog interval.
+    """
+    if not pane_text:
+        return None
+    lines = pane_text.split("\n")
+    if _find_chrome_separator(lines) is None:
+        return None
+
+    # All separator lines in the bottom scan window. The input box renders
+    # as a PAIR (top + bottom separator); anchoring the churn scan on the
+    # second-to-last separator — not the topmost — keeps a quoted ``────``
+    # inside body output from hijacking the anchor (hermes GH #43 diff P3).
+    search_start = max(0, len(lines) - _CHROME_SCAN_LINES)
+    sep_idxs = [
+        i
+        for i in range(search_start, len(lines))
+        if len(lines[i].strip()) >= 20 and all(c == "─" for c in lines[i].strip())
+    ]
+
+    counts: list[int] = []
+
+    # Status bar: first ⏵ line below the LAST separator in the frame.
+    last_sep = sep_idxs[-1]
+    for i in range(last_sep + 1, len(lines)):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if line.startswith("⏵"):
+            m = _RE_BG_SHELLS_BAR.search(line)
+            if m:
+                counts.append(int(m.group(1)))
+            break
+
+    # Churn line: the spinner line above the input box's TOP separator
+    # (the second-to-last separator when the pair is visible), same bounded
+    # walk-up as parse_status_line — blanks and task-progress lines skipped.
+    churn_anchor = sep_idxs[-2] if len(sep_idxs) >= 2 else sep_idxs[-1]
+    for i in range(churn_anchor - 1, max(churn_anchor - 16, -1), -1):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if line[0] in STATUS_SPINNERS:
+            m = _RE_BG_SHELLS_CHURN.search(line)
+            if m:
+                counts.append(int(m.group(1)))
+            break
+        if line.startswith(_TASK_PROGRESS_PREFIXES):
+            continue
+        break
+
+    return max(counts) if counts else 0
+
+
 def is_status_active(pane_text: str) -> bool:
     """Return True iff Claude is actively producing output.
 

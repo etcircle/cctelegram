@@ -65,6 +65,7 @@ from .. import route_runtime
 from ..config import config
 from ..route_runtime import RunState
 from ..session import session_manager
+from . import pane_signals
 from .message_sender import (
     TopicSendOutcome,
     safe_reply,
@@ -198,7 +199,18 @@ def render_dashboard(
             line = f"🟡 {name} — running" + (f" {detail}" if detail else "")
             rows.append((1, name.lower(), line))
         else:
-            line = f"⚪ {name} — idle" + (f" {age}" if age else "")
+            # GH #43: an idle route with fresh pane-reported background
+            # shells shows ⏳ instead of ⚪ (a decoration only — 🔔 above
+            # outranks it, the run-state is untouched, and a stale count
+            # silently falls back to ⚪ via the peek's max_age).
+            bg_jobs = pane_signals.peek_background_jobs(route, now=time.time())
+            if bg_jobs:
+                line = (
+                    f"⏳ {name} — idle · {bg_jobs} background "
+                    f"job{'s' if bg_jobs != 1 else ''}" + (f" {age}" if age else "")
+                )
+            else:
+                line = f"⚪ {name} — idle" + (f" {age}" if age else "")
             rows.append((2, name.lower(), line))
 
     if not rows:

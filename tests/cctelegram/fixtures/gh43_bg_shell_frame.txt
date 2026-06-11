@@ -1,0 +1,24 @@
+❯ 
+⏺ User answered Claude's─questions:─────────────────────────────────────────────
+  ⎿  · Pick3 → Pissions on (shift+tab to cycle) · ← for agents
+
+⏺ You picked P.
+
+✻ Cogitated for 5s
+
+❯ Run the command 'sleep 600' as a background Bash command (run_in_background
+  true). As soon as it is started, end your turn with a one-line confirmation.
+  Do not wait for it or poll it.
+
+⏺ Bash(sleep 600)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Started sleep 600 in the background (ID: b2n10pobq).
+
+✻ Brewed for 6s · 1 shell still running
+
+────────────────────────────────────────────────────────────────────────────────
+❯ check if it's done
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage
+

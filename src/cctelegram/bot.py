@@ -142,6 +142,7 @@ from .handlers.message_sender import (
 from .handlers.response_builder import build_response_parts, is_task_notification
 from .handlers.status_polling import status_poll_loop, typing_action_loop
 from . import route_runtime, terminal_parser, transcript_event_adapter
+from .handlers import pane_signals
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor, TranscriptEvent
@@ -725,6 +726,7 @@ async def forward_command_handler(
             # (which DROPS that cache) keeps the new session's footer from
             # rendering the dead session's 1M latch.
             await route_runtime.mark_session_reset(route)
+            pane_signals.clear_route(route)  # GH #43: dead session's count
 
         # Interactive commands (e.g. /model) render a terminal-based UI
         # with no JSONL tool_use entry.  The status poller already detects

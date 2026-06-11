@@ -1108,12 +1108,14 @@ class SessionMonitor:
             from .session import session_manager
             from .handlers.interactive_ui import forget_ask_tool_input
             from . import route_runtime
+            from .handlers import pane_signals
 
             for user_id, thread_id, wid in session_manager.iter_thread_bindings():
                 if wid in changed_window_ids:
                     await route_runtime.mark_session_reset(
                         (user_id, thread_id or 0, wid)
                     )
+                    pane_signals.clear_route((user_id, thread_id or 0, wid))
                     logger.info(
                         "Reset route_runtime route after session change: "
                         "user=%d thread=%s window=%s",

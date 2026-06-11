@@ -52,12 +52,13 @@ from ..terminal_parser import (
     has_pane_chrome,
     is_picker_anchor_visible,
     is_status_active,
+    parse_background_jobs,
     parse_status_line,
     resolve_ask_form,
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
-from . import auq_source, notify_source, pick_token
+from . import auq_source, notify_source, pane_signals, pick_token
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -446,6 +447,8 @@ async def update_status_message(
         _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
         _last_published_ui_hash.pop((user_id, thread_id or 0, window_id), None)
         _absent_streak.pop((user_id, thread_id or 0, window_id), None)
+        # GH #43: a gone window can't run shells — drop its bg-jobs record.
+        pane_signals.clear_route((user_id, thread_id or 0, window_id))
         # Best-effort teardown of the poller-local repaint-dedup cache (the only
         # _prev_run_state pop; status_polling-local, so import-safe — NOT from
         # message_queue, which would invert the status_polling → message_queue
@@ -523,6 +526,17 @@ async def update_status_message(
         # Transient capture failure - keep existing status message
         return
     _last_pane_capture[route] = time.monotonic()
+
+    # GH #43: record the pane's background-shell count on every full capture
+    # (0 = chrome present, positively no shells — recorded so a finished
+    # shell's ⏳ disappears; None = no chrome → skip, a bad frame must not
+    # erase a fresh count). On a CHANGED count, repaint the digest so the
+    # collapsed done-card's ⏳ decoration tracks the pane (pull-side refresh
+    # — no observer; c313657 stays forbidden).
+    bg_jobs = parse_background_jobs(pane_text)
+    if bg_jobs is not None:
+        if pane_signals.record_background_jobs(route, bg_jobs, now=capture_wall):
+            await refresh_activity_digest_if_present(bot, user_id, thread_id, window_id)
 
     # Read the next-turn context size from the session's JSONL into the
     # route_runtime context-usage cache. The activity-digest header reads it
