@@ -724,13 +724,6 @@ def _reset_session_manager() -> None:
     _real_sm.group_chat_ids.clear()
     _real_sm.dashboards.clear()
     _real_sm.user_settings.clear()
-    # Pin the suite's default preset to "verbose" (≡ pre-settings behavior)
-    # so the existing scenario floor keeps testing today's output shape after
-    # PR-2 flipped the production default to "standard" (plan v4 §9). Tests
-    # exercising the new presets set a stored user setting explicitly.
-    from cctelegram.config import config as _cfg
-
-    _cfg.default_verbosity = "verbose"
 
 
 def _reset_aggregator() -> None:
@@ -839,6 +832,23 @@ def fake_tmux(monkeypatch: pytest.MonkeyPatch) -> FakeTmux:
 @pytest.fixture
 def fake_bot() -> FakeBot:
     return FakeBot()
+
+
+@pytest.fixture(autouse=True)
+def _pin_default_verbosity():
+    """Pin the suite-wide default preset to "verbose" (≡ pre-settings
+    behavior) for EVERY test, deterministically — PR-2 flipped the
+    production default to "standard" (plan v4 §9), and an order-dependent
+    pin (reset-seam only) would let a solo-run unit test see the production
+    default. Tests exercising the new presets set a stored user setting (or
+    monkeypatch ``config.default_verbosity``) explicitly.
+    """
+    from cctelegram.config import config as _cfg
+
+    prev = _cfg.default_verbosity
+    _cfg.default_verbosity = "verbose"
+    yield
+    _cfg.default_verbosity = prev
 
 
 @pytest.fixture
