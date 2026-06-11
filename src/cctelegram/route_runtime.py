@@ -180,6 +180,12 @@ class ContextUsage:
 # stop_reasons that signal "this assistant turn is over".
 _TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
 
+# Cap on the per-route buffer of tool_result ids that arrived BEFORE their
+# tool_use (out-of-order JSONL flush — GH #42). Oldest entry evicted past the
+# cap; a post-eviction tool_use then leaks open (accepted residual — the cap
+# exists only to bound memory, and 128 far exceeds any observed pair burst).
+_EARLY_RESULTS_CAP = 128
+
 # Runtime-state TTL for the notification_pending bit (Wave B). A product
 # value, not an invariant: approval prompts are normally acted on within a
 # working session; past the TTL the 🔔 silently degrades to 🟡 and the prompt
@@ -369,6 +375,18 @@ class _RouteState:
     # / ``mark_session_reset`` / route teardown. In-memory only — restart
     # recovery stays ``parse_pending_tools_from_jsonl`` + ``seed_open_tools``.
     suspended_tools: dict[str, bool] = field(default_factory=dict)
+    # tool_result ids observed BEFORE their tool_use (out-of-order JSONL
+    # flush — GH #42), mapped to the result event's JSONL timestamp (None on
+    # parse failure). A later tool_use for a recorded id is treated as
+    # already-closed: it never opens a slot (an open slot nothing closes
+    # blocks the end-of-turn idle gate forever), and the STORED timestamp —
+    # never the tool_use event's own — drives the ts-qualified notification
+    # clear. Insertion-ordered, bounded by ``_EARLY_RESULTS_CAP`` (oldest
+    # evicted). Deliberately NEVER cleared by lifecycle events: an end_turn
+    # can straddle a pair, and ``toolu_*`` ids are unique so stale entries
+    # can never swallow a future pair. Dropped on ``mark_session_reset`` and
+    # route teardown.
+    early_tool_results: dict[str, float | None] = field(default_factory=dict)
     seen: bool = False  # have we ever observed this route?
     # Cached frozensets — invalidated on any open_tools mutation.
     # Most snapshots happen with no open tools (idle route), so the
@@ -593,11 +611,20 @@ def _set_run_state(st: _RouteState, new: RunState) -> None:
     st.seen = True
 
 
-def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> None:
+def _apply_lifecycle_event(
+    st: _RouteState, event: TranscriptLifecycleEvent, route: Route | None = None
+) -> bool:
     """Run the §2.2.1 transition table on the route's state.
 
     Operates on ``_RouteState`` without async (the lock is the caller's
-    responsibility).
+    responsibility). ``route`` is log context only — never mutated.
+
+    Returns whether the event counts as ACTIVITY for the pane-idle re-arm
+    (``ingest_transcript_event`` honors it). True for every event except the
+    terminal matched-early ``tool_use`` (GH #42): a tool_use whose
+    tool_result already passed, landing on an already-idled route, is
+    historical — re-arming off it would cancel a legitimately armed
+    card-clear deadline (codex r2 P2).
     """
     st.seen = True
 
@@ -608,6 +635,28 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
     # tool_use: open the tool. is_interactive bit travels with the id so
     # parallel turns settle correctly when each tool_result lands.
     if role == "assistant" and block == "tool_use" and event.tool_use_id:
+        if event.tool_use_id in st.early_tool_results:
+            # Out-of-order pair (GH #42): the tool_result for this id already
+            # arrived — the pair is closed; never open the slot (an open slot
+            # nothing closes blocks the end-of-turn idle gate forever).
+            result_ts = st.early_tool_results.pop(event.tool_use_id)
+            if (
+                st.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+                and not st.open_tools
+            ):
+                # An end-of-turn straddled the pair and already idled the
+                # route: preserve the idle state, deadlines and provenance —
+                # a re-derive here would revive the idled route (hermes r1
+                # P1). Historical, not activity (no pane-idle re-arm).
+                return False
+            # Active route: the known-tool_result reclaim side effects,
+            # driven by the STORED result timestamp — never this event's
+            # own (codex r1 P1; conservative: a clear can only ride a
+            # timestamp the result line actually carried).
+            st.pane_interactive_pending = False
+            _maybe_clear_notification_by_ts(st, result_ts)
+            _set_run_state(st, _derived_state(st))
+            return True
         is_interactive = bool(
             event.tool_name and event.tool_name in INTERACTIVE_TOOL_NAMES
         )
@@ -622,10 +671,11 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         st.pane_interactive_pending = False
         _maybe_clear_notification_by_ts(st, event.timestamp)
         _set_run_state(st, _derived_state(st))
-        return
+        return True
 
     # tool_result: close the slot if known. Stale ids (e.g. pre-startup
-    # tools we never saw the tool_use for) are ignored. Role is not
+    # tools we never saw the tool_use for) are recorded as early results
+    # (out-of-order JSONL — GH #42) but otherwise ignored. Role is not
     # checked because transcript_parser flips tool_result role to
     # ``assistant`` for rendering, while the JSONL envelope is
     # role="user" — block_type + tool_use_id are already specific
@@ -638,10 +688,29 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
             st.open_tools[event.tool_use_id] = st.suspended_tools.pop(event.tool_use_id)
             st.invalidate_tool_cache()
         if event.tool_use_id not in st.open_tools:
-            # Unknown id (stale / pre-startup). Preserve run_state, the pane
-            # bit AND the notification bit — an unknown tool_result is not
-            # proof of resumption and must not strand or re-hide a WAITING.
-            return
+            # Unknown id: stale/pre-startup — or the tool_result half of an
+            # out-of-order pair whose tool_use is still in flight (GH #42).
+            # Record it so the late tool_use is treated as already-closed.
+            # Run-state, the pane bit AND the notification bit are all
+            # preserved — an unknown tool_result is not proof of resumption
+            # and must not strand or re-hide a WAITING.
+            if event.tool_use_id in st.early_tool_results:
+                logger.debug(
+                    "early_tool_result duplicate route=%s id=%s",
+                    route,
+                    event.tool_use_id,
+                )
+            st.early_tool_results[event.tool_use_id] = event.timestamp
+            while len(st.early_tool_results) > _EARLY_RESULTS_CAP:
+                evicted = next(iter(st.early_tool_results))
+                st.early_tool_results.pop(evicted)
+                logger.warning(
+                    "early_tool_results cap (%d) evicted route=%s id=%s",
+                    _EARLY_RESULTS_CAP,
+                    route,
+                    evicted,
+                )
+            return True
         st.open_tools.pop(event.tool_use_id, None)
         st.invalidate_tool_cache()
         # Transcript reclaim on a KNOWN id: the buffered turn flushed. Zero
@@ -650,7 +719,7 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         st.pane_interactive_pending = False
         _maybe_clear_notification_by_ts(st, event.timestamp)
         _set_run_state(st, _derived_state(st))
-        return
+        return True
 
     # End-of-turn: thinking or text with end_turn / stop_sequence AND no
     # open tools → IDLE_RECENT. With open tools we stay in
@@ -684,10 +753,30 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         _maybe_clear_notification_by_ts(st, event.timestamp)
         if st.notification_pending:
             _set_run_state(st, _derived_state(st))
-            return
+            return True
         _set_run_state(st, RunState.IDLE_RECENT)
         st.idle_source = "transcript"
-        return
+        return True
+
+    # Diagnosis for the GH #42 class: a genuine end-of-turn that CANNOT idle
+    # the route because ``open_tools`` is non-empty (a leak, or a genuinely
+    # parallel pending tool). Mutually exclusive with the branch above;
+    # bounded sample, never the whole set (hermes/codex r1).
+    if (
+        role == "assistant"
+        and block in ("text", "thinking")
+        and stop_reason in _TURN_END_REASONS
+        and st.open_tools
+    ):
+        logger.info(
+            "end_of_turn blocked by open tools route=%s count=%d sample=%s "
+            "stop_reason=%s ts=%s",
+            route,
+            len(st.open_tools),
+            sorted(st.open_tools)[:8],
+            stop_reason,
+            event.timestamp,
+        )
 
     # Plain assistant text: at least RUNNING. Preserve RUNNING_TOOL /
     # WAITING_ON_USER (open tools / surviving bits still gate) — but
@@ -701,9 +790,9 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
                 st.last_event_at = _now()
             else:
                 _set_run_state(st, derived)
-            return
+            return True
         _set_run_state(st, RunState.RUNNING)
-        return
+        return True
 
     # Assistant thinking without end-of-turn: light up if route was idle.
     # Preserve RUNNING_TOOL / WAITING_ON_USER (same re-derive as text).
@@ -714,14 +803,14 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
             RunState.IDLE_RECENT,
         ):
             _set_run_state(st, RunState.RUNNING)
-            return
+            return True
         if st.run_state in (RunState.RUNNING_TOOL, RunState.WAITING_ON_USER):
             derived = _derived_state(st)
             if derived is not st.run_state:
                 _set_run_state(st, derived)
-                return
+                return True
         st.last_event_at = _now()
-        return
+        return True
 
     # User non-tool_result: user prompted Claude — RUNNING. A fresh user turn
     # supersedes any pane-set WAITING (the prompt was answered or replaced),
@@ -733,10 +822,11 @@ def _apply_lifecycle_event(st: _RouteState, event: TranscriptLifecycleEvent) -> 
         _clear_notification_in_place(st)
         st.suspended_tools.clear()
         _set_run_state(st, RunState.RUNNING)
-        return
+        return True
 
     # Fallback: refresh activity timer without state change.
     st.last_event_at = _now()
+    return True
 
 
 # ── public API: ingest + snapshot ───────────────────────────────────────
@@ -753,9 +843,12 @@ async def ingest_transcript_event(
     lock = _lock_for_route(route)
     async with lock:
         st = _state_for_route(route)
-        _apply_lifecycle_event(st, event)
-        # Activity re-arms the pane-idle debounce (cancels a pending clear).
-        _rearm_pane_idle_in_place(st)
+        is_activity = _apply_lifecycle_event(st, event, route)
+        if is_activity:
+            # Activity re-arms the pane-idle debounce (cancels a pending
+            # clear). A terminal matched-early tool_use (GH #42) reports
+            # False — historical, must not poke the net.
+            _rearm_pane_idle_in_place(st)
         snap = _freeze(route, st)
     return snap
 
@@ -912,6 +1005,13 @@ async def mark_interactive_cleared(route: Route) -> RouteRuntimeSnapshot:
             # bit keeps WAITING (the two bits clear INDEPENDENTLY); otherwise
             # empty / non-interactive open set → RUNNING / RUNNING_TOOL.
             _set_run_state(st, _derived_state(st))
+            if st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL):
+                # GH #42 leg 2 (W2c): real WAITING → active retract —
+                # re-enable the pane-idle net for a fresh stretch (see
+                # mark_notification_cleared). Status-card bookkeeping
+                # untouched.
+                st.pane_idle_clear_at = None
+                st.pane_idle_cleared = False
         else:
             # Transcript-set WAITING (interactive id open) or not-waiting →
             # drop the (already-False) bit only; do NOT transition run_state.
@@ -953,22 +1053,41 @@ async def mark_notification_pending(
     async with lock:
         st = _state.get(route)
         if st is None or not st.seen:
+            logger.info(
+                "notification_pending ignored (unseen route) route=%s set_at=%s",
+                route,
+                set_at,
+            )
             return NotificationMarkResult.IGNORED_NO_UNLINK
         if st.run_state is RunState.WAITING_ON_USER and any(st.open_tools.values()):
+            logger.info(
+                "notification_pending redundant (transcript WAITING) route=%s "
+                "set_at=%s",
+                route,
+                set_at,
+            )
             return NotificationMarkResult.REDUNDANT_TRANSCRIPT_WAITING
         if st.run_state in (
             RunState.RUNNING,
             RunState.RUNNING_TOOL,
             RunState.WAITING_ON_USER,
         ):
+            prior = st.run_state
             st.notification_pending = True
             st.notification_set_at = set_at
             st.notification_generation = generation
             _set_run_state(st, _derived_state(st))
             _rearm_pane_idle_in_place(st)
+            logger.info(
+                "notification_pending committed route=%s prior=%s set_at=%s",
+                route,
+                prior.name,
+                set_at,
+            )
             return NotificationMarkResult.COMMITTED_LIVE
         # Idle: only IDLE(pane) with a live stash is resurrectable.
         if st.idle_source == "pane" and st.suspended_tools:
+            restored = sorted(st.suspended_tools)[:8]
             st.open_tools.update(st.suspended_tools)
             st.suspended_tools.clear()
             st.invalidate_tool_cache()
@@ -978,7 +1097,21 @@ async def mark_notification_pending(
             # _set_run_state's active branch resets idle_source/idle_clear_at.
             _set_run_state(st, _derived_state(st))
             _rearm_pane_idle_in_place(st)
+            logger.info(
+                "notification_pending resurrected idle(pane) route=%s set_at=%s "
+                "restored=%d sample=%s",
+                route,
+                set_at,
+                len(st.open_tools),
+                restored,
+            )
             return NotificationMarkResult.COMMITTED_LIVE
+        logger.info(
+            "notification_pending stale (idle route) route=%s set_at=%s idle_source=%s",
+            route,
+            set_at,
+            st.idle_source,
+        )
         return NotificationMarkResult.STALE_UNLINK
 
 
@@ -1001,6 +1134,7 @@ async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
         if st is None:
             return _default_snapshot(route)
         had = st.notification_pending
+        prior = st.run_state
         _clear_notification_in_place(st)
         if (
             had
@@ -1008,6 +1142,19 @@ async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
             and not any(st.open_tools.values())
         ):
             _set_run_state(st, _derived_state(st))
+        if prior is RunState.WAITING_ON_USER and st.run_state in (
+            RunState.RUNNING,
+            RunState.RUNNING_TOOL,
+        ):
+            # GH #42 leg 2 (W2c): the retract returned the route to an
+            # ACTIVE state — re-enable the pane-idle net for a fresh
+            # stretch (a latch left closed across this transition is what
+            # kept the incident route typing for 31 minutes; the latch's
+            # only other resets are pane-ACTIVE observation and transcript
+            # activity, neither of which occurs on an abandoned idle pane).
+            # Status-card bookkeeping is untouched.
+            st.pane_idle_clear_at = None
+            st.pane_idle_cleared = False
         snap = _freeze(route, st)
     return snap
 
@@ -1183,11 +1330,13 @@ async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
     Returns ``True`` iff the armed deadline was still due at lock time — i.e.
     the debounce *fired*: the deadline was dropped and the ``pane_idle_cleared``
     sentinel latched. ``False`` if it no-op'd (re-armed / cancelled / not yet
-    due). Callers enqueue the card clear ONLY on ``True``. **NOTE:** ``True``
-    does NOT imply ``run_state`` changed — ``_reconcile_pane_idle_in_place``
-    *preserves* a ``WAITING_ON_USER`` route (transcript- or pane-set; pane has
-    lower authority), so for WAITING the deadline is consumed and ``True`` is
-    returned while the run-state is left untouched. Only ``RUNNING`` /
+    due — or the route is WAITING, see below). Callers enqueue the card clear
+    ONLY on ``True``. **NOTE (GH #42 leg 2, W2a):** a ``WAITING_ON_USER``
+    route (transcript- or pane-set; pane has lower authority) is NOT
+    reconcilable — the commit returns ``False`` WITHOUT consuming the deadline
+    and WITHOUT latching, so the net still works when the WAITING is later
+    retracted (TTL / mode-ended). The pre-fix consume+latch here permanently
+    disarmed the 2026-06-11 incident route. Only ``RUNNING`` /
     ``RUNNING_TOOL`` are reconciled to ``IDLE_CLEARED``.
 
     TOCTOU re-validation (Codex 8b P1): the caller checks
@@ -1211,9 +1360,25 @@ async def commit_pane_idle_clear(route: Route, *, now: float) -> bool:
         if st.pane_idle_clear_at is None or now < st.pane_idle_clear_at:
             # Re-armed or cancelled since the lockless due-check — do not clear.
             return False
+        if st.run_state is RunState.WAITING_ON_USER:
+            # GH #42 leg 2 (W2a): a WAITING route is not reconcilable (the
+            # pane has lower authority) — leave the deadline armed and the
+            # latch OPEN instead of consuming them, so the net still works
+            # when the WAITING is later retracted (TTL / mode-ended). The
+            # pre-fix consume+latch here is what permanently disarmed the
+            # incident route. The poller additionally skips arm/commit
+            # while WAITING (W2b); the visible-card clear is decoupled.
+            return False
+        prior = st.run_state
         _reconcile_pane_idle_in_place(st)
         st.pane_idle_clear_at = None
         st.pane_idle_cleared = True
+        logger.info(
+            "pane_idle_clear committed route=%s prior=%s stash=%d",
+            route,
+            prior.name,
+            len(st.suspended_tools),
+        )
     return True
 
 
@@ -1253,11 +1418,13 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         # the new session's first idle stretch arms from scratch.
         _rearm_pane_idle_in_place(st)
         # The old session's interactive prompt (if any) is gone with it —
-        # as are any pending notification, suspended tools, and the idle
-        # provenance.
+        # as are any pending notification, suspended tools, early tool
+        # results (GH #42 — they reference the dead session's ids), and
+        # the idle provenance.
         st.pane_interactive_pending = False
         _clear_notification_in_place(st)
         st.suspended_tools.clear()
+        st.early_tool_results.clear()
         # The dead session's turn stamps go with it — the dashboard's
         # unanswered-turn derivation must not survive a /clear.
         st.last_user_turn_at = None
