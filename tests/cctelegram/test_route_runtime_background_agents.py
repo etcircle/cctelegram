@@ -34,8 +34,8 @@ from cctelegram.route_runtime import (
 )
 
 ROUTE: route_runtime.Route = (1, 42, "@7")
-KEY = "a092b6b478733eef0"
-KEY2 = "ac36ad1b438c51f11"
+KEY = "a1b2c3d4e5f6a7b89"
+KEY2 = "b9f8e7d6c5b4a3210"
 
 # A stable wall-clock origin for the injectable clock.
 T0 = 1_750_000_000.0
