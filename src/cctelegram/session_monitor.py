@@ -6,8 +6,10 @@ Runs an async polling loop that:
   3. Reads new JSONL lines from each session file using byte-offset tracking.
   4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
   5. Tails sub-agent (sidechain) JSONLs unconditionally — display emission is
-     gated by show_tool_calls, but per-tick parent activity is always reported
-     (pop_sidechain_active_parents → route_runtime keep-alive).
+     gated by show_tool_calls, but per-tick per-agent activity (max event ts,
+     end-of-turn) plus parent-transcript async-launch / task-notification
+     signals are always reported (pop_sidechain_activity → the GH #44
+     route_runtime background-agent marks).
 
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
@@ -18,7 +20,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Literal
 
@@ -29,7 +31,11 @@ from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import read_cwd_from_jsonl
+from .utils import (
+    normalize_background_agent_key,
+    parse_iso_timestamp,
+    read_cwd_from_jsonl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,45 @@ _STALL_SKIP_MIN_CYCLES = 3
 # route_runtime.INTERACTIVE_TOOL_NAMES; duplicated to keep session_monitor free
 # of a route_runtime import (and the dedup is content-only, not run-state).
 _INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
+
+# GH #44: stop_reasons that end an assistant turn. Mirrors
+# ``route_runtime.TURN_END_REASONS``; duplicated to keep session_monitor free
+# of a route_runtime import (same pattern as _INTERACTIVE_TOOL_NAMES above) —
+# the fixture-gate test pins the two definitions equal.
+_TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
+
+
+@dataclass
+class SidechainTick:
+    """One tick's parsed activity for one sidechain agent (GH #44).
+
+    ``max_event_ts`` — max JSONL timestamp over the batch's parsed entries
+    (epoch via the shared ``utils.parse_iso_timestamp``; ``None`` when no
+    entry carried a parseable stamp). ``saw_end_of_turn`` — any entry
+    (INCLUDING lifecycle-only markers with no visible text) ended the
+    agent's turn.
+    """
+
+    max_event_ts: float | None = None
+    saw_end_of_turn: bool = False
+
+
+@dataclass
+class ParentSidechainActivity:
+    """Per-parent, per-tick background-agent signals (GH #44).
+
+    ``ticks`` — normalized agent_key → SidechainTick from the sidechain
+    tail. ``launched`` — agentIds extracted from async-launch Agent
+    tool_results in the PARENT transcript this tick. ``completed`` —
+    task-ids extracted from parent ``<task-notification>`` user entries.
+    Drained consume-once via ``pop_sidechain_activity`` and applied by the
+    bot fan-out AFTER the tick's lifecycle dispatch (the §4.2 ordering:
+    lifecycle → launch → activity → done).
+    """
+
+    launched: set[str] = field(default_factory=set)
+    completed: set[str] = field(default_factory=set)
+    ticks: dict[str, SidechainTick] = field(default_factory=dict)
 
 
 def _is_window_id(key: str) -> bool:
@@ -266,15 +311,19 @@ class SessionMonitor:
         # stored in the value and resets the entry when it moves). Popped on
         # skip, on offset progress, and at every session-cleanup site.
         self._unparseable_stalls: dict[str, tuple[int, float, int]] = {}
-        # Wave A: parent session_ids whose sidechain files produced new parsed
-        # entries this tick. Populated by ``check_sidechain_updates``
-        # unconditionally (even with show_tool_calls disabled) and drained via
-        # ``pop_sidechain_active_parents`` — the run-state keep-alive signal.
-        self._sidechain_active_parents: set[str] = set()
+        # GH #44 (successor of Wave A's parent-set): per-parent, per-tick
+        # background-agent signals — sidechain ticks (key + max event ts +
+        # saw_end_of_turn) populated by ``check_sidechain_updates``
+        # unconditionally (even with show_tool_calls disabled), plus
+        # async-launch agentIds / task-notification completions collected in
+        # the PARENT parse path by ``check_for_updates``. Drained consume-once
+        # via ``pop_sidechain_activity`` — the run-state keep-alive +
+        # projection-input signal.
+        self._sidechain_activity: dict[str, ParentSidechainActivity] = {}
         # Per-tick fan-out for sidechain activity (wired from bot.post_init,
         # like ``_message_callback`` / ``_event_callback``).
         self._subagent_activity_callback: (
-            Callable[[set[str]], Awaitable[None]] | None
+            Callable[[dict[str, ParentSidechainActivity]], Awaitable[None]] | None
         ) = None
 
     def set_message_callback(
@@ -292,20 +341,32 @@ class SessionMonitor:
         self._event_callback = callback
 
     def set_subagent_activity_callback(
-        self, callback: Callable[[set[str]], Awaitable[None]]
+        self,
+        callback: Callable[[dict[str, ParentSidechainActivity]], Awaitable[None]],
     ) -> None:
-        """Wire the per-tick sidechain-activity fan-out (Wave A).
+        """Wire the per-tick sidechain-activity fan-out (GH #44, ex-Wave A).
 
-        Called from ``_monitor_loop`` with the set of parent session_ids
-        whose sidechains produced new parsed entries this tick.
+        Called from ``_monitor_loop`` with the per-parent
+        ``ParentSidechainActivity`` map for this tick — AFTER the tick's
+        parent lifecycle events have already been dispatched (the §4.2
+        ordering guarantee the tombstone-reset logic relies on).
         """
         self._subagent_activity_callback = callback
 
-    def pop_sidechain_active_parents(self) -> set[str]:
-        """Drain (consume-once) the parents with sidechain activity this tick."""
-        parents = self._sidechain_active_parents
-        self._sidechain_active_parents = set()
-        return parents
+    def pop_sidechain_activity(self) -> dict[str, ParentSidechainActivity]:
+        """Drain (consume-once) this tick's per-parent background-agent
+        signals (sidechain ticks + parent launch/completion extractions)."""
+        activity = self._sidechain_activity
+        self._sidechain_activity = {}
+        return activity
+
+    def _parent_activity(self, parent_session_id: str) -> ParentSidechainActivity:
+        """Get/create the per-tick activity record for a parent session."""
+        rec = self._sidechain_activity.get(parent_session_id)
+        if rec is None:
+            rec = ParentSidechainActivity()
+            self._sidechain_activity[parent_session_id] = rec
+        return rec
 
     def register_session(
         self, session_id: str, file_path: Path, offset: int = 0
@@ -685,6 +746,41 @@ class SessionMonitor:
                             except Exception as e:
                                 logger.error(f"Event callback error: {e}")
 
+                    # GH #44: collect background-agent signals from the
+                    # PARENT transcript — applied by the bot fan-out AFTER
+                    # this tick's lifecycle dispatch (which already happened
+                    # above), preserving the §4.2 ordering. Deferred import:
+                    # the envelope/agentId extractors live in
+                    # handlers.response_builder (single regex owner).
+                    if entry.content_type == "tool_result" and entry.tool_name in (
+                        "Agent",
+                        "Task",
+                    ):
+                        from .handlers.response_builder import (
+                            extract_async_agent_launch_id,
+                        )
+
+                        launch_id = extract_async_agent_launch_id(entry.text)
+                        if launch_id:
+                            self._parent_activity(session_info.session_id).launched.add(
+                                normalize_background_agent_key(launch_id)
+                            )
+                    elif (
+                        entry.role == "user"
+                        and entry.content_type == "text"
+                        and entry.text
+                        and entry.text.lstrip().startswith("<task-notification>")
+                    ):
+                        from .handlers.response_builder import (
+                            extract_task_notification_task_id,
+                        )
+
+                        task_id = extract_task_notification_task_id(entry.text)
+                        if task_id:
+                            self._parent_activity(
+                                session_info.session_id
+                            ).completed.add(normalize_background_agent_key(task_id))
+
                     # Lifecycle-only entries exist purely to drive the
                     # busy indicator; they have no visible content and must
                     # not fan out to Telegram.
@@ -763,8 +859,9 @@ class SessionMonitor:
 
         Tracking, parsing, and activity reporting run UNCONDITIONALLY —
         a parent whose sidechains produced new parsed entries this tick is
-        recorded for ``pop_sidechain_active_parents`` (the Wave A run-state
-        keep-alive) regardless of display settings. ``config.show_tool_calls``
+        recorded per agent key for ``pop_sidechain_activity`` (the GH #44
+        run-state keep-alive + projection input) regardless of display
+        settings. ``config.show_tool_calls``
         gates only the ``NewMessage`` EMISSION below: when False, no sidechain
         messages are emitted (complete display suppression at this point — not
         bot.py-side filtering).
@@ -853,10 +950,25 @@ class SessionMonitor:
                 else:
                     self._pending_tools.pop(tracking_key, None)
 
-                # Wave A: new parsed entries = sidechain activity for the
-                # parent's route, regardless of whether anything is displayed.
+                # GH #44 (ex-Wave A): new parsed entries = sidechain activity
+                # for the parent's route, regardless of whether anything is
+                # displayed. Aggregate per normalized agent key: max parsed
+                # JSONL timestamp + end-of-turn detection — INCLUDING
+                # lifecycle-only entries with no visible text (a quiet final
+                # turn must still clear the projection; codex r2 P2-2).
                 if parsed_entries:
-                    self._sidechain_active_parents.add(parent_session_id)
+                    agent_key = normalize_background_agent_key(sc_file.stem)
+                    tick = self._parent_activity(parent_session_id).ticks.setdefault(
+                        agent_key, SidechainTick()
+                    )
+                    for entry in parsed_entries:
+                        ts = parse_iso_timestamp(entry.timestamp)
+                        if ts is not None and (
+                            tick.max_event_ts is None or ts > tick.max_event_ts
+                        ):
+                            tick.max_event_ts = ts
+                        if entry.stop_reason in _TURN_END_REASONS:
+                            tick.saw_end_of_turn = True
 
                 # Sidechain blocks are always emitted (keep-alive above is
                 # already unconditional); display gating is PER-RECIPIENT via
@@ -1607,13 +1719,15 @@ class SessionMonitor:
                 if sidechain_messages:
                     new_messages.extend(sidechain_messages)
 
-                # Wave A: fan sidechain activity out to route_runtime (the
-                # keep-alive heartbeat) — pull-only, once per tick. Never let
-                # it break the dispatch loop.
-                sidechain_parents = self.pop_sidechain_active_parents()
-                if sidechain_parents and self._subagent_activity_callback:
+                # GH #44 (ex-Wave A): fan the tick's background-agent
+                # signals out to route_runtime (keyed keep-alive + launch /
+                # done marks) — pull-only, once per tick, AFTER the parent
+                # lifecycle dispatch above (§4.2 ordering). Never let it
+                # break the dispatch loop.
+                sidechain_activity = self.pop_sidechain_activity()
+                if sidechain_activity and self._subagent_activity_callback:
                     try:
-                        await self._subagent_activity_callback(sidechain_parents)
+                        await self._subagent_activity_callback(sidechain_activity)
                     except Exception as e:
                         logger.error(f"Subagent activity callback error: {e}")
 

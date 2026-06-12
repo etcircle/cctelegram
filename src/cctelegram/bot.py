@@ -145,7 +145,12 @@ from . import route_runtime, terminal_parser, transcript_event_adapter
 from .handlers import pane_signals
 from .screenshot import text_to_image
 from .session import session_manager
-from .session_monitor import NewMessage, SessionMonitor, TranscriptEvent
+from .session_monitor import (
+    NewMessage,
+    ParentSidechainActivity,
+    SessionMonitor,
+    TranscriptEvent,
+)
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 
@@ -817,24 +822,45 @@ async def _build_context_footer(
     return f"_📊 {format_tokens(usage.tokens)} / {format_max(usage.max_tokens)}_"
 
 
-async def mark_subagent_activity_for_parents(parent_session_ids: set[str]) -> None:
-    """Wave A fan-out: sidechain activity → ``route_runtime.mark_subagent_activity``.
+async def apply_sidechain_activity(
+    activity: dict[str, ParentSidechainActivity],
+) -> None:
+    """GH #44 fan-out (successor of Wave A's ``mark_subagent_activity_for_parents``):
+    the monitor's per-tick background-agent signals → the keyed route_runtime
+    marks.
 
-    Called once per monitor tick with the parent session_ids whose sidechain
-    files produced new parsed entries (``pop_sidechain_active_parents``).
-    Resolves bound routes exactly like the parent event fan-out
-    (``find_users_for_session``) and marks each route at most once per tick.
-    Pull-only heartbeat — no lifecycle ingestion, no send-layer authority.
+    Called once per monitor tick (``pop_sidechain_activity``) AFTER the
+    tick's parent lifecycle dispatch (§4.2 ordering). Resolves bound routes
+    exactly like the parent event fan-out (``find_users_for_session``) and
+    applies, per (route, agent_key) — never deduped at route level (codex r2
+    P2-1: sibling agents in one tick must each get their marks):
+
+      1. launch marks (``is_background`` provenance — before activity so a
+         same-tick first batch records as background),
+      2. activity marks (keyed keep-alive + projection input),
+      3. done marks (sidechain end-of-turn and/or parent task-notification).
+
+    Pull-only; no lifecycle ingestion, no send-layer authority.
     """
-    marked: set[route_runtime.Route] = set()
-    for sid in parent_session_ids:
+    for sid, rec in activity.items():
         active = await session_manager.find_users_for_session(sid)
+        seen_routes: set[route_runtime.Route] = set()
         for user_id, wid, thread_id in active:
             route: route_runtime.Route = (user_id, thread_id or 0, wid)
-            if route in marked:
+            if route in seen_routes:
                 continue
-            marked.add(route)
-            await route_runtime.mark_subagent_activity(route)
+            seen_routes.add(route)
+            for key in rec.launched:
+                await route_runtime.mark_background_agent_launched(route, key)
+            for key, tick in rec.ticks.items():
+                await route_runtime.mark_background_agent_activity(
+                    route, key, tick.max_event_ts
+                )
+            for key, tick in rec.ticks.items():
+                if tick.saw_end_of_turn:
+                    await route_runtime.mark_background_agent_done(route, key)
+            for key in rec.completed:
+                await route_runtime.mark_background_agent_done(route, key)
 
 
 async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
@@ -1246,11 +1272,13 @@ async def post_init(application: Application) -> None:
 
     monitor.set_event_callback(event_callback)
 
-    # Wave A: sidechain activity keep-alive. The monitor reports which parent
-    # sessions had sidechain writes each tick; the fan-out marks their routes
-    # so a long subagent run survives transient confirmed-idle pane frames
-    # (and resurrects a pane-false-cleared route).
-    monitor.set_subagent_activity_callback(mark_subagent_activity_for_parents)
+    # GH #44 (ex-Wave A): keyed sidechain/background-agent fan-out. The
+    # monitor reports per-parent agent ticks + launch/completion signals each
+    # tick; the fan-out applies the route_runtime marks so a long sub-agent
+    # run survives transient confirmed-idle pane frames, a pane-false-cleared
+    # route resurrects, and a run_in_background agent lifts its route to a
+    # projected RUNNING (typing + 🟡 Busy) after the parent's end-of-turn.
+    monitor.set_subagent_activity_callback(apply_sidechain_activity)
 
     # Replay tool_use/tool_result pairs from each tracked parent JSONL so
     # tools that were open at the moment of bot shutdown (most painfully,

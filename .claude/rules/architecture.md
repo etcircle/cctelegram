@@ -38,9 +38,10 @@
 │    UNCONDITIONALLY;     │                   │
 │    show_tool_calls only │                   │
 │    gates display; per-  │                   │
-│    tick parent activity │                   │
-│    → mark_subagent_     │                   │
-│    activity keep-alive  │                   │
+│    tick per-agent ticks │                   │
+│    + launch/completion  │                   │
+│    signals → keyed bg-  │                   │
+│    agent marks (GH #44) │                   │
 └──────────┬──────────────┘                   │
            │                                  │
            ▼                                  ▼
@@ -100,22 +101,30 @@ Additional modules:
                                 teardown) plus a suspended_tools stash: the pane-idle
                                 reconciliation MOVES open_tools (ids + interactive
                                 flags) into the stash instead of dropping them.
-                                Restore paths: mark_subagent_activity resurrection, and
+                                Restore paths: mark_background_agent_activity
+                                resurrection (the keyed GH #44 successor of Wave A's
+                                retired mark_subagent_activity), and
                                 a transcript tool_result for a suspended id (checked
                                 BEFORE the unknown-id branch — restores+closes via the
                                 normal pairing). Drop paths: authoritative end-of-turn,
-                                user lifecycle event, mark_inbound_sent,
+                                user lifecycle event (genuine only — a
+                                task-notification user event PRESERVES the stash),
+                                mark_inbound_sent,
                                 mark_session_reset, route teardown. In-memory only
                                 (restart recovery stays parse_pending_tools_from_jsonl
-                                + seed_open_tools). mark_subagent_activity(route) is
-                                the sidechain keep-alive mutator: on RUNNING /
+                                + seed_open_tools).
+                                mark_background_agent_activity(route, key, ts) is
+                                the keyed sidechain keep-alive mutator: on RUNNING /
                                 RUNNING_TOOL it refreshes last_event_at + re-arms the
                                 pane-idle debounce (no open_tools mutation); on idle
                                 with idle_source=="pane" it RESURRECTS (restores the
                                 stash → RUNNING_TOOL, or RUNNING on an empty stash;
-                                clears idle deadlines); on transcript-idle / None it
-                                no-ops; it never overrides WAITING_ON_USER (transcript-
-                                or pane-bit-set) and never seeds an unseen route. Card
+                                clears idle deadlines — UNqualified, positive live
+                                proof); on transcript-idle / None it leaves the
+                                STORED state untouched (the GH #44 projection lifts
+                                the visible state instead — see below); it never
+                                overrides WAITING_ON_USER (transcript- or
+                                pane-bit-set) and never seeds an unseen route. Card
                                 claim NARROWED: a status clear already enqueued before
                                 resurrection MAY still delete the Busy card (no queue
                                 generation-guard; no send-layer authority) — it
@@ -140,6 +149,39 @@ Additional modules:
                                 dashboard renders state-only until repopulated).
                                 last_event_at stays monotonic and is NEVER used for
                                 the 🔔 unanswered-turn classification (ages only).
+                                GH #44 background-agent projection: a THIRD
+                                lower-authority input, background_agents
+                                (normalized key → {last_seen_wall,
+                                last_event_ts, is_background}) + done
+                                tombstones, applied at SNAPSHOT time by the
+                                single _build_snapshot/_projected_run_state
+                                helper (every read path; no duplicate-freeze
+                                drift): stored-idle + live key ⇒ visible
+                                RUNNING (typing + 🟡 Busy); a committed
+                                notification_pending projects WAITING above
+                                the lift. Marks: mark_background_agent_
+                                activity (keyed Wave A successor — heartbeat +
+                                pane-false-idle resurrection unqualified; idle
+                                key SET strictly ts-qualified vs
+                                last_assistant_turn_ended_at, fail-closed),
+                                mark_background_agent_launched (agentId: line
+                                in the async-launch tool_result ⇒
+                                is_background, never pruned),
+                                mark_background_agent_done (tombstones).
+                                Clears: done / BG_AGENT_TTL_SECONDS 30-min
+                                wall-clock heartbeat TTL (_wall_now(),
+                                expire-before-classify) / provenance-only
+                                foreground prune at end-of-turn / teardown.
+                                mark_notification_pending commits on
+                                stored-idle + live bg key (🔔 outranks the
+                                lift). Task-notification user events
+                                (is_task_notification, adapter-stamped)
+                                preserve tombstones/pane-bit/stash, clear the
+                                notification bit ts-qualified, and re-derive
+                                with preserved gates. mark_subagent_activity
+                                is RETIRED into the keyed mark. In-memory;
+                                restart ⇒ stamp-None fail-closed (no lift
+                                until fresh parent activity).
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —

@@ -35,11 +35,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 
 from . import route_runtime
 from .route_runtime import Route, RouteRuntimeSnapshot, TranscriptLifecycleEvent
 from .session_monitor import TranscriptEvent
+from .utils import parse_iso_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +50,22 @@ _warned_sessions: set[str] = set()
 
 def _parse_event_timestamp(raw: str | None) -> float | None:
     """Parse the JSONL ISO8601 ``timestamp`` to epoch seconds; ``None`` on
-    any failure (the timestamp-qualified notification clears then PRESERVE)."""
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw).timestamp()
-    except (ValueError, OverflowError, OSError):
-        return None
+    any failure (the timestamp-qualified notification clears then PRESERVE).
+    Delegates to the shared ``utils.parse_iso_timestamp`` so the monitor's
+    GH #44 sidechain-timestamp aggregation uses the SAME parse semantics."""
+    return parse_iso_timestamp(raw)
+
+
+def _is_task_notification_user_event(event: TranscriptEvent) -> bool:
+    """GH #44 §3.7: stamp machine-initiated ``<task-notification>`` user
+    events so ``route_runtime`` can suppress the genuine-user-turn side
+    effects. Deferred import: the predicate lives in
+    ``handlers.response_builder`` (the single envelope-regex owner)."""
+    if event.role != "user" or event.block_type != "text":
+        return False
+    from .handlers.response_builder import is_task_notification
+
+    return is_task_notification(event.text)
 
 
 def to_lifecycle_event(event: TranscriptEvent) -> TranscriptLifecycleEvent | None:
@@ -92,6 +101,7 @@ def to_lifecycle_event(event: TranscriptEvent) -> TranscriptLifecycleEvent | Non
         tool_name=event.tool_name,
         stop_reason=event.stop_reason,
         timestamp=_parse_event_timestamp(event.timestamp),
+        is_task_notification=_is_task_notification_user_event(event),
     )
 
 

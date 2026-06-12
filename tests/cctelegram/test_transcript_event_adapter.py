@@ -220,3 +220,47 @@ def test_adapter_loc_budget_intact():
     from pathlib import Path
 
     assert len(Path(mod.__file__).read_text().splitlines()) <= 250
+
+
+# ── GH #44: is_task_notification stamping ───────────────────────────────
+
+
+def _user_text_event(text: str) -> TranscriptEvent:
+    return TranscriptEvent(
+        session_id="sess-A",
+        role="user",
+        block_type="text",
+        tool_use_id=None,
+        tool_name=None,
+        stop_reason=None,
+        timestamp=None,
+        text=text,
+        image_data=None,
+    )
+
+
+def test_task_notification_user_event_is_stamped():
+    """hermes r3 P3-2: the flag must be derivable from a RAW TranscriptEvent
+    through the adapter — hand-built lifecycle events alone can fake-green."""
+    out = transcript_event_adapter.to_lifecycle_event(
+        _user_text_event(
+            "<task-notification>\n<task-id>abc123</task-id>\n"
+            "<status>completed</status>\n</task-notification>"
+        )
+    )
+    assert out is not None
+    assert out.is_task_notification is True
+
+
+def test_ordinary_user_text_is_not_stamped():
+    out = transcript_event_adapter.to_lifecycle_event(_user_text_event("hi there"))
+    assert out is not None
+    assert out.is_task_notification is False
+
+
+def test_assistant_text_is_never_stamped():
+    out = transcript_event_adapter.to_lifecycle_event(
+        _event(role="assistant", block_type="text")
+    )
+    assert out is not None
+    assert out.is_task_notification is False

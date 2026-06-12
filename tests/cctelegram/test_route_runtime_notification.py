@@ -420,7 +420,7 @@ async def test_sidechain_resurrection_then_notification():
     notification → 🔔 over the restored tools."""
     await _mk_running_tool(tool_id="agent-1", name="Agent")
     await route_runtime.mark_pane_idle(ROUTE)
-    await route_runtime.mark_subagent_activity(ROUTE)
+    await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING_TOOL
     result = await _mark()
     assert result is NotificationMarkResult.COMMITTED_LIVE

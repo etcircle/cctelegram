@@ -195,6 +195,55 @@ lifecycle: unlinked per the mark result, on session replacement / `/clear`
 `is_live_session` conservative-skip. Pull-only; no observer (c313657 stays
 forbidden).
 
+**Background-agent projected Busy (GH #44 — typing + 🟡 while a
+`run_in_background` agent works).** A background async agent keeps writing its
+sidechain for minutes-to-hours after the parent's authoritative end-of-turn,
+with its output visibly streaming into the topic — but sidechain blocks are
+display-path `NewMessage`s, never lifecycle events, so the route used to
+render idle (no typing) the whole time. The fix is a THIRD lower-authority
+route_runtime input, `background_agents`, applied as a **snapshot-time
+PROJECTION**: the stored `run_state` is never mutated on an agent's account;
+the single snapshot builder lifts a stored-idle route with a live
+(non-expired, non-tombstoned) key to a visible RUNNING — `typing_eligible`,
+the digest header, and /dashboard all follow from the snapshot. Precedence:
+a committed `notification_pending` projects WAITING_ON_USER above the lift
+(user-action-needed beats machine-busy), and `mark_notification_pending` now
+COMMITS on stored-idle + a live background key (the second idle exception
+beside the pane-stash resurrect) so a 🔔 raised by the background agent's own
+approval gate is never stale-dropped. **Keys** (always through
+`utils.normalize_background_agent_key` — agentId == sidechain stem minus
+`agent-` == task-id): `mark_background_agent_activity(route, key, max_ts)` is
+the keyed Wave A successor (heartbeat + UNqualified pane-false-idle
+resurrection preserved verbatim; a NEW key on a stored-idle route records
+ONLY when `event_ts > last_assistant_turn_ended_at`, both non-None, strict —
+a buffered pre-end-of-turn flush fails closed; active/WAITING recording is
+unconditional but foreground-presumed); `mark_background_agent_launched`
+registers `is_background=True` from the parent's async-launch tool_result
+(the structured `agentId:` line is the anchor; the prose sentence is
+diagnostic-only) so the key survives the parent's end-of-turn regardless of
+sidechain batching. **Clears**: `mark_background_agent_done` on the agent's
+own sidechain end-of-turn (lifecycle-only markers included) and on the
+parent's `<task-notification>` task-id (extracted monitor-side, applied
+after lifecycle dispatch); the `BG_AGENT_TTL_SECONDS` (30 min) wall-clock
+heartbeat TTL (`_wall_now()` injectable; expire-before-classify deletes a
+stale record before NEW/EXISTING classification so a late None-ts batch can
+never relift); the provenance-only foreground prune at the authoritative
+end-of-turn (synchronous agents always finish before their parent's turn
+ends — `is_background` keys are NEVER pruned); and route teardown. Done keys
+are TOMBSTONED — reset only on a GENUINE user turn. A task-notification user
+event (`TranscriptLifecycleEvent.is_task_notification`, stamped by the
+adapter via the public `response_builder.is_task_notification`) is
+machine-initiated: it counts as activity but preserves the pane bit, the
+stash, and the tombstones, clears the notification bit timestamp-qualified
+only, and RE-DERIVES with the preserved gates (never a forced RUNNING — the
+`interactive_pending ⟺ pane-set WAITING` invariant holds). The status CARD
+stays pane-driven and may clear on the idle pane while the lift holds —
+typing + digest/dashboard Busy are the contracted surfaces (recorded product
+decision). Restart degradation: all in-memory; the stamp-None guard keeps
+post-restart sidechain batches from lifting (no false Busy), so the route
+renders idle until fresh parent activity. Pull-only throughout (no observer;
+c313657 stays forbidden).
+
 **AUQ card-liveness authority (pane is lower authority than the
 lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone
 an AskUserQuestion card on visible-pane absence alone. The visible tmux pane

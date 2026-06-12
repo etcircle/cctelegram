@@ -807,7 +807,7 @@ class TestSidechainTailing:
         msgs = await monitor.check_sidechain_updates({parent_sid})
         assert msgs == []
         assert monitor.state.get_session(f"sub:{parent_sid}:agent-abc") is not None
-        assert monitor.pop_sidechain_active_parents() == set()
+        assert monitor.pop_sidechain_activity() == {}
 
         entry = make_jsonl_entry(
             "assistant",
@@ -821,21 +821,21 @@ class TestSidechainTailing:
         # Blocks ARE emitted (per-recipient gating happens downstream), and
         # the parent's sidechain activity is reported as before.
         assert [m.subagent_key for m in msgs] == [f"sub:{parent_sid}:agent-abc"]
-        assert monitor.pop_sidechain_active_parents() == {parent_sid}
+        assert set(monitor.pop_sidechain_activity()) == {parent_sid}
 
     @pytest.mark.asyncio
     async def test_sidechain_activity_reported_for_new_parsed_entries(
         self, monitor, tmp_path, make_jsonl_entry, make_tool_use_block
     ):
         """Parents whose sidechains produced new parsed entries this tick are
-        reported via pop_sidechain_active_parents (consume-once)."""
+        reported via pop_sidechain_activity (consume-once)."""
         parent_sid = "parent-sid"
         _, sub_dir = self._setup_parent(monitor, tmp_path, parent_sid)
         sc_file = sub_dir / "agent-abc.jsonl"
         sc_file.write_text("")
 
         await monitor.check_sidechain_updates({parent_sid})
-        assert monitor.pop_sidechain_active_parents() == set()
+        assert monitor.pop_sidechain_activity() == {}
 
         entry = make_jsonl_entry(
             "assistant",
@@ -847,8 +847,8 @@ class TestSidechainTailing:
         assert len(msgs) == 1
 
         # Reported once, then the accessor drains.
-        assert monitor.pop_sidechain_active_parents() == {parent_sid}
-        assert monitor.pop_sidechain_active_parents() == set()
+        assert set(monitor.pop_sidechain_activity()) == {parent_sid}
+        assert monitor.pop_sidechain_activity() == {}
 
     @pytest.mark.asyncio
     async def test_sidechain_discovered_at_eof_then_quiet_reports_no_activity(
@@ -867,11 +867,11 @@ class TestSidechainTailing:
         self._write_jsonl(sc_file, [old_entry])
 
         await monitor.check_sidechain_updates({parent_sid})  # registers at EOF
-        assert monitor.pop_sidechain_active_parents() == set()
+        assert monitor.pop_sidechain_activity() == {}
 
         # Quiet tick — no new bytes, no activity.
         await monitor.check_sidechain_updates({parent_sid})
-        assert monitor.pop_sidechain_active_parents() == set()
+        assert monitor.pop_sidechain_activity() == {}
 
     def test_remove_sidechains_for_parent_drops_all(self, monitor, tmp_path):
         """_remove_sidechains_for_parent clears trackers + caches for one parent only."""

@@ -2,7 +2,8 @@
 
 Covers the busy-signal Wave A contract:
 
-  - ``mark_subagent_activity`` authority matrix (unseen / IDLE(transcript) /
+  - the keyed ``mark_background_agent_activity`` heartbeat authority matrix
+    (the ported Wave A semantics; GH #44) — (unseen / IDLE(transcript) /
     IDLE(pane)+stash / IDLE(pane)+empty stash / RUNNING / RUNNING_TOOL /
     WAITING_ON_USER transcript-set and pane-bit-set).
   - ``idle_source`` transition rules: end-of-turn → "transcript"; pane clear
@@ -189,7 +190,7 @@ async def test_mark_inbound_sent_drops_stash():
     assert _st().suspended_tools == {}
     # And a later pane-clear + sidechain resurrection sees an EMPTY stash.
     await route_runtime.mark_pane_idle(ROUTE)
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.RUNNING
     assert snap.open_tools == frozenset()
 
@@ -200,7 +201,7 @@ async def test_clear_route_drops_stash_state():
     route_runtime.clear_route(ROUTE)
     assert ROUTE not in route_runtime._state
     # A post-teardown sidechain mark must not seed the route back.
-    await route_runtime.mark_subagent_activity(ROUTE)
+    await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert ROUTE not in route_runtime._state
 
 
@@ -211,22 +212,23 @@ async def test_clear_routes_for_topic_drops_stash_state():
     assert ROUTE not in route_runtime._state
 
 
-# ── mark_subagent_activity authority matrix (A1) ────────────────────────
+# ── keyed heartbeat authority matrix (A1, ported to GH #44) ─────────────
 
 
 async def test_subagent_activity_never_seeds_unseen_route():
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.IDLE_CLEARED
     assert ROUTE not in route_runtime._state
 
 
 async def test_subagent_activity_noop_on_transcript_idle():
-    """Spec test 4: transcript end-of-turn then a stray sidechain write must
-    stay idle — the transcript has spoken."""
+    """Spec test 4 (ported): transcript end-of-turn then a stray sidechain
+    write with NO qualifying timestamp must stay idle — the stored state is
+    never mutated and the ts-None idle SET fails closed (GH #44)."""
     await route_runtime.ingest_transcript_event(
         ROUTE, _evt("assistant", "text", stop_reason="end_turn")
     )
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.IDLE_RECENT
     assert snap.typing_eligible is False
 
@@ -235,7 +237,7 @@ async def test_subagent_activity_noop_on_idle_with_none_source():
     """An idle route that never recorded an idle source (e.g. after a session
     reset) is not resurrectable."""
     await route_runtime.mark_session_reset(ROUTE)
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.IDLE_CLEARED
 
 
@@ -244,7 +246,7 @@ async def test_subagent_activity_resurrects_pane_idle_with_stash():
     RUNNING_TOOL with the suspended tools restored."""
     await _open_agent_tool()
     await route_runtime.mark_pane_idle(ROUTE)
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.RUNNING_TOOL
     assert snap.open_tools == frozenset({"agent-1"})
     assert snap.typing_eligible is True
@@ -259,7 +261,7 @@ async def test_subagent_activity_resurrects_pane_idle_with_empty_stash():
     await route_runtime.ingest_transcript_event(ROUTE, _evt("assistant", "text"))
     await route_runtime.mark_pane_idle(ROUTE)
     assert _st().idle_source == "pane"
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.RUNNING
     assert snap.typing_eligible is True
 
@@ -268,7 +270,7 @@ async def test_subagent_activity_refreshes_running():
     await route_runtime.ingest_transcript_event(ROUTE, _evt("assistant", "text"))
     before = _st().last_event_at
     route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.RUNNING
     assert snap.last_event_at >= before
     # The pane-idle debounce was re-armed (cancelled).
@@ -278,7 +280,7 @@ async def test_subagent_activity_refreshes_running():
 async def test_subagent_activity_refreshes_running_tool_without_tool_mutation():
     await _open_agent_tool()
     route_runtime.arm_pane_idle_clear(ROUTE, now=100.0)
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.RUNNING_TOOL
     assert snap.open_tools == frozenset({"agent-1"})
     assert snap.pane_idle_clear_at is None
@@ -289,7 +291,7 @@ async def test_subagent_activity_never_overrides_transcript_waiting():
         ROUTE,
         _evt("assistant", "tool_use", tool_use_id="ask-1", tool_name="AskUserQuestion"),
     )
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.WAITING_ON_USER
     assert snap.waiting_on_user_tools == frozenset({"ask-1"})
 
@@ -298,7 +300,7 @@ async def test_subagent_activity_never_overrides_pane_bit_waiting():
     await route_runtime.ingest_transcript_event(ROUTE, _evt("assistant", "text"))
     await route_runtime.mark_interactive_pending(ROUTE)
     assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.WAITING_ON_USER
     assert snap.interactive_pending is True
 
@@ -317,7 +319,7 @@ async def test_subagent_activity_never_overrides_notification_set_waiting():
     open_before = dict(_st().open_tools)
     stash_before = dict(_st().suspended_tools)
 
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
 
     assert snap.run_state is RunState.WAITING_ON_USER
     assert snap.typing_eligible is False
@@ -339,7 +341,7 @@ async def test_long_subagent_run_survives_transient_idle_pane_frames():
     # Pane frame looks idle → poller arms the debounce.
     route_runtime.arm_pane_idle_clear(ROUTE, now=now)
     # Sidechain activity lands before the deadline → re-arms (cancels).
-    await route_runtime.mark_subagent_activity(ROUTE)
+    await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert (
         route_runtime.pane_idle_clear_due(
             ROUTE, now=now + IDLE_CLEAR_DELAY_SECONDS + 10.0
@@ -365,7 +367,7 @@ async def test_resurrection_final_state_after_queued_status_clear_drains():
     )
     assert fired is True  # the poller would now enqueue a status clear
     # Sidechain activity resurrects before the queue drains.
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.RUNNING_TOOL
     # The queued clear drains (message_queue deletes the card).
     route_runtime.mark_status_card_cleared(ROUTE)
@@ -383,7 +385,7 @@ async def test_corruption_regression_transcript_idle_pane_clear_sidechain():
         ROUTE, _evt("assistant", "text", stop_reason="end_turn")
     )
     await route_runtime.mark_pane_idle(ROUTE)
-    snap = await route_runtime.mark_subagent_activity(ROUTE)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, "sc-key", None)
     assert snap.run_state is RunState.IDLE_CLEARED
     assert snap.typing_eligible is False
 
@@ -406,24 +408,109 @@ async def test_commit_pane_idle_clear_stashes_tools():
 # ── bot fan-out helper ───────────────────────────────────────────────────
 
 
-async def test_bot_fanout_marks_each_route_once_per_tick(monkeypatch):
-    """bot.mark_subagent_activity_for_parents resolves bound routes per parent
-    session and marks each route at most once per tick."""
+async def test_bot_fanout_applies_per_route_per_key_marks(monkeypatch):
+    """bot.apply_sidechain_activity resolves bound routes per parent session
+    and applies launch → activity → done marks per (route, agent_key) —
+    sibling agents in one tick each get their marks (codex r2 P2-1), while a
+    parent's duplicate route resolutions are deduped at route level."""
     from cctelegram import bot as bot_module
+    from cctelegram.session_monitor import ParentSidechainActivity, SidechainTick
 
-    calls: list[route_runtime.Route] = []
+    calls: list[tuple[str, route_runtime.Route, str, float | None]] = []
 
-    async def fake_mark(route: route_runtime.Route):
-        calls.append(route)
+    async def fake_activity(route, key, ts):
+        calls.append(("activity", route, key, ts))
         return route_runtime.snapshot(route)
 
-    monkeypatch.setattr(route_runtime, "mark_subagent_activity", fake_mark)
+    async def fake_launched(route, key):
+        calls.append(("launched", route, key, None))
+        return route_runtime.snapshot(route)
+
+    async def fake_done(route, key):
+        calls.append(("done", route, key, None))
+        return route_runtime.snapshot(route)
+
+    monkeypatch.setattr(route_runtime, "mark_background_agent_activity", fake_activity)
+    monkeypatch.setattr(route_runtime, "mark_background_agent_launched", fake_launched)
+    monkeypatch.setattr(route_runtime, "mark_background_agent_done", fake_done)
 
     async def fake_find(session_id: str):
-        # Both parents resolve to the same (user, window, thread) binding.
+        # The parent resolves to the same binding twice (double-bind shape).
+        return [(1, "@7", 42), (1, "@7", 42)]
+
+    monkeypatch.setattr(bot_module.session_manager, "find_users_for_session", fake_find)
+
+    activity = {
+        "parent-a": ParentSidechainActivity(
+            launched={"k1"},
+            completed={"k2"},
+            ticks={
+                "k1": SidechainTick(max_event_ts=100.0, saw_end_of_turn=False),
+                "k2": SidechainTick(max_event_ts=110.0, saw_end_of_turn=True),
+            },
+        )
+    }
+    await bot_module.apply_sidechain_activity(activity)
+
+    route = (1, 42, "@7")
+    assert ("launched", route, "k1", None) in calls
+    assert ("activity", route, "k1", 100.0) in calls
+    assert ("activity", route, "k2", 110.0) in calls
+    # k2 completes via BOTH its sidechain end-of-turn and the parent
+    # task-notification — done marks are idempotent so both fire.
+    assert calls.count(("done", route, "k2", None)) == 2
+    # Route-level dedupe: the duplicate binding produced no second pass.
+    assert calls.count(("activity", route, "k1", 100.0)) == 1
+    # Ordering: launch precedes activity precedes done for k1/k2.
+    assert calls.index(("launched", route, "k1", None)) < calls.index(
+        ("activity", route, "k1", 100.0)
+    )
+    assert calls.index(("activity", route, "k2", 110.0)) < calls.index(
+        ("done", route, "k2", None)
+    )
+
+
+async def test_bot_fanout_same_key_launch_activity_done_in_one_tick(monkeypatch):
+    """Plan §7: ONE key appearing in launched, ticks (saw_end_of_turn=True),
+    AND completed in a single tick must see exactly launch → activity → done
+    (twice — sidechain end-of-turn + task-notification) in that order."""
+    from cctelegram import bot as bot_module
+    from cctelegram.session_monitor import ParentSidechainActivity, SidechainTick
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_activity(route, key, ts):
+        calls.append(("activity", key))
+        return route_runtime.snapshot(route)
+
+    async def fake_launched(route, key):
+        calls.append(("launched", key))
+        return route_runtime.snapshot(route)
+
+    async def fake_done(route, key):
+        calls.append(("done", key))
+        return route_runtime.snapshot(route)
+
+    monkeypatch.setattr(route_runtime, "mark_background_agent_activity", fake_activity)
+    monkeypatch.setattr(route_runtime, "mark_background_agent_launched", fake_launched)
+    monkeypatch.setattr(route_runtime, "mark_background_agent_done", fake_done)
+
+    async def fake_find(session_id: str):
         return [(1, "@7", 42)]
 
     monkeypatch.setattr(bot_module.session_manager, "find_users_for_session", fake_find)
 
-    await bot_module.mark_subagent_activity_for_parents({"parent-a", "parent-b"})
-    assert calls == [(1, 42, "@7")]
+    activity = {
+        "parent-a": ParentSidechainActivity(
+            launched={"k1"},
+            completed={"k1"},
+            ticks={"k1": SidechainTick(max_event_ts=100.0, saw_end_of_turn=True)},
+        )
+    }
+    await bot_module.apply_sidechain_activity(activity)
+    assert calls == [
+        ("launched", "k1"),
+        ("activity", "k1"),
+        ("done", "k1"),
+        ("done", "k1"),
+    ]

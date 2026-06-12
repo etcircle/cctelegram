@@ -69,12 +69,16 @@ Concurrency contract:
     ``suspended_tools`` stash (in-memory only) instead of dropping them;
     the authoritative transcript end-of-turn records
     ``idle_source="transcript"`` and drops the stash.
-  - ``mark_subagent_activity`` is the Wave A sidechain keep-alive: it
-    refreshes an active route like transcript activity and RESURRECTS an
+  - ``mark_background_agent_activity`` is the keyed sidechain keep-alive
+    (GH #44 — successor of Wave A's ``mark_subagent_activity``): it
+    refreshes an active route like transcript activity, RESURRECTS an
     ``idle_source="pane"`` route (restoring the stash — sidechain
-    activity is positive proof the pane clear was false). It never
-    resurrects a transcript-idle route, never overrides
-    ``WAITING_ON_USER``, and never seeds an unseen route.
+    activity is positive proof the pane clear was false), and records the
+    agent's key into ``background_agents``. The stored state of a
+    transcript-idle route is never mutated; instead the SNAPSHOT
+    PROJECTION lifts a stored-idle route with a live background key to a
+    visible ``RUNNING`` (typing + 🟡 Busy) — see ``_projected_run_state``.
+    It never overrides ``WAITING_ON_USER`` and never seeds an unseen route.
   - A pane/lifecycle signal may also **PROMOTE** an *active* ``RUNNING``
     route (empty ``open_tools``) to ``WAITING_ON_USER`` via
     ``mark_interactive_pending`` — for the window where Claude Code buffers
@@ -127,6 +131,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
 
+from .utils import normalize_background_agent_key
+
 logger = logging.getLogger(__name__)
 
 
@@ -177,8 +183,41 @@ class ContextUsage:
     max_tokens: int
 
 
-# stop_reasons that signal "this assistant turn is over".
-_TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
+# stop_reasons that signal "this assistant turn is over". Public: the
+# session_monitor's sidechain end-of-turn scan (GH #44 done detection) must
+# use the SAME definition the state machine idles on.
+TURN_END_REASONS = frozenset({"end_turn", "stop_sequence"})
+_TURN_END_REASONS = TURN_END_REASONS  # internal alias (historic name)
+
+# GH #44: heartbeat-silence TTL for a background-agent key. Compared as
+# ``_wall_now() - last_seen_wall`` (OUR wall clock, stamped at mark time) —
+# JSONL event timestamps NEVER feed the TTL (codex r2 P1: ``_now()`` is
+# monotonic; mixing clock bases never expires). Bounds how long a crashed /
+# silent agent can hold the projected-Busy lift; a healthy agent refreshes on
+# every sidechain write, so multi-hour agents stay lifted as long as no single
+# internal tool call exceeds the TTL. Product value, mirrors NOTIFY_TTL_SECONDS.
+BG_AGENT_TTL_SECONDS = 1800.0
+
+
+@dataclass
+class _BgAgent:
+    """One background agent observed on a route (GH #44).
+
+    ``last_seen_wall`` — ``_wall_now()`` at the latest mark; the TTL basis.
+    ``last_event_ts`` — max JSONL event timestamp observed in the agent's
+    sidechain batches (epoch; ``None`` until a parseable stamp arrives); the
+    idle-qualification basis. The two clocks are deliberately separate.
+    ``is_background`` — launch-evidence / post-turn-evidence provenance: True
+    from ``mark_background_agent_launched`` (the async-launch tool_result) or
+    a timestamp-qualified idle-path SET (post-turn writes are background by
+    definition); False for keys first seen while the parent was active
+    (foreground-presumed → pruned at the parent's end-of-turn).
+    """
+
+    last_seen_wall: float
+    last_event_ts: float | None
+    is_background: bool
+
 
 # Cap on the per-route buffer of tool_result ids that arrived BEFORE their
 # tool_use (out-of-order JSONL flush — GH #42). Oldest entry evicted past the
@@ -234,10 +273,17 @@ class TranscriptLifecycleEvent:
     stop_reason: str | None
     # JSONL event wall-clock timestamp (epoch seconds), parsed by the adapter
     # from the ISO8601 ``TranscriptEvent.timestamp``; ``None`` on parse
-    # failure. Read ONLY by the timestamp-qualified notification clears (an
-    # older buffered event must not re-hide a fresh 🔔 — v4 fix 2). Defaults
+    # failure. Read by the timestamp-qualified notification clears (an
+    # older buffered event must not re-hide a fresh 🔔 — v4 fix 2) and the
+    # GH #44 turn-stamp/qualification machinery. Defaults
     # ``None`` so pre-Wave-B constructors are unchanged.
     timestamp: float | None = None
+    # GH #44 §3.7: True when this ``user`` event is a machine-initiated
+    # ``<task-notification>`` envelope (stamped by the adapter via the public
+    # ``response_builder.is_task_notification``). Such events re-derive with
+    # preserved gates instead of running the genuine-user-turn unconditional
+    # clears — and never reset background-agent tombstones.
+    is_task_notification: bool = False
 
 
 @dataclass(frozen=True)
@@ -313,6 +359,12 @@ class RouteRuntimeSnapshot:
     # state-only until fresh turns repopulate them (documented degradation).
     last_user_turn_at: float | None
     last_assistant_turn_ended_at: float | None
+    # GH #44: the route's LIVE background-agent keys at freeze time (TTL
+    # filter applied; tombstoned/expired keys excluded). Non-empty on a
+    # stored-idle route ⟺ the snapshot's run_state was LIFTED to RUNNING by
+    # the projection (unless a committed notification projects WAITING above
+    # it). Empty tuple for routes with no background agents.
+    background_agents: tuple[str, ...] = ()
 
 
 @dataclass
@@ -368,7 +420,7 @@ class _RouteState:
     idle_source: Literal["transcript", "pane"] | None = None
     # Tools MOVED out of ``open_tools`` by a pane-idle reconciliation (Wave A).
     # The pane has lower authority than the transcript, so the clear must not
-    # destroy tool identity: ``mark_subagent_activity`` restores the stash on
+    # destroy tool identity: ``mark_background_agent_activity`` restores the stash on
     # resurrection, and a transcript tool_result for a suspended id
     # restores+closes it through the normal pairing path. Dropped on
     # authoritative end-of-turn / user lifecycle event / ``mark_inbound_sent``
@@ -387,6 +439,18 @@ class _RouteState:
     # can never swallow a future pair. Dropped on ``mark_session_reset`` and
     # route teardown.
     early_tool_results: dict[str, float | None] = field(default_factory=dict)
+    # GH #44: background agents observed on this route (normalized key →
+    # record; see ``_BgAgent``) and the done-tombstone set. The keys are a
+    # PROJECTION input only — no mutator transitions ``run_state`` on their
+    # account; ``_build_snapshot`` lifts a stored-idle route to a visible
+    # RUNNING while a live key exists. Foreground-presumed keys
+    # (``is_background=False``) are pruned at the authoritative end-of-turn;
+    # background keys clear via done / TTL / teardown. Tombstones block
+    # re-recording a completed key (a trailing sidechain flush must not
+    # re-lift) and reset only on a GENUINE user turn (never the
+    # task-notification user event that created them) or teardown.
+    background_agents: dict[str, _BgAgent] = field(default_factory=dict)
+    background_agents_done: set[str] = field(default_factory=set)
     seen: bool = False  # have we ever observed this route?
     # Cached frozensets — invalidated on any open_tools mutation.
     # Most snapshots happen with no open tools (idle route), so the
@@ -452,6 +516,74 @@ def _state_for_route(route: Route) -> _RouteState:
 
 def _now() -> float:
     return time.monotonic()
+
+
+def _wall_now() -> float:
+    """Wall clock for the GH #44 background-agent TTL (injectable in tests).
+
+    Separate from the monotonic ``_now()`` on purpose: ``last_seen_wall`` is
+    stamped with THIS clock at mark time and compared with THIS clock at
+    projection time — JSONL event timestamps never enter the TTL math."""
+    return time.time()
+
+
+def _live_background_keys(
+    st: _RouteState, now_wall: float | None = None
+) -> tuple[str, ...]:
+    """The route's live (non-expired) background-agent keys.
+
+    The SINGLE TTL-filtered liveness helper — used by the snapshot projection
+    AND the §3.6 notification-commit check (codex r3 P3-2: never the raw
+    dict). Read-only; expiry DELETION happens in the marks' step-0
+    (expire-before-classify) so an expired key must re-pass full NEW
+    qualification.
+    """
+    if not st.background_agents:
+        return ()
+    now = _wall_now() if now_wall is None else now_wall
+    return tuple(
+        k
+        for k, rec in st.background_agents.items()
+        if now - rec.last_seen_wall < BG_AGENT_TTL_SECONDS
+    )
+
+
+def _expire_background_agents_in_place(st: _RouteState) -> None:
+    """Step 0 of the background marks: DELETE expired records before
+    NEW/EXISTING classification (hermes r2 P1-3 — a late ``None``-timestamp
+    batch must not refresh a corpse past the idle qualification)."""
+    if not st.background_agents:
+        return
+    now = _wall_now()
+    for k in [
+        k
+        for k, rec in st.background_agents.items()
+        if now - rec.last_seen_wall >= BG_AGENT_TTL_SECONDS
+    ]:
+        del st.background_agents[k]
+
+
+def _projected_run_state(st: _RouteState, live_bg: tuple[str, ...]) -> RunState:
+    """The GH #44 snapshot-time projection — the ONLY place the
+    background-agent lift exists.
+
+    The STORED ``run_state`` is never mutated on a background agent's
+    account; every snapshot path projects through here so consumers see one
+    consistent visible state (typing loop, digest repaint dedup, dashboard):
+
+      1. stored not-idle → stored (WAITING/RUNNING/RUNNING_TOOL untouched).
+      2. stored idle + committed ``notification_pending`` → WAITING_ON_USER
+         (user-action-needed outranks machine-busy — §3.6).
+      3. stored idle + ≥1 live background key → RUNNING (the lift).
+      4. otherwise → stored idle.
+    """
+    if st.run_state not in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED):
+        return st.run_state
+    if st.notification_pending:
+        return RunState.WAITING_ON_USER
+    if live_bg:
+        return RunState.RUNNING
+    return st.run_state
 
 
 def _state_from_open_tools(
@@ -520,19 +652,23 @@ def _maybe_clear_notification_by_ts(st: _RouteState, event_ts: float | None) -> 
         _clear_notification_in_place(st)
 
 
-def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
-    """Snapshot ``st`` under the route's lock. Must be called with the
-    lock held."""
+def _build_snapshot(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
+    """The SINGLE snapshot constructor — every read path (``_freeze`` under
+    a lock, the lock-free ``snapshot()``, mutator returns, lazy-decay reads)
+    builds through here so the GH #44 projection can never drift between
+    paths (hermes r2 P3-1)."""
+    live_bg = _live_background_keys(st)
+    projected = _projected_run_state(st, live_bg)
     return RouteRuntimeSnapshot(
         route=route,
-        run_state=st.run_state,
+        run_state=projected,
         open_tools=st.open_tools_frozen(),
         waiting_on_user_tools=st.waiting_tools_frozen(),
         context_usage=st.context_usage,
         last_event_at=st.last_event_at,
         idle_clear_at=st.idle_clear_at,
         pane_idle_clear_at=st.pane_idle_clear_at,
-        typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
+        typing_eligible=projected in (RunState.RUNNING, RunState.RUNNING_TOOL),
         status_card_visible=st.status_card_msg_id is not None,
         status_card_msg_id=st.status_card_msg_id,
         interactive_pending=st.pane_interactive_pending,
@@ -541,7 +677,14 @@ def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         notification_generation=st.notification_generation,
         last_user_turn_at=st.last_user_turn_at,
         last_assistant_turn_ended_at=st.last_assistant_turn_ended_at,
+        background_agents=live_bg,
     )
+
+
+def _freeze(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
+    """Snapshot ``st`` under the route's lock. Must be called with the
+    lock held."""
+    return _build_snapshot(route, st)
 
 
 def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
@@ -747,6 +890,20 @@ def _apply_lifecycle_event(
         # A transcript-ended turn never resurrects its tools — drop the stash
         # and record the authoritative idle provenance.
         st.suspended_tools.clear()
+        # GH #44 §3.3.4: provenance-only foreground prune. A synchronous
+        # agent by definition completes before its parent's turn ends, so
+        # every foreground-presumed key (no launch evidence, recorded while
+        # the parent was active) is dropped here UNCONDITIONALLY — no
+        # timestamp comparison (hermes r2 P2-2). ``is_background`` keys are
+        # NEVER pruned (a live background agent in a silent tool call
+        # spanning this end-of-turn keeps its lift — codex/hermes r2 P1);
+        # they clear via sidechain end-of-turn / task-notification / TTL /
+        # teardown.
+        if st.background_agents:
+            for k in [
+                k for k, rec in st.background_agents.items() if not rec.is_background
+            ]:
+                del st.background_agents[k]
         # The notification bit clears only on a strictly NEWER end-of-turn;
         # an older buffered one must not re-hide the wait (v4 fix 2) — when
         # the bit survives, the route stays WAITING instead of idling.
@@ -812,15 +969,36 @@ def _apply_lifecycle_event(
         st.last_event_at = _now()
         return True
 
-    # User non-tool_result: user prompted Claude — RUNNING. A fresh user turn
+    # User non-tool_result. Two flavors (GH #44 §3.7):
+    #
+    # A TASK-NOTIFICATION user event is machine-initiated — the harness
+    # re-invoking the parent when a background task completes — NOT the human
+    # acting. It counts as activity, but its side effects diverge from a
+    # genuine user turn: the pane bit, the suspended-tools stash, and the
+    # background-agent tombstones are all PRESERVED (an agent finishing
+    # proves nothing about a live picker or a pending approval), the
+    # notification bit clears only TIMESTAMP-QUALIFIED, and the run state is
+    # RE-DERIVED through the standard deriver with those preserved gates
+    # intact — never a forced RUNNING (hermes r3 P2: forcing RUNNING while
+    # preserving the pane bit would break the invariant
+    # ``interactive_pending ⟺ pane-set WAITING_ON_USER``).
+    if role == "user" and block != "tool_result" and event.is_task_notification:
+        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _set_run_state(st, _derived_state(st))
+        return True
+
+    # GENUINE user turn: user prompted Claude — RUNNING. A fresh user turn
     # supersedes any pane-set WAITING (the prompt was answered or replaced),
     # any pending notification (the user acted — the ONE unconditional,
-    # timestamp-free transcript clear), and any suspended tools (they belong
-    # to the superseded turn).
+    # timestamp-free transcript clear), any suspended tools (they belong
+    # to the superseded turn), and the background-agent tombstones (a new
+    # user turn = a new world; agent keys are unique so a reset can never
+    # unmask a completed agent's key).
     if role == "user" and block != "tool_result":
         st.pane_interactive_pending = False
         _clear_notification_in_place(st)
         st.suspended_tools.clear()
+        st.background_agents_done.clear()
         _set_run_state(st, RunState.RUNNING)
         return True
 
@@ -876,26 +1054,7 @@ def snapshot(route: Route) -> RouteRuntimeSnapshot:
     ):
         st.run_state = RunState.IDLE_CLEARED
         st.idle_clear_at = None
-        return _freeze(route, st)
-    return RouteRuntimeSnapshot(
-        route=route,
-        run_state=st.run_state,
-        open_tools=st.open_tools_frozen(),
-        waiting_on_user_tools=st.waiting_tools_frozen(),
-        context_usage=st.context_usage,
-        last_event_at=st.last_event_at,
-        idle_clear_at=st.idle_clear_at,
-        pane_idle_clear_at=st.pane_idle_clear_at,
-        typing_eligible=st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL),
-        status_card_visible=st.status_card_msg_id is not None,
-        status_card_msg_id=st.status_card_msg_id,
-        interactive_pending=st.pane_interactive_pending,
-        notification_pending=st.notification_pending,
-        notification_set_at=st.notification_set_at,
-        notification_generation=st.notification_generation,
-        last_user_turn_at=st.last_user_turn_at,
-        last_assistant_turn_ended_at=st.last_assistant_turn_ended_at,
-    )
+    return _build_snapshot(route, st)
 
 
 # ── public API: mark_* mutations ────────────────────────────────────────
@@ -1106,6 +1265,27 @@ async def mark_notification_pending(
                 restored,
             )
             return NotificationMarkResult.COMMITTED_LIVE
+        # GH #44 §3.6: stored idle + a LIVE background-agent key = positive
+        # live proof (the BACKGROUND agent hit the approval gate while the
+        # parent's turn was over — the route is projected-Busy, not dead).
+        # Liveness via the SAME TTL-filtered helper the projection uses
+        # (codex r3 P3-2 — never the raw dict). Sets the bit ONLY: the
+        # stored state remains idle and the projection (rule 2) reports
+        # WAITING_ON_USER above the background-RUNNING lift, so 🔔 genuinely
+        # outranks projected Busy (hermes r2 P1-2).
+        live_bg = _live_background_keys(st)
+        if live_bg:
+            st.notification_pending = True
+            st.notification_set_at = set_at
+            st.notification_generation = generation
+            logger.info(
+                "notification_pending committed (projected-busy bg agent) "
+                "route=%s set_at=%s bg_keys=%s",
+                route,
+                set_at,
+                live_bg[:4],
+            )
+            return NotificationMarkResult.COMMITTED_LIVE
         logger.info(
             "notification_pending stale (idle route) route=%s set_at=%s idle_source=%s",
             route,
@@ -1159,56 +1339,172 @@ async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
     return snap
 
 
-async def mark_subagent_activity(route: Route) -> RouteRuntimeSnapshot:
-    """Sidechain (sub-agent) JSONL activity observed for this route (Wave A).
+async def mark_background_agent_activity(
+    route: Route, agent_key: str, event_ts: float | None
+) -> RouteRuntimeSnapshot:
+    """Sidechain JSONL activity for one agent key on this route (GH #44).
 
-    A running sub-agent writes only to its own sidechain file, so the parent
-    transcript is silent and a transient confirmed-idle pane frame can falsely
-    clear the route. This mutator is the keep-alive + bounded self-heal:
+    Replaces the Wave A ``mark_subagent_activity`` heartbeat — same callers
+    (the monitor's per-tick sidechain fan-out via ``bot``), now keyed per
+    agent and carrying the batch's max JSONL event timestamp. Two orthogonal
+    jobs under the route lock:
 
-      - ``RUNNING`` / ``RUNNING_TOOL`` → refresh ``last_event_at`` and
-        re-arm/cancel the pane-idle debounce (the same treatment as transcript
-        activity). NO ``open_tools`` mutation — this is a heartbeat, not a
-        lifecycle ingestion.
-      - Idle with ``idle_source == "pane"`` → RESURRECT: sidechain activity is
-        positive proof the pane clear was false. Restores ``suspended_tools``
-        into ``open_tools`` and re-derives (``RUNNING_TOOL`` when the parent
-        Agent tool was stashed, ``RUNNING`` on an empty stash), clearing the
-        idle deadlines. The ONLY resurrection path for this mutator.
-      - Idle with ``idle_source == "transcript"`` / ``None`` → no-op (the
-        transcript has spoken; a stray late sidechain write must not resurrect
-        a genuinely ended turn).
-      - ``WAITING_ON_USER`` (transcript- or pane-bit-set) → never overridden.
-      - Unseen route (no ``_RouteState``) → bail; never seeds.
+    **Key recording** (projection input — independent of run_state):
+      - step 0: expired records are DELETED before NEW/EXISTING
+        classification (expire-before-classify, hermes r2 P1-3).
+      - tombstoned key → full no-op (a completed agent's trailing flush must
+        not re-lift).
+      - EXISTING key → refresh ``last_seen_wall`` (OUR wall clock — a
+        ``None`` ``event_ts`` cannot poison the TTL) and max-update
+        ``last_event_ts``.
+      - NEW key, stored state ACTIVE or WAITING → record foreground-presumed
+        (``is_background=False``; the end-of-turn prune disarms it — launch
+        evidence upgrades it via ``mark_background_agent_launched``).
+      - NEW key, stored idle → record ONLY timestamp-qualified:
+        ``event_ts > last_assistant_turn_ended_at`` (both non-None, strict,
+        same JSONL clock). Post-turn writes are background by definition →
+        ``is_background=True``. A buffered pre-end-of-turn flush has older
+        stamps and fails closed — the guard that replaced the old blanket
+        transcript-idle no-op.
 
-    Card semantics are explicitly NARROWED: a status clear already enqueued
-    before resurrection MAY still delete the visible Busy card —
-    ``mark_subagent_activity`` has no send-layer authority and the queue is
-    not generation-guarded. The card re-publishes on the next active status
-    tick; ``typing_eligible`` and the digest header recover immediately from
-    the snapshot.
+    **Heartbeat duties** (the ported Wave A semantics, guard-split — the
+    timestamp qualification above NEVER applies here, hermes r2 P1-3):
+      - ``RUNNING`` / ``RUNNING_TOOL`` → refresh ``last_event_at`` + re-arm
+        the pane-idle debounce. No ``open_tools`` mutation.
+      - Idle with ``idle_source == "pane"`` → RESURRECT (verbatim Wave A):
+        sidechain activity is positive proof the pane clear was false;
+        restores ``suspended_tools`` and re-derives.
+      - Idle with ``idle_source`` "transcript"/None and ``WAITING_ON_USER``
+        → no stored-state mutation (the PROJECTION does the lifting for the
+        background case; a transcript-ended turn's stored state stays idle).
+      - ``last_event_at`` refreshes in EVERY state (dashboard ages track
+        observed sidechain activity — hermes r2 P2-3; the field is ages-only
+        by contract, never 🔔 classification).
+
+    Never seeds an unseen route. Card semantics stay NARROWED as in Wave A:
+    no send-layer authority; typing/digest recover from the snapshot.
     """
+    key = normalize_background_agent_key(agent_key)
     lock = _lock_for_route(route)
     async with lock:
         st = _state.get(route)
         if st is None:
             return _default_snapshot(route)
+        _expire_background_agents_in_place(st)
+        if key in st.background_agents_done:
+            return _freeze(route, st)
+        # ── key recording ────────────────────────────────────────────
+        rec = st.background_agents.get(key)
+        if rec is not None:
+            rec.last_seen_wall = _wall_now()
+            if event_ts is not None and (
+                rec.last_event_ts is None or event_ts > rec.last_event_ts
+            ):
+                rec.last_event_ts = event_ts
+        elif st.run_state not in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED):
+            st.background_agents[key] = _BgAgent(
+                last_seen_wall=_wall_now(),
+                last_event_ts=event_ts,
+                is_background=False,
+            )
+        elif (
+            event_ts is not None
+            and st.last_assistant_turn_ended_at is not None
+            and event_ts > st.last_assistant_turn_ended_at
+        ):
+            st.background_agents[key] = _BgAgent(
+                last_seen_wall=_wall_now(),
+                last_event_ts=event_ts,
+                is_background=True,
+            )
+            logger.info(
+                "background_agent recorded post-turn route=%s key=%s event_ts=%s",
+                route,
+                key,
+                event_ts,
+            )
+        # ── heartbeat (ported Wave A) ────────────────────────────────
+        st.last_event_at = _now()
         if st.run_state is RunState.WAITING_ON_USER:
             return _freeze(route, st)
         if st.run_state in (RunState.RUNNING, RunState.RUNNING_TOOL):
-            st.last_event_at = _now()
             _rearm_pane_idle_in_place(st)
             return _freeze(route, st)
-        # Idle: only a pane-sourced idle is resurrectable.
-        if st.idle_source != "pane":
+        if st.idle_source == "pane":
+            if st.suspended_tools:
+                st.open_tools.update(st.suspended_tools)
+                st.suspended_tools.clear()
+                st.invalidate_tool_cache()
+            # _set_run_state's active branch resets idle_source+idle_clear_at.
+            _set_run_state(st, _state_from_open_tools(st.open_tools))
+            _rearm_pane_idle_in_place(st)
+        snap = _freeze(route, st)
+    return snap
+
+
+async def mark_background_agent_launched(
+    route: Route, agent_key: str
+) -> RouteRuntimeSnapshot:
+    """Async-launch evidence for ``agent_key`` on this route (GH #44 §3.2a).
+
+    Called by the bot fan-out when the parent transcript's Agent
+    ``tool_result`` carries the ``agentId:`` line (a ``run_in_background``
+    launch — synchronous agents never produce one). Registers/upgrades the
+    key with ``is_background=True`` so the end-of-turn prune never drops it —
+    the key exists with background provenance from the moment of launch,
+    independent of sidechain batching (the codex/hermes r2 silent-tool-gap
+    P1). An EXISTING (foreground-presumed) key is upgraded in place with its
+    ``last_event_ts`` PRESERVED (hermes r3 P3-1). Tombstoned key → no-op;
+    never seeds an unseen route; no stored-state mutation.
+    """
+    key = normalize_background_agent_key(agent_key)
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            return _default_snapshot(route)
+        _expire_background_agents_in_place(st)
+        if key in st.background_agents_done:
             return _freeze(route, st)
-        if st.suspended_tools:
-            st.open_tools.update(st.suspended_tools)
-            st.suspended_tools.clear()
-            st.invalidate_tool_cache()
-        # _set_run_state's active branch resets idle_source + idle_clear_at.
-        _set_run_state(st, _state_from_open_tools(st.open_tools))
-        _rearm_pane_idle_in_place(st)
+        rec = st.background_agents.get(key)
+        if rec is not None:
+            rec.is_background = True
+            rec.last_seen_wall = _wall_now()
+        else:
+            st.background_agents[key] = _BgAgent(
+                last_seen_wall=_wall_now(),
+                last_event_ts=None,
+                is_background=True,
+            )
+        logger.info("background_agent launched route=%s key=%s", route, key)
+        snap = _freeze(route, st)
+    return snap
+
+
+async def mark_background_agent_done(
+    route: Route, agent_key: str
+) -> RouteRuntimeSnapshot:
+    """Positive completion for ``agent_key`` (GH #44 §3.3 paths 1-2).
+
+    Fired on the agent's own sidechain end-of-turn and on the parent's
+    ``<task-notification>`` for the key (belt and suspenders — either alone
+    clears). Removes the key and TOMBSTONES it so a trailing sidechain flush
+    cannot re-record and strand a false lift until the TTL. The stored
+    run_state is untouched — with the last live key gone the projection
+    simply stops lifting and the snapshot reports the stored idle (no
+    fall-back reconstruction). Tombstones even a never-recorded key (covers
+    a completion whose activity the monitor never saw). Never seeds.
+    """
+    key = normalize_background_agent_key(agent_key)
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            return _default_snapshot(route)
+        existed = st.background_agents.pop(key, None) is not None
+        st.background_agents_done.add(key)
+        if existed:
+            logger.info("background_agent done route=%s key=%s", route, key)
         snap = _freeze(route, st)
     return snap
 
@@ -1425,6 +1721,10 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         _clear_notification_in_place(st)
         st.suspended_tools.clear()
         st.early_tool_results.clear()
+        # GH #44: the dead session's background agents (and their
+        # tombstones) go with it.
+        st.background_agents.clear()
+        st.background_agents_done.clear()
         # The dead session's turn stamps go with it — the dashboard's
         # unanswered-turn derivation must not survive a /clear.
         st.last_user_turn_at = None
@@ -1663,7 +1963,9 @@ __all__ = [
     "NotificationMarkResult",
     "Route",
     "RouteRuntimeSnapshot",
+    "BG_AGENT_TTL_SECONDS",
     "RunState",
+    "TURN_END_REASONS",
     "TranscriptLifecycleEvent",
     "arm_pane_idle_clear",
     "clear_route",
@@ -1679,7 +1981,10 @@ __all__ = [
     "mark_session_reset",
     "mark_status_card_cleared",
     "mark_status_card_published",
-    "mark_subagent_activity",
+    "normalize_background_agent_key",
+    "mark_background_agent_activity",
+    "mark_background_agent_done",
+    "mark_background_agent_launched",
     "pane_idle_clear_due",
     "parse_pending_tools_from_jsonl",
     "reset_for_tests",
