@@ -253,7 +253,9 @@ async def test_end_of_turn_prune_fires_even_without_event_timestamp():
     """Provenance-only prune: no timestamp comparison, so a None end-of-turn
     timestamp still drops foreground keys (hermes r2 P2-2)."""
     await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
-    await route_runtime.mark_background_agent_activity(ROUTE, KEY, None)  # active: recorded
+    await route_runtime.mark_background_agent_activity(
+        ROUTE, KEY, None
+    )  # active: recorded
     assert KEY in _st().background_agents
     snap = await route_runtime.ingest_transcript_event(
         ROUTE, _evt("assistant", "text", stop_reason="end_turn", timestamp=None)
@@ -523,7 +525,8 @@ async def test_pane_idle_card_clear_proceeds_while_projected_running():
     await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
     route_runtime.arm_pane_idle_clear(ROUTE, now=1000.0)
     assert route_runtime.pane_idle_clear_due(ROUTE, now=1000.0 + 10.0)
-    snap = await route_runtime.commit_pane_idle_clear(ROUTE)
+    fired = await route_runtime.commit_pane_idle_clear(ROUTE, now=1000.0 + 10.0)
     # The card-clear protocol ran; the visible state stays lifted.
-    assert snap.run_state is RunState.RUNNING
+    assert fired is True
     assert _st().pane_idle_cleared is True
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING

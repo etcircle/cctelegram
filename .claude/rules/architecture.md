@@ -38,9 +38,10 @@
 │    UNCONDITIONALLY;     │                   │
 │    show_tool_calls only │                   │
 │    gates display; per-  │                   │
-│    tick parent activity │                   │
-│    → mark_subagent_     │                   │
-│    activity keep-alive  │                   │
+│    tick per-agent ticks │                   │
+│    + launch/completion  │                   │
+│    signals → keyed bg-  │                   │
+│    agent marks (GH #44) │                   │
 └──────────┬──────────────┘                   │
            │                                  │
            ▼                                  ▼
@@ -140,6 +141,39 @@ Additional modules:
                                 dashboard renders state-only until repopulated).
                                 last_event_at stays monotonic and is NEVER used for
                                 the 🔔 unanswered-turn classification (ages only).
+                                GH #44 background-agent projection: a THIRD
+                                lower-authority input, background_agents
+                                (normalized key → {last_seen_wall,
+                                last_event_ts, is_background}) + done
+                                tombstones, applied at SNAPSHOT time by the
+                                single _build_snapshot/_projected_run_state
+                                helper (every read path; no duplicate-freeze
+                                drift): stored-idle + live key ⇒ visible
+                                RUNNING (typing + 🟡 Busy); a committed
+                                notification_pending projects WAITING above
+                                the lift. Marks: mark_background_agent_
+                                activity (keyed Wave A successor — heartbeat +
+                                pane-false-idle resurrection unqualified; idle
+                                key SET strictly ts-qualified vs
+                                last_assistant_turn_ended_at, fail-closed),
+                                mark_background_agent_launched (agentId: line
+                                in the async-launch tool_result ⇒
+                                is_background, never pruned),
+                                mark_background_agent_done (tombstones).
+                                Clears: done / BG_AGENT_TTL_SECONDS 30-min
+                                wall-clock heartbeat TTL (_wall_now(),
+                                expire-before-classify) / provenance-only
+                                foreground prune at end-of-turn / teardown.
+                                mark_notification_pending commits on
+                                stored-idle + live bg key (🔔 outranks the
+                                lift). Task-notification user events
+                                (is_task_notification, adapter-stamped)
+                                preserve tombstones/pane-bit/stash, clear the
+                                notification bit ts-qualified, and re-derive
+                                with preserved gates. mark_subagent_activity
+                                is RETIRED into the keyed mark. In-memory;
+                                restart ⇒ stamp-None fail-closed (no lift
+                                until fresh parent activity).
   transcript_event_adapter.py ─ Translates session_monitor.TranscriptEvent →
                                 route_runtime.TranscriptLifecycleEvent and fans out
                                 per-route. 150-250 LoC budget (kill signal at 250 —

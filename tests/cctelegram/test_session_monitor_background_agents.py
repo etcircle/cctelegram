@@ -14,7 +14,7 @@ import json
 
 import pytest
 
-from cctelegram.session_monitor import SessionMonitor, TrackedSession
+from cctelegram.session_monitor import SessionInfo, SessionMonitor, TrackedSession
 from cctelegram.utils import parse_iso_timestamp
 
 PARENT = "parent-sid"
@@ -43,6 +43,13 @@ def _setup_parent(monitor, tmp_path, parent_sid: str = PARENT):
             last_byte_offset=parent_jsonl.stat().st_size,
         )
     )
+
+    # scan_projects shells out to tmux for active cwds — stub it like the
+    # existing check_for_updates tests do.
+    async def _scan():
+        return [SessionInfo(session_id=parent_sid, file_path=parent_jsonl)]
+
+    monitor.scan_projects = _scan  # type: ignore[method-assign]
     return parent_jsonl, sub_dir
 
 
@@ -85,9 +92,7 @@ async def test_per_agent_ticks_with_max_timestamp(
     assert PARENT in activity
     ticks = activity[PARENT].ticks
     assert set(ticks) == {"abc"}  # normalized key — no agent- prefix
-    assert ticks["abc"].max_event_ts == parse_iso_timestamp(
-        "2026-06-12T08:05:00.000Z"
-    )
+    assert ticks["abc"].max_event_ts == parse_iso_timestamp("2026-06-12T08:05:00.000Z")
     assert ticks["abc"].saw_end_of_turn is False
     # Consume-once.
     assert monitor.pop_sidechain_activity() == {}

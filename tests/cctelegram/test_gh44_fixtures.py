@@ -41,8 +41,10 @@ SIDECHAIN_STEM = "agent-a092b6b478733eef0"
 
 
 def _parse_fixture(name: str):
-    lines = (FIXTURES / name).read_text().splitlines()
-    parsed, _pending = TranscriptParser.parse_entries(lines, pending_tools={})
+    entries = [
+        json.loads(ln) for ln in (FIXTURES / name).read_text().splitlines() if ln
+    ]
+    parsed, _pending = TranscriptParser.parse_entries(entries, pending_tools={})
     return parsed
 
 
@@ -119,9 +121,7 @@ def test_task_notification_extractor_on_fixture():
 def test_task_notification_extractor_rejects_ordinary_text():
     assert extract_task_notification_task_id("hello world") is None
     assert extract_task_notification_task_id("") is None
-    assert (
-        extract_task_notification_task_id("<task-notification>no id here") is None
-    )
+    assert extract_task_notification_task_id("<task-notification>no id here") is None
 
 
 # ── (b) timestamps — both sides parse with the shared helper ────────────

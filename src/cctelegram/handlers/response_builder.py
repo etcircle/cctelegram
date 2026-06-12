@@ -37,6 +37,51 @@ def is_task_notification(text: str) -> bool:
     return _TASK_NOTIF_RE.match(text or "") is not None
 
 
+def extract_task_notification_task_id(text: str) -> str | None:
+    """Extract ``<task-id>`` from a ``<task-notification>`` envelope.
+
+    Public extractor beside the predicate (GH #44, codex r3 P3-1 — the
+    predicate alone returns bool). For a background async agent the task-id
+    IS the agent key (== the sidechain ``agent-<id>.jsonl`` stem minus the
+    prefix; fixture-verified). ``None`` when the text is not a recognizable
+    envelope or carries no task-id.
+    """
+    m = _TASK_NOTIF_RE.match(text or "")
+    if not m:
+        return None
+    for tm in _TASK_NOTIF_TAG_RE.finditer(m.group(1)):
+        if tm.group("tag") == "task-id":
+            body = tm.group("body").strip()
+            return body or None
+    return None
+
+
+# The async-launch background discriminator (GH #44 §3.2a). Anchored on the
+# STRUCTURED ``agentId: <id>`` line — the surrounding success sentence is
+# diagnostic/fixture coverage only, never load-bearing (codex r3 + hermes
+# §9-2: TUI prose drifts across Claude Code versions; the id line is the
+# stable part). Callers scope it to Agent/Task tool_result text.
+# Leading whitespace tolerated: the transcript parser renders tool_result
+# content indented under the "⎿" marker.
+_ASYNC_LAUNCH_AGENT_ID_RE = re.compile(
+    r"^\s*agentId:\s*([0-9a-fA-F]{6,})\b", re.MULTILINE
+)
+
+
+def extract_async_agent_launch_id(text: str) -> str | None:
+    """Extract the ``agentId`` from an async-Agent-launch ``tool_result``.
+
+    Returns the raw id (no ``agent-`` prefix — normalize with
+    ``route_runtime.normalize_background_agent_key`` before keying) or
+    ``None`` when no ``agentId:`` line is present. Synchronous agents never
+    produce one (their tool_result is the agent's final report).
+    """
+    if not text:
+        return None
+    m = _ASYNC_LAUNCH_AGENT_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
 def _render_task_notification(text: str) -> str | None:
     """Render an external `<task-notification>` envelope as a clean card.
 
