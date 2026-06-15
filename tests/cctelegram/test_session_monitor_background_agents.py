@@ -402,3 +402,128 @@ async def test_workflow_bracket_heartbeats_only_on_mtime_advance(
     activity = monitor.pop_sidechain_activity()
     if PARENT in activity:
         assert f"wf-task:{_WF_TASK}" not in activity[PARENT].bracket_heartbeats
+
+
+# ── Fix 5 PR-A characterization: pin the CURRENT top-level Agent/Task ──────
+#   sidechain behavior of check_sidechain_updates BEFORE the helper
+#   extraction (§4-A). This is the gate-landing safety net: the extraction
+#   of _track_and_emit_sidechain_file(feed_run_state=True) for the top-level
+#   loop must keep ALL of (a) tick population, (b) first-seen-at-EOF
+#   registration, and (c) the _pending_tools tool_use/tool_result carry
+#   across ticks byte-identical. Uses synthetic ids/content (no PII).
+
+
+@pytest.mark.asyncio
+async def test_characterize_toplevel_sidechain_ticks_eof_and_pending_carry(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """Characterize the existing top-level (subagents/agent-*.jsonl) path.
+
+    Pins three behaviors that the §2.1(a) extraction must preserve:
+      (a) ``pop_sidechain_activity().ticks`` carries the normalized stem key
+          with the correct ``max_event_ts`` and ``saw_end_of_turn``;
+      (b) a newly-discovered file registers at EOF (first observation emits
+          NOTHING and the tracker exists at the file's current size);
+      (c) ``_pending_tools`` carries an unpaired ``tool_use`` across ticks and
+          pairs it with the ``tool_result`` that lands the next tick.
+    """
+    _, sub_dir = _setup_parent(monitor, tmp_path)
+    sc = sub_dir / "agent-char01.jsonl"
+
+    # ── (b) first-seen registers at EOF ──────────────────────────────────
+    # Pre-existing "historical" content the bot must NOT replay.
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("old", "Bash", {"command": "echo hi"})],
+                timestamp="2026-06-12T07:00:00.000Z",
+            )
+        ],
+    )
+    eof_size = sc.stat().st_size
+
+    first_msgs = await monitor.check_sidechain_updates({PARENT})
+    assert first_msgs == []  # started at EOF — no historical replay
+    assert monitor.pop_sidechain_activity() == {}  # no activity on registration
+
+    tracking_key = f"sub:{PARENT}:agent-char01"
+    tracked = monitor.state.get_session(tracking_key)
+    assert tracked is not None  # tracker exists after first observation
+    assert tracked.parent_session_id == PARENT
+    assert tracked.last_byte_offset == eof_size  # registered at EOF
+
+    # ── (c) tick 1: an UNPAIRED tool_use → carried in _pending_tools ──────
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("tc1", "Read", {"file_path": "syn.py"})],
+                timestamp="2026-06-12T08:00:00.000Z",
+            )
+        ],
+    )
+    msgs_t1 = await monitor.check_sidechain_updates({PARENT})
+    # The tool_use is forwarded (subagent-tagged) but its tool_result has not
+    # arrived, so the parser carries it as a pending tool for next tick.
+    assert [m.subagent_key for m in msgs_t1] == [tracking_key]
+    assert msgs_t1[0].content_type == "tool_use"
+    assert msgs_t1[0].tool_use_id == "tc1"
+    assert "tc1" in monitor._pending_tools.get(tracking_key, {})
+
+    # ── (a) tick 1 activity: normalized stem key + ts + no end-of-turn ────
+    activity_t1 = monitor.pop_sidechain_activity()
+    assert PARENT in activity_t1
+    ticks = activity_t1[PARENT].ticks
+    assert set(ticks) == {"char01"}  # normalized — "agent-" stripped
+    assert ticks["char01"].max_event_ts == parse_iso_timestamp(
+        "2026-06-12T08:00:00.000Z"
+    )
+    assert ticks["char01"].saw_end_of_turn is False
+
+    # ── (c) tick 2: the tool_result pairs with the carried tool_use ──────
+    # Plus an end-of-turn text block so (a) saw_end_of_turn flips True.
+    _append(
+        sc,
+        [
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("tc1", "synthetic result")],
+                timestamp="2026-06-12T08:05:00.000Z",
+            ),
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "text", "text": "done"}],
+                timestamp="2026-06-12T08:06:00.000Z",
+            ),
+        ],
+    )
+    # Mark the assistant turn's end so saw_end_of_turn flips.
+    # (make_jsonl_entry has no stop_reason; set it on the last raw line.)
+    raw = sc.read_text().splitlines()
+    last = json.loads(raw[-1])
+    last["message"]["stop_reason"] = "end_turn"
+    raw[-1] = json.dumps(last)
+    sc.write_text("\n".join(raw) + "\n")
+
+    msgs_t2 = await monitor.check_sidechain_updates({PARENT})
+
+    # The carried tool_use is now paired with its tool_result and cleared.
+    assert "tc1" not in monitor._pending_tools.get(tracking_key, {})
+    # The tool_result and the text both forward, subagent-tagged.
+    kinds_t2 = [m.content_type for m in msgs_t2]
+    assert "tool_result" in kinds_t2
+    assert "text" in kinds_t2
+    assert all(m.subagent_key == tracking_key for m in msgs_t2)
+
+    # ── (a) tick 2 activity: end-of-turn now seen ────────────────────────
+    activity_t2 = monitor.pop_sidechain_activity()
+    assert PARENT in activity_t2
+    ticks2 = activity_t2[PARENT].ticks
+    assert "char01" in ticks2
+    assert ticks2["char01"].max_event_ts == parse_iso_timestamp(
+        "2026-06-12T08:06:00.000Z"
+    )
+    assert ticks2["char01"].saw_end_of_turn is True

@@ -1003,10 +1003,15 @@ class SessionMonitor:
         a parent whose sidechains produced new parsed entries this tick is
         recorded per agent key for ``pop_sidechain_activity`` (the GH #44
         run-state keep-alive + projection input) regardless of display
-        settings. ``config.show_tool_calls``
-        gates only the ``NewMessage`` EMISSION below: when False, no sidechain
-        messages are emitted (complete display suppression at this point — not
-        bot.py-side filtering).
+        settings. Sidechain ``NewMessage`` emission is likewise UNCONDITIONAL
+        at the monitor; per-recipient display suppression is entirely
+        downstream via ``output_prefs.subagent_cards`` in the message_queue
+        digest path (a monitor-level drop would make a stored user override
+        unable to re-enable the cards).
+
+        The shared per-file body lives in ``_track_and_emit_sidechain_file``;
+        the top-level Agent/Task loop drives it with ``feed_run_state=True``
+        (Fix 5 PR-A extraction).
         """
         new_messages: list[NewMessage] = []
 
@@ -1042,134 +1047,173 @@ class SessionMonitor:
             for sc_file in sidechain_files:
                 # sc_file.stem looks like "agent-a05666f9d196136af"
                 tracking_key = f"sub:{parent_session_id}:{sc_file.stem}"
-
-                tracked = self.state.get_session(tracking_key)
-                if tracked is None:
-                    # New sidechain file — start at EOF to skip history.
-                    # On startup this avoids replaying long-finished
-                    # sub-agent runs; mid-session it means we miss a few
-                    # lines that landed before discovery, which is fine.
-                    try:
-                        st = sc_file.stat()
-                    except OSError:
-                        continue
-                    tracked = TrackedSession(
-                        session_id=tracking_key,
-                        file_path=str(sc_file),
-                        last_byte_offset=st.st_size,
-                        parent_session_id=parent_session_id,
-                    )
-                    self.state.update_session(tracked)
-                    self._file_mtimes[tracking_key] = st.st_mtime
-                    logger.info(
-                        "Started tracking sidechain %s (parent=%s, size=%d)",
-                        sc_file.name,
-                        parent_session_id[:8],
-                        st.st_size,
-                    )
-                    continue
-
-                try:
-                    st = sc_file.stat()
-                    current_mtime = st.st_mtime
-                    current_size = st.st_size
-                except OSError:
-                    continue
-
-                last_mtime = self._file_mtimes.get(tracking_key, 0.0)
-                if (
-                    current_mtime <= last_mtime
-                    and current_size <= tracked.last_byte_offset
-                ):
-                    continue
-
-                new_entries = await self._read_new_lines(tracked, sc_file)
-                self._file_mtimes[tracking_key] = current_mtime
-
-                if not new_entries:
-                    self.state.update_session(tracked)
-                    continue
-
-                carry = self._pending_tools.get(tracking_key, {})
-                parsed_entries, remaining = TranscriptParser.parse_entries(
-                    new_entries,
-                    pending_tools=carry,
+                await self._track_and_emit_sidechain_file(
+                    parent_session_id=parent_session_id,
+                    sc_file=sc_file,
+                    tracking_key=tracking_key,
+                    new_messages=new_messages,
+                    feed_run_state=True,
                 )
-                if remaining:
-                    self._pending_tools[tracking_key] = remaining
-                else:
-                    self._pending_tools.pop(tracking_key, None)
-
-                # GH #44 (ex-Wave A): new parsed entries = sidechain activity
-                # for the parent's route, regardless of whether anything is
-                # displayed. Aggregate per normalized agent key: max parsed
-                # JSONL timestamp + end-of-turn detection — INCLUDING
-                # lifecycle-only entries with no visible text (a quiet final
-                # turn must still clear the projection; codex r2 P2-2).
-                if parsed_entries:
-                    agent_key = normalize_background_agent_key(sc_file.stem)
-                    tick = self._parent_activity(parent_session_id).ticks.setdefault(
-                        agent_key, SidechainTick()
-                    )
-                    for entry in parsed_entries:
-                        ts = parse_iso_timestamp(entry.timestamp)
-                        if ts is not None and (
-                            tick.max_event_ts is None or ts > tick.max_event_ts
-                        ):
-                            tick.max_event_ts = ts
-                        if entry.stop_reason in _TURN_END_REASONS:
-                            tick.saw_end_of_turn = True
-
-                # Sidechain blocks are always emitted (keep-alive above is
-                # already unconditional); display gating is PER-RECIPIENT via
-                # output_prefs (subagent_cards / tool_activity) in the
-                # message_queue digest path — a monitor-level drop here would
-                # make a stored user override unable to re-enable the cards
-                # (plan v4 §4).
-
-                for entry in parsed_entries:
-                    # Each block (text / thinking / tool_use / tool_result)
-                    # becomes one event for the per-sub-agent digest. The
-                    # message_queue collapses these into a single editable
-                    # message keyed by ``subagent_key=tracking_key`` so a
-                    # multi-step run renders as one bubble in the parent
-                    # topic, not N. Routing through ``subagent_key`` also
-                    # bypasses Agent prominence / parent activity digest /
-                    # interactive UI dispatch — those apply only to the
-                    # parent's own blocks.
-                    if entry.role != "assistant":
-                        continue
-                    if entry.content_type not in (
-                        "text",
-                        "thinking",
-                        "tool_use",
-                        "tool_result",
-                    ):
-                        continue
-                    if not entry.text and not entry.tool_use_id:
-                        continue
-                    new_messages.append(
-                        NewMessage(
-                            session_id=parent_session_id,
-                            text=entry.text,
-                            content_type=entry.content_type,
-                            tool_use_id=entry.tool_use_id,
-                            role="assistant",
-                            tool_name=entry.tool_name,
-                            image_data=None,
-                            tool_input=entry.tool_input,
-                            transcript_uuid=entry.uuid,
-                            subagent_key=tracking_key,
-                            stop_reason=entry.stop_reason,
-                            message_id=entry.message_id,
-                            block_origin=entry.block_origin,
-                        )
-                    )
-
-                self.state.update_session(tracked)
 
         self.state.save_if_dirty()
         return new_messages
+
+    async def _track_and_emit_sidechain_file(
+        self,
+        *,
+        parent_session_id: str,
+        sc_file: Path,
+        tracking_key: str,
+        new_messages: list[NewMessage],
+        feed_run_state: bool,
+    ) -> None:
+        """Track byte offsets for ONE sidechain JSONL and emit its blocks.
+
+        The shared per-file body lifted out of ``check_sidechain_updates``'s
+        top-level ``for sc_file in sidechain_files`` loop (Fix 5 PR-A). It
+        owns the first-seen-at-EOF registration, the mtime/size short-circuit,
+        the ``_read_new_lines`` + ``TranscriptParser.parse_entries`` +
+        ``_pending_tools`` carry, the per-block subagent-tagged ``NewMessage``
+        emission, and the trailing ``update_session`` — byte-identical to the
+        pre-extraction top-level path.
+
+        ``feed_run_state`` gates ONLY the GH #44 run-state tick block: when
+        True (the top-level Agent/Task caller) new parsed entries populate the
+        parent's ``ParentSidechainActivity.ticks`` for ``pop_sidechain_activity``
+        (the run-state keep-alive / projection input). When False (the Fix 5
+        Workflow ``wf_dir`` caller in PR-B) the tick block is SKIPPED — the
+        ``wf-task:`` bracket + its mtime heartbeat stay the SOLE run-state input
+        for Workflow sidechains; their entries feed display ONLY. Everything
+        else — tracking, parsing, ``_pending_tools`` carry, and the
+        ``subagent_key``-tagged emission — runs unconditionally for both callers.
+        """
+        tracked = self.state.get_session(tracking_key)
+        if tracked is None:
+            # New sidechain file — start at EOF to skip history.
+            # On startup this avoids replaying long-finished
+            # sub-agent runs; mid-session it means we miss a few
+            # lines that landed before discovery, which is fine.
+            try:
+                st = sc_file.stat()
+            except OSError:
+                return
+            tracked = TrackedSession(
+                session_id=tracking_key,
+                file_path=str(sc_file),
+                last_byte_offset=st.st_size,
+                parent_session_id=parent_session_id,
+            )
+            self.state.update_session(tracked)
+            self._file_mtimes[tracking_key] = st.st_mtime
+            logger.info(
+                "Started tracking sidechain %s (parent=%s, size=%d)",
+                sc_file.name,
+                parent_session_id[:8],
+                st.st_size,
+            )
+            return
+
+        try:
+            st = sc_file.stat()
+            current_mtime = st.st_mtime
+            current_size = st.st_size
+        except OSError:
+            return
+
+        last_mtime = self._file_mtimes.get(tracking_key, 0.0)
+        if current_mtime <= last_mtime and current_size <= tracked.last_byte_offset:
+            return
+
+        new_entries = await self._read_new_lines(tracked, sc_file)
+        self._file_mtimes[tracking_key] = current_mtime
+
+        if not new_entries:
+            self.state.update_session(tracked)
+            return
+
+        carry = self._pending_tools.get(tracking_key, {})
+        parsed_entries, remaining = TranscriptParser.parse_entries(
+            new_entries,
+            pending_tools=carry,
+        )
+        if remaining:
+            self._pending_tools[tracking_key] = remaining
+        else:
+            self._pending_tools.pop(tracking_key, None)
+
+        # GH #44 (ex-Wave A): new parsed entries = sidechain activity
+        # for the parent's route, regardless of whether anything is
+        # displayed. Aggregate per normalized agent key: max parsed
+        # JSONL timestamp + end-of-turn detection — INCLUDING
+        # lifecycle-only entries with no visible text (a quiet final
+        # turn must still clear the projection; codex r2 P2-2).
+        #
+        # Fix 5: gated on ``feed_run_state`` — the Workflow ``wf_dir`` caller
+        # (PR-B) passes False so Workflow sidechain ENTRIES never feed
+        # run-state (the ``wf-task:`` bracket + mtime heartbeat are the SOLE
+        # Workflow run-state input). The top-level Agent/Task caller passes
+        # True, preserving today's behavior.
+        if feed_run_state and parsed_entries:
+            agent_key = normalize_background_agent_key(sc_file.stem)
+            tick = self._parent_activity(parent_session_id).ticks.setdefault(
+                agent_key, SidechainTick()
+            )
+            for entry in parsed_entries:
+                ts = parse_iso_timestamp(entry.timestamp)
+                if ts is not None and (
+                    tick.max_event_ts is None or ts > tick.max_event_ts
+                ):
+                    tick.max_event_ts = ts
+                if entry.stop_reason in _TURN_END_REASONS:
+                    tick.saw_end_of_turn = True
+
+        # Sidechain blocks are always emitted (keep-alive above is
+        # already unconditional); display gating is PER-RECIPIENT via
+        # output_prefs (subagent_cards / tool_activity) in the
+        # message_queue digest path — a monitor-level drop here would
+        # make a stored user override unable to re-enable the cards
+        # (plan v4 §4).
+
+        for entry in parsed_entries:
+            # Each block (text / thinking / tool_use / tool_result)
+            # becomes one event for the per-sub-agent digest. The
+            # message_queue collapses these into a single editable
+            # message keyed by ``subagent_key=tracking_key`` so a
+            # multi-step run renders as one bubble in the parent
+            # topic, not N. Routing through ``subagent_key`` also
+            # bypasses Agent prominence / parent activity digest /
+            # interactive UI dispatch — those apply only to the
+            # parent's own blocks.
+            if entry.role != "assistant":
+                continue
+            if entry.content_type not in (
+                "text",
+                "thinking",
+                "tool_use",
+                "tool_result",
+            ):
+                continue
+            if not entry.text and not entry.tool_use_id:
+                continue
+            new_messages.append(
+                NewMessage(
+                    session_id=parent_session_id,
+                    text=entry.text,
+                    content_type=entry.content_type,
+                    tool_use_id=entry.tool_use_id,
+                    role="assistant",
+                    tool_name=entry.tool_name,
+                    image_data=None,
+                    tool_input=entry.tool_input,
+                    transcript_uuid=entry.uuid,
+                    subagent_key=tracking_key,
+                    stop_reason=entry.stop_reason,
+                    message_id=entry.message_id,
+                    block_origin=entry.block_origin,
+                )
+            )
+
+        self.state.update_session(tracked)
 
     def _remove_sidechains_for_parent(self, parent_session_id: str) -> None:
         """Drop sidechain trackers belonging to a parent that's been cleaned up."""
