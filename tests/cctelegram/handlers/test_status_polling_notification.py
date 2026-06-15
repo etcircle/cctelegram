@@ -30,7 +30,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cctelegram import route_runtime
-from cctelegram.handlers import status_polling
+from cctelegram.handlers import attention, status_polling
+from cctelegram.handlers.message_sender import TopicSendOutcome
 from cctelegram.route_runtime import (
     NOTIFY_TTL_SECONDS,
     RunState,
@@ -69,13 +70,17 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("CC_TELEGRAM_DIR", str(tmp_path))
     session_manager.window_states[_WID] = WindowState(cwd="/tmp/x", session_id=_SID)
     route_runtime.reset_for_tests()
+    attention.reset_for_tests()
     status_polling._last_pane_capture.clear()
     status_polling._prev_run_state.clear()
+    status_polling._decision_card_eot_grace.clear()
     yield tmp_path
     session_manager.window_states.pop(_WID, None)
     route_runtime.reset_for_tests()
+    attention.reset_for_tests()
     status_polling._last_pane_capture.clear()
     status_polling._prev_run_state.clear()
+    status_polling._decision_card_eot_grace.clear()
 
 
 def _write_record(
@@ -449,3 +454,194 @@ async def test_idle_pane_after_set_at_does_not_clear(_env, mock_bot):
     )
     await _tick(mock_bot, pane_text=idle_pane)
     assert route_runtime.snapshot(_ROUTE).notification_pending is True
+
+
+# ── Fix 3b/3c/3d: durable decision card (notify_waiting / dismiss_if_kind) ─
+#
+# ISSUE-5's missing surface: the 🔔 only ever drove a SILENT digest header.
+# It must surface as a persistent, audible "Claude needs a decision" card that
+# SURVIVES the workflow's streaming narration (Fix 1) and dismisses on resume.
+# These pin the poller card seam: post on COMMITTED_LIVE (gated by the
+# double-card guard, Fix 3d), dismiss on the reason-driven clears (Fix 3b/3c).
+
+
+async def test_committed_live_posts_notification_decision_card(_env, mock_bot):
+    await route_runtime.mark_inbound_sent(_ROUTE)  # RUNNING
+    _write_record(_env, generation="g1")
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with patch(
+        "cctelegram.handlers.attention.notify_waiting",
+        AsyncMock(return_value=TopicSendOutcome.OK),
+    ) as mock_notify:
+        await _tick(mock_bot)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is True
+    mock_notify.assert_awaited()
+    assert mock_notify.await_args.kwargs.get("kind") == "notification_decision"
+
+
+async def test_decision_card_retried_while_pending(_env, mock_bot):
+    """Fix 3b retry-while-pending (codex-R1-P2c): while notification_pending
+    stays True across ticks — even with the side file already consumed/gone —
+    the poller RE-ATTEMPTS the decision card. notify_waiting is idempotent (a
+    no-op if the card is already up, a genuine retry if a prior post failed on
+    a transient), so a lost first post never strands the route on the silent
+    digest header alone (the ISSUE-5 symptom)."""
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time(), generation="g1"
+    )  # committed; NO side file on disk (already consumed a prior tick)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is True
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with patch(
+        "cctelegram.handlers.attention.notify_waiting",
+        AsyncMock(return_value=TopicSendOutcome.OK),
+    ) as mock_notify:
+        await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is True
+    mock_notify.assert_awaited()
+    assert mock_notify.await_args.kwargs.get("kind") == "notification_decision"
+
+
+async def test_decision_card_retry_respects_interactive_surface_guard(_env, mock_bot):
+    """The retry-while-pending path stays gated by has_interactive_surface
+    (Fix 3d) — no decision card while a real AUQ/EPM surface owns the topic."""
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time(), generation="g1"
+    )
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with (
+        patch(
+            "cctelegram.handlers.attention.notify_waiting",
+            AsyncMock(return_value=TopicSendOutcome.OK),
+        ) as mock_notify,
+        patch.object(status_polling, "has_interactive_surface", return_value=True),
+    ):
+        await _tick(mock_bot)
+    mock_notify.assert_not_awaited()
+
+
+async def test_decision_card_suppressed_when_interactive_surface_live(_env, mock_bot):
+    """Fix 3d: no audible decision card while a real AUQ/EPM interactive surface
+    already owns the topic (gate on has_interactive_surface, NOT the pane bit).
+    The bit still commits; only the redundant card is suppressed."""
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    _write_record(_env, generation="g1")
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with (
+        patch(
+            "cctelegram.handlers.attention.notify_waiting",
+            AsyncMock(return_value=TopicSendOutcome.OK),
+        ) as mock_notify,
+        patch.object(status_polling, "has_interactive_surface", return_value=True),
+    ):
+        await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is True
+    mock_notify.assert_not_awaited()
+
+
+async def test_pane_running_clear_dismisses_decision_card(_env, mock_bot):
+    """Fix 3b/3c: the PANE_RUNNING clear (user resumed in the terminal)
+    dismisses the notification_decision card via the kind-aware dismissal."""
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    set_at = time.time() - 30
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=set_at, generation="g1"
+    )
+    path = _write_record(_env, ts=set_at, generation="g1")
+    with patch(
+        "cctelegram.handlers.attention.dismiss_if_kind", AsyncMock(), create=True
+    ) as mock_dismiss:
+        await _tick(mock_bot, pane_text=_ACTIVE_PANE)
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    mock_dismiss.assert_awaited()
+    assert mock_dismiss.await_args.kwargs.get("kind") == "notification_decision"
+    assert not path.exists()
+
+
+async def _commit_then_eot_clear() -> None:
+    """Commit a notification (card posts) then clear it via a strictly-newer
+    end-of-turn → reason END_OF_TURN, route idle, NO background-agent key."""
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time(), generation="g1"
+    )
+    await route_runtime.ingest_transcript_event(
+        _ROUTE,
+        _evt("assistant", "text", stop_reason="end_turn", timestamp=time.time() + 10),
+    )
+    snap = route_runtime.snapshot(_ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.END_OF_TURN
+    )
+    assert snap.background_agents == ()
+
+
+async def test_eot_gap_grace_holds_card_then_dismisses(_env, mock_bot, monkeypatch):
+    """Codex P2 (the EOT-gap race): an END_OF_TURN clear with NO visible
+    background key must NOT dismiss the decision card immediately — the monitor
+    applies the parent end-of-turn (clearing 🔔) BEFORE the same-batch Workflow
+    launch fan-out sets the bg key, so a poller reconcile can land in between.
+    The card is HELD for a short grace; only after the grace elapses with still
+    no bg key (a genuine no-workflow end-of-turn) is it dismissed."""
+    monkeypatch.setattr(status_polling, "DECISION_CARD_EOT_GRACE_S", 5.0)
+    await _commit_then_eot_clear()
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    # Within grace: must NOT dismiss.
+    with patch(
+        "cctelegram.handlers.attention.dismiss_if_kind", AsyncMock(), create=True
+    ) as mock_dismiss:
+        await _tick(mock_bot)
+    mock_dismiss.assert_not_awaited()
+    # Force the grace expired → the genuine end-of-turn dismisses.
+    status_polling._decision_card_eot_grace[_ROUTE] = time.monotonic() - 1.0
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with patch(
+        "cctelegram.handlers.attention.dismiss_if_kind", AsyncMock(), create=True
+    ) as mock_dismiss:
+        await _tick(mock_bot)
+    mock_dismiss.assert_awaited()
+
+
+async def test_eot_gap_lagging_bg_key_within_grace_keeps_card(
+    _env, mock_bot, monkeypatch
+):
+    """Codex P2 fix: when the lagging Workflow launch fan-out lands DURING the
+    grace (the bg key becomes visible), the card is KEPT — the route is
+    projected-Busy, exactly the EOT-gap the card is meant to survive."""
+    monkeypatch.setattr(status_polling, "DECISION_CARD_EOT_GRACE_S", 5.0)
+    await _commit_then_eot_clear()
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with patch(
+        "cctelegram.handlers.attention.dismiss_if_kind", AsyncMock(), create=True
+    ) as mock_dismiss:
+        await _tick(mock_bot)  # grace starts; no dismiss
+    mock_dismiss.assert_not_awaited()
+    # The lagging launch lands → bg key live → projected Busy.
+    await route_runtime.mark_background_agent_launched(_ROUTE, "wf-task:wlag01")
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with patch(
+        "cctelegram.handlers.attention.dismiss_if_kind", AsyncMock(), create=True
+    ) as mock_dismiss:
+        await _tick(mock_bot)
+    mock_dismiss.assert_not_awaited()  # EOT-gap keep (bg key now visible)
+
+
+async def test_ttl_clear_dismisses_decision_card(_env, mock_bot):
+    """Fix 3b/3c: the runtime-TTL clear also dismisses the decision card so a
+    silently-degraded 🔔 never leaves a stuck audible card."""
+    await route_runtime.mark_inbound_sent(_ROUTE)
+    await route_runtime.mark_notification_pending(
+        _ROUTE, set_at=time.time() - NOTIFY_TTL_SECONDS - 60, generation="g1"
+    )
+    status_polling._last_pane_capture[_ROUTE] = time.monotonic() - 1.0
+    with patch(
+        "cctelegram.handlers.attention.dismiss_if_kind", AsyncMock(), create=True
+    ) as mock_dismiss:
+        await _tick(mock_bot)
+    assert route_runtime.snapshot(_ROUTE).notification_pending is False
+    mock_dismiss.assert_awaited()

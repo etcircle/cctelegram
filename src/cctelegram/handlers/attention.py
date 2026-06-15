@@ -78,6 +78,12 @@ class AttentionState:
     state: Literal["idle", "waiting"]
     last_send_at: float
     kind: str
+    # Fix 3b/3c: WALL clock (``time.time()``) the card was last set to
+    # "waiting" — distinct from the MONOTONIC ``last_send_at``. Wall so the
+    # decision-card genuine-user proof (``last_user_turn_at > card.set_at``)
+    # compares on the same ``time.time()`` clock as the route_runtime turn
+    # stamps. Defaulted so pre-Fix-3 constructors stay valid.
+    set_at: float = 0.0
 
 
 # Keyed by ``(user_id, thread_id_or_0)`` so DM-only routes (thread_id is None)
@@ -315,6 +321,7 @@ async def notify_waiting(
             existing.generation = _bump_attention_generation(key)
             existing.kind = kind
             existing.state = "waiting"
+            existing.set_at = time.time()  # Fix 3b/3c: re-arm the wall stamp
             return TopicSendOutcome.OK
         # Edit failed — drop slot and fall through to fresh send so the
         # signal is not silently lost.
@@ -397,6 +404,7 @@ async def notify_waiting(
         state="waiting",
         last_send_at=now,
         kind=kind,
+        set_at=time.time(),  # Fix 3b/3c: WALL stamp for the genuine-user proof
     )
     return TopicSendOutcome.OK
 
@@ -442,6 +450,28 @@ async def dismiss(
                 outcome.value,
             )
     state.state = "idle"
+
+
+async def dismiss_if_kind(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    kind: str,
+) -> None:
+    """Dismiss the live attention card ONLY if its ``kind`` matches (Fix 3c).
+
+    The generic display-layer cleanup sites (``message_queue`` / ``interactive_ui``
+    / ``inbound_telegram``) call this with ``kind="interactive_ui"`` so they can
+    never silently ack a ``notification_decision`` card; the reason-driven poller
+    dismisses the decision card with ``kind="notification_decision"``. No-op when
+    no card exists or the live card is a different kind. Delegates to ``dismiss``
+    (same ack-trailer + idle logic) on a match.
+    """
+    state = _attention_state.get(_key(user_id, thread_id))
+    if state is None or state.kind != kind:
+        return
+    await dismiss(bot, user_id=user_id, thread_id=thread_id)
 
 
 def clear(user_id: int, thread_id: int | None) -> None:

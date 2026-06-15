@@ -81,7 +81,7 @@ fields: `run_state`, `open_tools`, `waiting_on_user_tools`,
 `context_usage`, `last_event_at`, `idle_clear_at`, `pane_idle_clear_at`,
 `typing_eligible`, `status_card_visible`, `status_card_msg_id`,
 `interactive_pending`, `notification_pending`, `notification_set_at`,
-`notification_generation`. The two
+`notification_generation`, `notification_clear_reason`. The two
 idle deadlines are distinct:
 `idle_clear_at` is the run-state `IDLE_RECENT → IDLE_CLEARED` decay
 (armed by a transcript end-of-turn), while `pane_idle_clear_at` is the
@@ -174,11 +174,18 @@ bits clear INDEPENDENTLY and the pane bit's contract is untouched. The ONE
 idle exception: IDLE(pane) with a non-empty `suspended_tools` stash is
 positive live proof the pane clear was false — the mark RESTORES the stash
 and derives WAITING (the second stash-restore path). CLEAR: a transcript
-`user` event unconditionally; `tool_result` / end-of-turn / assistant events
-only when their JSONL timestamp is strictly NEWER than `notification_set_at`
-(None/older preserves — buffered pre-notification JSONL must not re-hide the
-wait; a preserved bit at end-of-turn keeps WAITING instead of idling; an
-unknown `tool_result` preserves); the poller's pane-RUNNING observation at a
+`user` event unconditionally; `tool_result` / end-of-turn / task-notification
+events only when their JSONL timestamp is strictly NEWER than
+`notification_set_at` (None/older preserves — buffered pre-notification JSONL
+must not re-hide the wait; a preserved bit at end-of-turn keeps WAITING
+instead of idling; an unknown `tool_result` preserves). **Fix 1 (ISSUE-5 arm
+A): plain assistant `text`/`thinking` narration NO LONGER clears the bit** —
+a Workflow blocked on an approval gate narrates *while* blocked, and the
+buffered-flush timestamp is not causal order vs the gate, so a newer
+narration block must not bury the wait; the narration branches call
+`_clear_notification_if_setat_invalid` (the corrupt `set_at=None` invariant
+repair ONLY), never the causal `_maybe_clear_notification_by_ts`. The poller's
+pane-RUNNING observation at a
 capture taken strictly after `set_at + NOTIFY_PANE_CLEAR_MARGIN_S` (LEVEL +
 margin, NOT an idle→active edge — the adaptive capture can skip the blocked
 approval frame, so an edge requirement strands the bit when the last
@@ -194,6 +201,42 @@ lifecycle: unlinked per the mark result, on session replacement / `/clear`
 (OLD session id) / topic close, 24h startup GC with the injected
 `is_live_session` conservative-skip. Pull-only; no observer (c313657 stays
 forbidden).
+
+**Notification clear-reason channel + durable decision card (ISSUE-5 Fix
+3a/3b/3c/3d).** Every `notification_pending` True→False transition stamps a
+typed `NotificationClearReason` (`USER` / `TOOL_RESULT` / `END_OF_TURN` /
+`TASK_NOTIFICATION` / `INVARIANT` / `PANE_RUNNING` / `TTL` / `TEARDOWN`),
+surfaced on the snapshot as `notification_clear_reason` (`_clear_notification_in_place`
+takes a REQUIRED `reason`; `mark_notification_cleared(route, *, reason)` — the
+poller passes `TTL` / `PANE_RUNNING`; reset to None on each fresh commit). The
+🔔 now drives a **persistent, audible decision card** (`attention.notify_waiting(...,
+kind="notification_decision")` → the "🔔 Claude needs a decision" header; NO
+notification text stored — privacy). The poller posts it on `COMMITTED_LIVE`
+BEFORE the side-file unlink, gated by `interactive_ui.has_interactive_surface`
+(Fix 3d — never double-cards over a live AUQ/EPM surface; gate on the surface,
+NOT the pane bit). `status_polling._reconcile_decision_card` runs at the END of
+every consume: **retry-while-pending** (re-post idempotently while
+`notification_pending`, so a transient first-post failure never strands the
+route on the silent digest header); **KEEP** while cleared with reason
+`END_OF_TURN` AND a live `background_agents` key still projects Busy (the
+EOT-gap — a 🔔 raised by a Workflow's own approval gate survives the parent's
+end-of-turn); **DISMISS** kind-aware (`attention.dismiss_if_kind(...,
+kind="notification_decision")`) on every other reason. **EOT-gap grace (codex
+P2):** the monitor applies the parent end-of-turn (clearing 🔔) DURING
+`check_for_updates` but the same-batch Workflow launch (the bg key) only via
+the later `apply_sidechain_activity` fan-out, so a reconcile can land in
+between (bit cleared, bg key not yet visible) and dismiss prematurely — the
+END_OF_TURN-with-empty-bg dismiss is therefore HELD for
+`DECISION_CARD_EOT_GRACE_S` (poller-local `_decision_card_eot_grace` deadline)
+so a lagging launch becomes visible; only after the grace elapses with still no
+key (a genuine no-workflow end-of-turn) is it dismissed. **Dismiss audit (Fix
+3c):** every generic display-layer `attention.dismiss` (`message_queue` ×4,
+`interactive_ui` clear_interactive_msg, `inbound_telegram` user-reply) became
+`dismiss_if_kind("interactive_ui")` so display-path cleanup / narration can
+NEVER ack a `notification_decision` card — the decision card dismisses ONLY via
+the reason-driven poller path (the genuine-user dismissal flows through the
+route_runtime `user` clear → reason `USER` → reconcile). `AttentionState.set_at`
+is a WALL stamp. Pull-only; no observer (c313657 stays forbidden).
 
 **Background-agent projected Busy (GH #44 — typing + 🟡 while a
 `run_in_background` agent works).** A background async agent keeps writing its
@@ -243,6 +286,42 @@ decision). Restart degradation: all in-memory; the stamp-None guard keeps
 post-restart sidechain batches from lifting (no false Busy), so the route
 renders idle until fresh parent activity. Pull-only throughout (no observer;
 c313657 stays forbidden).
+
+**Workflow-tool bracket (ISSUE-6 — extends GH #44 to the `Workflow` tool).**
+GH #44 only detected the `Agent` tool's `run_in_background` (`agentId:` launch +
+single-level `subagents/agent-*.jsonl` glob); the `Workflow` tool has a
+DIFFERENT shape (subagents one level deeper at `subagents/workflows/wf_*/`, a
+launch tool_result with `Task ID:` mid-line and a separate `Run ID`, and a
+`<task-notification>` close keyed by the Task ID), so a Workflow run rendered
+idle (no typing). The fix reuses the SAME `background_agents` machinery via a
+**parent-transcript bracket** keyed `wf-task:<task_id>` (passes
+`normalize_background_agent_key` as identity — no `agent-` prefix — so it never
+aliases the Agent/Task namespace): `response_builder.extract_workflow_launch_info`
+parses the launch (regex `(?im)^.*\bTask ID:\s*…` — Task ID is MID-LINE,
+verified against real launches; the captured id == the `<task-notification>`
+close key, the open/close parity invariant); `session_monitor` adds the raw
+`wf-task:<id>` to `.launched` (→ `mark_background_agent_launched`,
+`is_background=True`, survives the parent end-of-turn prune → typing + 🟡) and
+opens a persistent `_WorkflowBracket`. **Fix 2c heartbeat (DESIGN B — separate
+channel):** each poll, `_emit_workflow_bracket_heartbeats` stats the bracket's
+`wf_dir` for the freshest `*.jsonl` mtime and emits a `wf-task:<id>` refresh
+into `ParentSidechainActivity.bracket_heartbeats` (→ `mark_background_agent_activity`)
+ONLY on an mtime ADVANCE (real new sidechain writes) — never by parsing
+sidechain ENTRIES (run-state consumes only the bracket + a dir stat); no new
+writes → the key ages out via the 30-min `BG_AGENT_TTL_SECONDS` (the dead/
+never-completed backstop); a `wf_dir`-less bracket never heartbeats (ages out
+one TTL from `launch_wall`). **Close = GATE-ON-BRACKET ONLY:** the
+`<task-notification>` emits the `wf-task:<id>` close key (→
+`mark_background_agent_done` tombstone) + drops the bracket IFF a live open
+bracket exists — never guessing a Workflow id from its character set; an
+isolated close with no bracket has no route_runtime key to tombstone, so the
+bare key suffices. Out-of-order done-before-launch fail-closes (the done
+tombstone no-ops the later launch). This `wf-task:` key is ALSO what makes
+ISSUE-5 arm B fire: a stored-idle route with a live `wf-task:` key lets
+`mark_notification_pending` re-commit (§3.6) instead of STALE_UNLINK, so a 🔔
+raised by the Workflow's own approval gate is durable. The `↳` sub-agent
+DISPLAY cards for Workflow sidechains are a deferred fast-follow (Fix 5) — not
+in this wave; typing + 🟡 + 🔔 do not depend on them. Pull-only; no observer.
 
 **AUQ card-liveness authority (pane is lower authority than the
 lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone

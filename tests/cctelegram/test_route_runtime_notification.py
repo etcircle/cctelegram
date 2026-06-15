@@ -45,6 +45,7 @@ def _evt(
     tool_name: str | None = None,
     stop_reason: str | None = None,
     timestamp: float | None = None,
+    is_task_notification: bool = False,
 ) -> TranscriptLifecycleEvent:
     return TranscriptLifecycleEvent(
         role=role,  # type: ignore[arg-type]
@@ -53,6 +54,7 @@ def _evt(
         tool_name=tool_name,
         stop_reason=stop_reason,
         timestamp=timestamp,
+        is_task_notification=is_task_notification,
     )
 
 
@@ -273,15 +275,35 @@ async def test_newer_tool_result_clears_bit():
     assert snap.run_state is RunState.RUNNING
 
 
-async def test_newer_assistant_text_clears_bit():
+async def test_newer_assistant_text_preserves_bit():
+    """ISSUE-5 arm A / Fix 1 (INVERTED from test_newer_assistant_text_clears_bit):
+    plain assistant narration text — even with a JSONL timestamp NEWER than
+    set_at — must NOT causally clear the 🔔 bit. A Workflow blocked on an
+    approval gate narrates WHILE blocked (the buffered-flush ts is not causal
+    order vs the gate), so the wait must survive its own streaming text.
+    Only an end-of-turn / tool_result / user / pane-running / TTL clears it."""
     await _mk_running()
     await _mark()
     await route_runtime.ingest_transcript_event(
         ROUTE, _evt("assistant", "text", timestamp=SET_AT + 10)
     )
     snap = route_runtime.snapshot(ROUTE)
-    assert snap.notification_pending is False
-    assert snap.run_state is RunState.RUNNING
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+
+
+async def test_newer_assistant_thinking_preserves_bit():
+    """ISSUE-5 arm A / Fix 1 (thinking twin): an assistant ``thinking`` block
+    with a newer timestamp must NOT causally clear the bit either — same
+    narration-while-blocked reasoning as the text branch."""
+    await _mk_running()
+    await _mark()
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "thinking", timestamp=SET_AT + 10)
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
 
 
 async def test_older_assistant_text_preserves_bit():
@@ -443,3 +465,128 @@ async def test_notification_resurrect_then_restored_tool_result_pairs():
     assert snap.notification_pending is False
     assert "agent-1" not in snap.open_tools
     assert snap.run_state is RunState.RUNNING
+
+
+# ── clear-reason channel (Fix 3a) ───────────────────────────────────────
+#
+# Every notification_pending True→False transition must carry a typed
+# NotificationClearReason, surfaced on the snapshot as notification_clear_reason
+# so the poller's decision-card keep/dismiss (Fix 3b) can distinguish a genuine
+# resolution from the EOT-gap. A True→False with an unset reason is a bug.
+
+
+async def test_clear_reason_user_on_genuine_user_turn():
+    await _mk_running_tool()
+    await _mark()
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert snap.notification_clear_reason is route_runtime.NotificationClearReason.USER
+
+
+async def test_clear_reason_tool_result_on_newer_tool_result():
+    await _mk_running_tool(tool_id="wf-1", name="Workflow")
+    await _mark()
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "tool_result", tool_use_id="wf-1", timestamp=SET_AT + 10)
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.TOOL_RESULT
+    )
+
+
+async def test_clear_reason_end_of_turn_on_newer_eot():
+    await _mk_running()
+    await _mark()
+    await route_runtime.ingest_transcript_event(
+        ROUTE,
+        _evt("assistant", "text", stop_reason="end_turn", timestamp=SET_AT + 10),
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.END_OF_TURN
+    )
+
+
+async def test_clear_reason_task_notification_on_newer_task_notif():
+    await _mk_running()
+    await _mark()
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("user", "text", timestamp=SET_AT + 10, is_task_notification=True)
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.TASK_NOTIFICATION
+    )
+
+
+async def test_clear_reason_invariant_on_corrupted_setat():
+    await _mk_running()
+    await _mark()
+    _st().notification_set_at = None  # corrupt the invariant
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", timestamp=None)
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.INVARIANT
+    )
+
+
+async def test_clear_reason_ttl_on_mark_cleared_ttl():
+    await _mk_running()
+    await _mark()
+    await route_runtime.mark_notification_cleared(
+        ROUTE, reason=route_runtime.NotificationClearReason.TTL
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert snap.notification_clear_reason is route_runtime.NotificationClearReason.TTL
+
+
+async def test_clear_reason_pane_running_on_mark_cleared_pane():
+    await _mk_running()
+    await _mark()
+    await route_runtime.mark_notification_cleared(
+        ROUTE, reason=route_runtime.NotificationClearReason.PANE_RUNNING
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.PANE_RUNNING
+    )
+
+
+async def test_clear_reason_teardown_on_session_reset():
+    await _mk_running()
+    await _mark()
+    await route_runtime.mark_session_reset(ROUTE)
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is False
+    assert (
+        snap.notification_clear_reason is route_runtime.NotificationClearReason.TEARDOWN
+    )
+
+
+async def test_narration_does_not_set_clear_reason_when_bit_survives():
+    """Fix 1 + 3a: a newer narration text PRESERVES the bit, so no clear
+    happens and the reason stays None — narration never spuriously stamps a
+    clear reason."""
+    await _mk_running()
+    await _mark()
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", timestamp=SET_AT + 10)
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is True
+    assert snap.notification_clear_reason is None

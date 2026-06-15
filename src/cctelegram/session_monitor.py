@@ -79,16 +79,42 @@ class ParentSidechainActivity:
 
     ``ticks`` — normalized agent_key → SidechainTick from the sidechain
     tail. ``launched`` — agentIds extracted from async-launch Agent
-    tool_results in the PARENT transcript this tick. ``completed`` —
-    task-ids extracted from parent ``<task-notification>`` user entries.
-    Drained consume-once via ``pop_sidechain_activity`` and applied by the
-    bot fan-out AFTER the tick's lifecycle dispatch (the §4.2 ordering:
-    lifecycle → launch → activity → done).
+    tool_results in the PARENT transcript this tick (plus the raw
+    ``wf-task:<id>`` keys from Workflow launches — Fix 2a). ``completed`` —
+    task-ids extracted from parent ``<task-notification>`` user entries (plus
+    the matching ``wf-task:<id>`` close keys — Fix 2d). ``bracket_heartbeats``
+    — ``wf-task:<id>`` → freshest sidechain ``*.jsonl`` mtime, emitted ONLY on
+    a per-bracket mtime ADVANCE (Fix 2c, DESIGN B — a SEPARATE channel from
+    ``ticks`` so run-state never consumes sidechain entries for a Workflow;
+    the bot fan-out turns it into ``mark_background_agent_activity``). Drained
+    consume-once via ``pop_sidechain_activity`` and applied by the bot fan-out
+    AFTER the tick's lifecycle dispatch (the §4.2 ordering: lifecycle → launch
+    → activity → done).
     """
 
     launched: set[str] = field(default_factory=set)
     completed: set[str] = field(default_factory=set)
     ticks: dict[str, SidechainTick] = field(default_factory=dict)
+    bracket_heartbeats: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class _WorkflowBracket:
+    """One open Workflow-tool bracket (ISSUE-6 / Fix 2c).
+
+    Persists across poll ticks (NOT per-tick like ``ParentSidechainActivity``):
+    opened at the Workflow launch parse, closed at the ``<task-notification>``
+    or any sidechain teardown. ``wf_dir`` is the validated
+    ``subagents/workflows/wf_<runid>`` Path whose freshest ``*.jsonl`` mtime is
+    stat'd each poll (the heartbeat gate); ``None`` when the launch carried no
+    Run ID / Transcript dir → the bracket NEVER heartbeats and its key ages
+    out one ``BG_AGENT_TTL_SECONDS`` from ``launch_wall``. ``last_seen_mtime``
+    is the advance-only gate; ``launch_wall`` is the no-dir TTL basis.
+    """
+
+    wf_dir: Path | None
+    last_seen_mtime: float
+    launch_wall: float
 
 
 def _is_window_id(key: str) -> bool:
@@ -320,6 +346,12 @@ class SessionMonitor:
         # via ``pop_sidechain_activity`` — the run-state keep-alive +
         # projection-input signal.
         self._sidechain_activity: dict[str, ParentSidechainActivity] = {}
+        # ISSUE-6 / Fix 2c: persistent per-parent open Workflow brackets
+        # (parent_sid -> {task_id -> _WorkflowBracket}). Opened at a Workflow
+        # launch parse, stat'd each poll for an mtime-advance heartbeat, and
+        # removed at the matching <task-notification> close OR any sidechain
+        # teardown. NOT per-tick — survives ticks until close.
+        self._open_workflow_brackets: dict[str, dict[str, _WorkflowBracket]] = {}
         # Per-tick fan-out for sidechain activity (wired from bot.post_init,
         # like ``_message_callback`` / ``_event_callback``).
         self._subagent_activity_callback: (
@@ -367,6 +399,79 @@ class SessionMonitor:
             rec = ParentSidechainActivity()
             self._sidechain_activity[parent_session_id] = rec
         return rec
+
+    def _open_workflow_bracket(self, parent_session_id: str, info: Any) -> None:
+        """Open a persistent Workflow bracket (ISSUE-6 / Fix 2c).
+
+        ``info`` is a ``response_builder.WorkflowLaunchInfo``. The bracket is
+        keyed by the bare ``task_id`` (the ``wf-task:`` prefix is added on the
+        key seams); ``wf_dir`` (the validated ``subagents/workflows/wf_…``
+        path) feeds the mtime heartbeat. A re-launch of the same task-id
+        refreshes the bracket. Defensive against a tombstoned re-launch is the
+        route_runtime done-guard, not here.
+        """
+        tdir = info.transcript_dir
+        wf_dir = Path(tdir) if tdir else None
+        brackets = self._open_workflow_brackets.setdefault(parent_session_id, {})
+        brackets[info.task_id] = _WorkflowBracket(
+            wf_dir=wf_dir,
+            last_seen_mtime=0.0,
+            launch_wall=time.time(),
+        )
+
+    def _has_open_workflow_bracket(self, parent_session_id: str, task_id: str) -> bool:
+        """True IFF a live OPEN Workflow bracket exists for ``task_id``
+        (ISSUE-6 / Fix 2d).
+
+        Gate-on-bracket-only: the open bracket is the SOLE signal that a
+        ``<task-notification>`` close belongs to a Workflow launch. An isolated
+        close with no open bracket has no route_runtime bg key to tombstone, so
+        the bare normalized close key suffices and NO ``wf-task:`` close key is
+        emitted — we never guess "is this a Workflow id?" from the id's
+        character set (a fragile external-format assumption).
+        """
+        brackets = self._open_workflow_brackets.get(parent_session_id)
+        return bool(brackets) and task_id in brackets
+
+    def _close_workflow_bracket(self, parent_session_id: str, task_id: str) -> None:
+        """Remove an open Workflow bracket on its ``<task-notification>`` close
+        (ISSUE-6 / Fix 2d). No-op for an unknown task-id."""
+        brackets = self._open_workflow_brackets.get(parent_session_id)
+        if not brackets:
+            return
+        brackets.pop(task_id, None)
+        if not brackets:
+            self._open_workflow_brackets.pop(parent_session_id, None)
+
+    def _emit_workflow_bracket_heartbeats(self, parent_session_id: str) -> None:
+        """Stat each open Workflow bracket's ``wf_dir`` and emit a
+        ``wf-task:<id>`` heartbeat ONLY when the freshest ``*.jsonl`` mtime
+        ADVANCED (ISSUE-6 / Fix 2c, DESIGN B).
+
+        A bracket with ``wf_dir is None`` never heartbeats (it ages out one
+        TTL from ``launch_wall``). The heartbeat lands in
+        ``ParentSidechainActivity.bracket_heartbeats`` — a SEPARATE channel
+        from ``ticks`` so run-state never consumes a Workflow's sidechain
+        entries; only the dir-stat drives the lift.
+        """
+        brackets = self._open_workflow_brackets.get(parent_session_id)
+        if not brackets:
+            return
+        for task_id, bracket in brackets.items():
+            if bracket.wf_dir is None:
+                continue
+            try:
+                latest = max(
+                    (f.stat().st_mtime for f in bracket.wf_dir.glob("*.jsonl")),
+                    default=0.0,
+                )
+            except OSError:
+                continue
+            if latest > bracket.last_seen_mtime:
+                bracket.last_seen_mtime = latest
+                self._parent_activity(parent_session_id).bracket_heartbeats[
+                    f"wf-task:{task_id}"
+                ] = latest
 
     def register_session(
         self, session_id: str, file_path: Path, offset: int = 0
@@ -766,6 +871,27 @@ class SessionMonitor:
                                 normalize_background_agent_key(launch_id)
                             )
                     elif (
+                        entry.content_type == "tool_result"
+                        and entry.tool_name == "Workflow"
+                    ):
+                        # ISSUE-6 / Fix 2a: the Workflow launch tool_result has
+                        # a DIFFERENT shape (Task ID mid-line + separate Run ID
+                        # / Transcript dir). Record the RAW prefixed key (no
+                        # normalize — the wf-task: namespace is isolated from
+                        # the Agent/Task agentId space) and open a persistent
+                        # bracket for the Fix 2c mtime heartbeat.
+                        from .handlers.response_builder import (
+                            extract_workflow_launch_info,
+                        )
+
+                        info = extract_workflow_launch_info(entry.text)
+                        if info and info.task_id:
+                            key = f"wf-task:{info.task_id}"
+                            self._parent_activity(session_info.session_id).launched.add(
+                                key
+                            )
+                            self._open_workflow_bracket(session_info.session_id, info)
+                    elif (
                         entry.role == "user"
                         and entry.content_type == "text"
                         and entry.text
@@ -777,9 +903,25 @@ class SessionMonitor:
 
                         task_id = extract_task_notification_task_id(entry.text)
                         if task_id:
-                            self._parent_activity(
-                                session_info.session_id
-                            ).completed.add(normalize_background_agent_key(task_id))
+                            rec = self._parent_activity(session_info.session_id)
+                            rec.completed.add(normalize_background_agent_key(task_id))
+                            # ISSUE-6 / Fix 2d: for a WORKFLOW task-id, ALSO emit
+                            # the wf-task: close key (== the wf-task launch key)
+                            # so the bracket tombstones, and drop the open
+                            # bracket. A Workflow task-id is identified ONLY by a
+                            # live OPEN bracket (gate-on-bracket): an isolated
+                            # close with no bracket has no route_runtime bg key
+                            # to tombstone, so the bare key above suffices. This
+                            # keeps an Agent close from spuriously emitting a
+                            # wf-task: done key without guessing a Workflow id
+                            # from its character set.
+                            if self._has_open_workflow_bracket(
+                                session_info.session_id, task_id
+                            ):
+                                rec.completed.add(f"wf-task:{task_id}")
+                                self._close_workflow_bracket(
+                                    session_info.session_id, task_id
+                                )
 
                     # Lifecycle-only entries exist purely to drive the
                     # busy indicator; they have no visible content and must
@@ -881,6 +1023,14 @@ class SessionMonitor:
             parent_files[sid] = Path(tracked.file_path)
 
         for parent_session_id, parent_jsonl in parent_files.items():
+            # ISSUE-6 / Fix 2c: emit the per-bracket mtime-advance heartbeat
+            # FIRST, before the agent-*.jsonl glob — a Workflow's sidechains
+            # live one level deeper (subagents/workflows/wf_*/), so the
+            # bracket stat must not depend on the top-level subagents glob (or
+            # the run-state lift would die whenever a parent has no direct
+            # Agent/Task sidechain).
+            self._emit_workflow_bracket_heartbeats(parent_session_id)
+
             sub_dir = parent_jsonl.parent / parent_session_id / "subagents"
             try:
                 if not sub_dir.is_dir():
@@ -1023,6 +1173,11 @@ class SessionMonitor:
 
     def _remove_sidechains_for_parent(self, parent_session_id: str) -> None:
         """Drop sidechain trackers belonging to a parent that's been cleaned up."""
+        # ISSUE-6 / Fix 2c: a parent's open Workflow brackets die with it (the
+        # central per-parent sidechain-teardown seam — reached by the runtime
+        # session-change cleanup, the deleted-window cleanup, and both startup
+        # sweeps).
+        self._open_workflow_brackets.pop(parent_session_id, None)
         prefix = f"sub:{parent_session_id}:"
         stale = [k for k in self.state.tracked_sessions if k.startswith(prefix)]
         for k in stale:

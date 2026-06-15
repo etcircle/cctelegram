@@ -253,6 +253,38 @@ class NotificationMarkResult(Enum):
     IGNORED_NO_UNLINK = "ignored-no-unlink"
 
 
+class NotificationClearReason(Enum):
+    """Why the ``notification_pending`` bit last transitioned True→False.
+
+    Surfaced on the snapshot as ``notification_clear_reason`` so the poller's
+    decision-card keep/dismiss (Fix 3b) can distinguish a genuine resolution
+    from the end-of-turn projected-Busy gap. Every True→False site stamps
+    exactly one reason; a True→False with no reason is a bug.
+
+      - ``USER`` — a genuine user turn (the unconditional transcript clear).
+      - ``TOOL_RESULT`` — a strictly-newer tool_result reclaim (the buffered
+        turn flushed) or out-of-order known-result reclaim.
+      - ``END_OF_TURN`` — a strictly-newer authoritative end-of-turn.
+      - ``TASK_NOTIFICATION`` — a strictly-newer ``<task-notification>`` user
+        event (machine-initiated completion).
+      - ``INVARIANT`` — pending-without-set_at corruption cleared as expired
+        (also the narration text/thinking invariant-only clear, Fix 1).
+      - ``PANE_RUNNING`` — the poller observed the pane RUNNING sufficiently
+        after set_at (the user acted in the terminal).
+      - ``TTL`` — the runtime-state TTL elapsed.
+      - ``TEARDOWN`` — session reset / route teardown.
+    """
+
+    USER = "user"
+    TOOL_RESULT = "tool_result"
+    END_OF_TURN = "end_of_turn"
+    TASK_NOTIFICATION = "task_notification"
+    INVARIANT = "invariant"
+    PANE_RUNNING = "pane_running"
+    TTL = "ttl"
+    TEARDOWN = "teardown"
+
+
 # A route observed strictly above this token count must be on the 1M variant.
 _CONTEXT_DETECT_1M_THRESHOLD = 200_001
 
@@ -365,6 +397,11 @@ class RouteRuntimeSnapshot:
     # the projection (unless a committed notification projects WAITING above
     # it). Empty tuple for routes with no background agents.
     background_agents: tuple[str, ...] = ()
+    # Fix 3a: the reason the bit last transitioned True→False (None until the
+    # first clear). The poller reads this on a transition tick to decide
+    # whether to KEEP the decision card (the END_OF_TURN projected-Busy gap)
+    # or dismiss it. Defaulted so pre-Fix-3a constructors stay valid.
+    notification_clear_reason: NotificationClearReason | None = None
 
 
 @dataclass
@@ -397,13 +434,22 @@ class _RouteState:
     # Notification-hook derivation input (Wave B) — see the snapshot field
     # docs. Set/cleared ONLY under the route lock (it transitions run_state
     # through the deriver). Cleared by: a ``user`` lifecycle event
-    # (unconditional), a strictly-NEWER-timestamped tool_result / end-of-turn
-    # / assistant event, ``mark_notification_cleared`` (pane observed RUNNING
-    # sufficiently after set_at + runtime TTL), ``mark_session_reset``, and
-    # route teardown.
+    # (unconditional), a strictly-NEWER-timestamped tool_result / end-of-turn,
+    # a ``<task-notification>`` user event (timestamp-qualified),
+    # ``mark_notification_cleared`` (pane observed RUNNING sufficiently after
+    # set_at, or the runtime TTL), ``mark_session_reset``, and route teardown.
+    # A corrupt ``set_at=None`` is repaired as expired (reason INVARIANT) at the
+    # next observation. PLAIN assistant text/thinking narration does NOT clear
+    # the bit — only the set_at-None invariant repair fires on a narration block
+    # — so a Workflow approval 🔔 survives the agent's own running narration.
     notification_pending: bool = False
     notification_set_at: float | None = None
     notification_generation: str | None = None
+    # Fix 3a: the reason the bit last cleared (True→False). Set by every clear
+    # site; RESET to None when the bit is SET True (the 3 commit sites in
+    # ``mark_notification_pending``) so a stale reason never leaks across a
+    # fresh notification.
+    notification_clear_reason: NotificationClearReason | None = None
     # Wave C wall-clock turn stamps (see the snapshot field docs). Written by
     # ``stamp_user_turn`` (sync side-band, pre-send mirror) and the
     # authoritative end-of-turn branch (max-monotonic by event time);
@@ -628,28 +674,52 @@ def _derived_state(st: _RouteState) -> RunState:
     )
 
 
-def _clear_notification_in_place(st: _RouteState) -> None:
+def _clear_notification_in_place(
+    st: _RouteState, *, reason: NotificationClearReason
+) -> None:
     st.notification_pending = False
     st.notification_set_at = None
     st.notification_generation = None
+    # Fix 3a: stamp WHY the bit cleared so the poller's decision-card
+    # keep/dismiss can read it off the snapshot.
+    st.notification_clear_reason = reason
 
 
-def _maybe_clear_notification_by_ts(st: _RouteState, event_ts: float | None) -> None:
+def _maybe_clear_notification_by_ts(
+    st: _RouteState, event_ts: float | None, *, reason: NotificationClearReason
+) -> None:
     """Timestamp-qualified notification clear (v4 fix 2).
 
     Clears the bit ONLY when the transcript event's wall-clock timestamp is
     strictly newer than ``notification_set_at`` — an older or ``None``
     timestamp PRESERVES it (a monitor running behind must not let buffered
     pre-notification JSONL re-hide a fresh wait). A pending bit without a
-    set_at violates the invariant and is treated as expired (codex r4 P3 (a)).
+    set_at violates the invariant and is treated as expired (codex r4 P3 (a))
+    — the set_at-None path clears with ``INVARIANT``, NOT the caller's branch
+    reason; the ts-newer path stamps the caller's ``reason`` (Fix 3a).
     """
     if not st.notification_pending:
         return
     if st.notification_set_at is None:
-        _clear_notification_in_place(st)
+        _clear_notification_in_place(st, reason=NotificationClearReason.INVARIANT)
         return
     if event_ts is not None and event_ts > st.notification_set_at:
-        _clear_notification_in_place(st)
+        _clear_notification_in_place(st, reason=reason)
+
+
+def _clear_notification_if_setat_invalid(st: _RouteState) -> None:
+    """Fix 1: narration (assistant text/thinking) must NOT causally clear 🔔.
+
+    A Workflow blocked on an approval gate narrates WHILE blocked, and the
+    buffered-flush JSONL timestamp is not a causal-order signal vs the gate —
+    so a newer narration timestamp must NOT clear the wait. The ONLY clear a
+    narration block still performs is the invariant repair: a pending bit
+    with a corrupt ``None`` set_at is treated as expired (reason=INVARIANT),
+    matching ``_maybe_clear_notification_by_ts``'s set_at-None path. Otherwise
+    the bit is preserved and ``notification_clear_reason`` stays untouched.
+    """
+    if st.notification_pending and st.notification_set_at is None:
+        _clear_notification_in_place(st, reason=NotificationClearReason.INVARIANT)
 
 
 def _build_snapshot(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
@@ -675,6 +745,7 @@ def _build_snapshot(route: Route, st: _RouteState) -> RouteRuntimeSnapshot:
         notification_pending=st.notification_pending,
         notification_set_at=st.notification_set_at,
         notification_generation=st.notification_generation,
+        notification_clear_reason=st.notification_clear_reason,
         last_user_turn_at=st.last_user_turn_at,
         last_assistant_turn_ended_at=st.last_assistant_turn_ended_at,
         background_agents=live_bg,
@@ -711,6 +782,7 @@ def _default_snapshot(route: Route) -> RouteRuntimeSnapshot:
         notification_pending=False,
         notification_set_at=None,
         notification_generation=None,
+        notification_clear_reason=None,
         last_user_turn_at=None,
         last_assistant_turn_ended_at=None,
     )
@@ -797,7 +869,9 @@ def _apply_lifecycle_event(
             # own (codex r1 P1; conservative: a clear can only ride a
             # timestamp the result line actually carried).
             st.pane_interactive_pending = False
-            _maybe_clear_notification_by_ts(st, result_ts)
+            _maybe_clear_notification_by_ts(
+                st, result_ts, reason=NotificationClearReason.TOOL_RESULT
+            )
             _set_run_state(st, _derived_state(st))
             return True
         is_interactive = bool(
@@ -812,7 +886,9 @@ def _apply_lifecycle_event(
         # notification bit clears only if the event is strictly NEWER than
         # the hook fire (an older buffered Workflow tool_use must keep 🔔).
         st.pane_interactive_pending = False
-        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _maybe_clear_notification_by_ts(
+            st, event.timestamp, reason=NotificationClearReason.TOOL_RESULT
+        )
         _set_run_state(st, _derived_state(st))
         return True
 
@@ -860,7 +936,9 @@ def _apply_lifecycle_event(
         # the pane bit before deriving; the notification bit clears only on
         # a strictly newer event timestamp (v4 fix 2).
         st.pane_interactive_pending = False
-        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _maybe_clear_notification_by_ts(
+            st, event.timestamp, reason=NotificationClearReason.TOOL_RESULT
+        )
         _set_run_state(st, _derived_state(st))
         return True
 
@@ -907,7 +985,9 @@ def _apply_lifecycle_event(
         # The notification bit clears only on a strictly NEWER end-of-turn;
         # an older buffered one must not re-hide the wait (v4 fix 2) — when
         # the bit survives, the route stays WAITING instead of idling.
-        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _maybe_clear_notification_by_ts(
+            st, event.timestamp, reason=NotificationClearReason.END_OF_TURN
+        )
         if st.notification_pending:
             _set_run_state(st, _derived_state(st))
             return True
@@ -936,11 +1016,13 @@ def _apply_lifecycle_event(
         )
 
     # Plain assistant text: at least RUNNING. Preserve RUNNING_TOOL /
-    # WAITING_ON_USER (open tools / surviving bits still gate) — but
-    # RE-DERIVE so a notification bit just cleared by a newer-timestamped
-    # event drops its notification-set WAITING.
+    # WAITING_ON_USER (open tools / surviving bits still gate). Fix 1:
+    # narration must NOT causally clear 🔔 (a blocked Workflow narrates WHILE
+    # blocked) — only the invariant repair (corrupt None set_at) clears here;
+    # an end-of-turn / tool_result / user / pane-running / TTL clears it. A
+    # surviving bit keeps the route WAITING through its own streaming text.
     if role == "assistant" and block == "text":
-        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _clear_notification_if_setat_invalid(st)
         if st.run_state in (RunState.RUNNING_TOOL, RunState.WAITING_ON_USER):
             derived = _derived_state(st)
             if derived is st.run_state:
@@ -952,9 +1034,11 @@ def _apply_lifecycle_event(
         return True
 
     # Assistant thinking without end-of-turn: light up if route was idle.
-    # Preserve RUNNING_TOOL / WAITING_ON_USER (same re-derive as text).
+    # Preserve RUNNING_TOOL / WAITING_ON_USER (same re-derive as text). Fix 1:
+    # like the text branch, narration thinking must NOT causally clear 🔔 —
+    # only the invariant repair fires here.
     if role == "assistant" and block == "thinking":
-        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _clear_notification_if_setat_invalid(st)
         if not st.seen or st.run_state in (
             RunState.IDLE_CLEARED,
             RunState.IDLE_RECENT,
@@ -983,7 +1067,9 @@ def _apply_lifecycle_event(
     # preserving the pane bit would break the invariant
     # ``interactive_pending ⟺ pane-set WAITING_ON_USER``).
     if role == "user" and block != "tool_result" and event.is_task_notification:
-        _maybe_clear_notification_by_ts(st, event.timestamp)
+        _maybe_clear_notification_by_ts(
+            st, event.timestamp, reason=NotificationClearReason.TASK_NOTIFICATION
+        )
         _set_run_state(st, _derived_state(st))
         return True
 
@@ -996,7 +1082,7 @@ def _apply_lifecycle_event(
     # unmask a completed agent's key).
     if role == "user" and block != "tool_result":
         st.pane_interactive_pending = False
-        _clear_notification_in_place(st)
+        _clear_notification_in_place(st, reason=NotificationClearReason.USER)
         st.suspended_tools.clear()
         st.background_agents_done.clear()
         _set_run_state(st, RunState.RUNNING)
@@ -1235,6 +1321,7 @@ async def mark_notification_pending(
             st.notification_pending = True
             st.notification_set_at = set_at
             st.notification_generation = generation
+            st.notification_clear_reason = None  # Fix 3a: fresh set clears reason
             _set_run_state(st, _derived_state(st))
             _rearm_pane_idle_in_place(st)
             logger.info(
@@ -1253,6 +1340,7 @@ async def mark_notification_pending(
             st.notification_pending = True
             st.notification_set_at = set_at
             st.notification_generation = generation
+            st.notification_clear_reason = None  # Fix 3a: fresh set clears reason
             # _set_run_state's active branch resets idle_source/idle_clear_at.
             _set_run_state(st, _derived_state(st))
             _rearm_pane_idle_in_place(st)
@@ -1278,6 +1366,7 @@ async def mark_notification_pending(
             st.notification_pending = True
             st.notification_set_at = set_at
             st.notification_generation = generation
+            st.notification_clear_reason = None  # Fix 3a: fresh set clears reason
             logger.info(
                 "notification_pending committed (projected-busy bg agent) "
                 "route=%s set_at=%s bg_keys=%s",
@@ -1295,18 +1384,23 @@ async def mark_notification_pending(
         return NotificationMarkResult.STALE_UNLINK
 
 
-async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
+async def mark_notification_cleared(
+    route: Route, *, reason: NotificationClearReason = NotificationClearReason.TEARDOWN
+) -> RouteRuntimeSnapshot:
     """Retract the notification bit — the poller-side programmatic clear.
 
     Called by ``status_polling`` when the pane is observed RUNNING at a
     capture sufficiently after ``notification_set_at`` (the user acted in
     the terminal — level + margin, not an idle→active edge; see
-    ``status_polling.NOTIFY_PANE_CLEAR_MARGIN_S``) and on runtime-TTL
-    expiry, and usable by any
-    teardown that holds a route. Re-derives the run state when the bit was
-    holding a WAITING with no transcript-interactive id open (a still-set
-    pane bit keeps WAITING — independent clears); a transcript-set WAITING
-    is never stripped. Never seeds an unseen route.
+    ``status_polling.NOTIFY_PANE_CLEAR_MARGIN_S``; reason=PANE_RUNNING) and on
+    runtime-TTL expiry (reason=TTL). The ``reason`` (Fix 3a) is stamped on the
+    snapshot so the poller's decision-card dismissal can read it; the two
+    production callers always pass it explicitly and the default (TEARDOWN —
+    "any teardown that holds a route") only covers the bare programmatic-clear
+    callers. Re-derives the run state when the bit was holding a WAITING with
+    no transcript-interactive id open (a still-set pane bit keeps WAITING —
+    independent clears); a transcript-set WAITING is never stripped. Never
+    seeds an unseen route.
     """
     lock = _lock_for_route(route)
     async with lock:
@@ -1315,7 +1409,7 @@ async def mark_notification_cleared(route: Route) -> RouteRuntimeSnapshot:
             return _default_snapshot(route)
         had = st.notification_pending
         prior = st.run_state
-        _clear_notification_in_place(st)
+        _clear_notification_in_place(st, reason=reason)
         if (
             had
             and st.run_state is RunState.WAITING_ON_USER
@@ -1718,7 +1812,7 @@ async def mark_session_reset(route: Route) -> RouteRuntimeSnapshot:
         # results (GH #42 — they reference the dead session's ids), and
         # the idle provenance.
         st.pane_interactive_pending = False
-        _clear_notification_in_place(st)
+        _clear_notification_in_place(st, reason=NotificationClearReason.TEARDOWN)
         st.suspended_tools.clear()
         st.early_tool_results.clear()
         # GH #44: the dead session's background agents (and their
@@ -1960,6 +2054,7 @@ def reset_for_tests() -> None:
 __all__ = [
     "ContextUsage",
     "NOTIFY_TTL_SECONDS",
+    "NotificationClearReason",
     "NotificationMarkResult",
     "Route",
     "RouteRuntimeSnapshot",

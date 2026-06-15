@@ -14,6 +14,7 @@ Key function:
 """
 
 import re
+from dataclasses import dataclass
 
 from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
@@ -80,6 +81,76 @@ def extract_async_agent_launch_id(text: str) -> str | None:
         return None
     m = _ASYNC_LAUNCH_AGENT_ID_RE.search(text)
     return m.group(1) if m else None
+
+
+# The Workflow-tool launch discriminator (ISSUE-6 / Fix 2a). DIFFERENT shape
+# from the Agent/Task ``agentId:`` launch — verified against 34 real launches:
+# the Task ID is MID-LINE ("Workflow launched in background. Task ID: <id>"),
+# the id is the last token on its line, and Task ID (e.g. ``w13z7jqx6``) ≠ Run
+# ID (e.g. ``wf_54f46aea-ba6``). ``^.*`` allows the line prefix (incl. the
+# ⎿/indent the transcript parser renders tool_result content under); ``\b``
+# before "Task ID" prevents a "Subtask ID" false match; the id is bounded by
+# line-end so a wrapping backtick / one trailing punct sits OUTSIDE the
+# capture → the captured id EQUALS the ``<task-notification>`` close key
+# (``extract_task_notification_task_id``), the bracket open/close parity
+# invariant. A line-start ``^\s*Task ID:`` anchor (the plan's draft) would
+# match NOTHING on the real mid-line shape.
+_WF_LAUNCH_TASK_ID_RE = re.compile(
+    r"(?im)^.*\bTask ID:\s*`?([A-Za-z0-9_-]+)`?\s*[.,;:)\]]?\s*$"
+)
+_WF_LAUNCH_RUN_ID_RE = re.compile(r"(?im)^\s*Run ID:\s*(wf_[A-Za-z0-9_-]+)\s*$")
+_WF_LAUNCH_DIR_RE = re.compile(r"(?im)^\s*Transcript dir:\s*(\S+)\s*$")
+
+
+@dataclass
+class WorkflowLaunchInfo:
+    """Parsed fields from a Workflow-tool launch ``tool_result`` (Fix 2a).
+
+    ``task_id`` is the bracket key body (``wf-task:<task_id>``) and equals the
+    ``<task-notification>`` close key. ``transcript_dir`` is kept ONLY when it
+    is a real Workflow sidechain dir (under ``subagents/workflows/wf_…``) — it
+    feeds the Fix 2c per-bracket mtime heartbeat; a non-Workflow path is
+    dropped to ``None`` so the bracket falls back to the launch-wall TTL.
+    """
+
+    task_id: str
+    run_id: str | None
+    transcript_dir: str | None
+
+
+def extract_workflow_launch_info(text: str) -> WorkflowLaunchInfo | None:
+    """Parse a Workflow-tool launch ``tool_result`` (ISSUE-6 / Fix 2a).
+
+    Returns the Task ID + (optional) Run ID + (validated) Transcript dir, or
+    ``None`` when no Task ID line is present (the caller logs and opens no
+    bracket). Scoped by the caller to ``tool_name == "Workflow"`` tool_results.
+    """
+    if not text:
+        return None
+    m = _WF_LAUNCH_TASK_ID_RE.search(text)
+    if not m:
+        return None
+    task_id = m.group(1)
+    rm = _WF_LAUNCH_RUN_ID_RE.search(text)
+    run_id = rm.group(1) if rm else None
+    dm = _WF_LAUNCH_DIR_RE.search(text)
+    tdir = dm.group(1) if dm else None
+    if tdir and "subagents/workflows/wf_" not in tdir:
+        # Only a real Workflow transcript dir feeds the Fix 2c mtime heartbeat.
+        tdir = None
+    return WorkflowLaunchInfo(task_id=task_id, run_id=run_id, transcript_dir=tdir)
+
+
+def extract_workflow_launch_task_id(text: str) -> str | None:
+    """The Workflow launch Task ID — parity with the close key.
+
+    ``extract_workflow_launch_task_id(launch) == extract_task_notification_task_id(close)``
+    for all four rendered shapes (``id`` / ``` `id` ``` / ``id.`` /
+    ``` `id`. ```), so ``wf-task:<launch>`` == ``wf-task:<close>`` (the bracket
+    opens AND closes).
+    """
+    info = extract_workflow_launch_info(text)
+    return info.task_id if info else None
 
 
 def _render_task_notification(text: str) -> str | None:

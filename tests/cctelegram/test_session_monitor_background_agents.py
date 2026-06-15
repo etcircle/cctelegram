@@ -11,6 +11,7 @@ and ``pop_sidechain_activity`` drains the combined structure consume-once.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -240,3 +241,164 @@ async def test_ordinary_tool_results_and_user_text_record_nothing(
     )
     await monitor.check_for_updates({PARENT})
     assert monitor.pop_sidechain_activity() == {}
+
+
+# ── ISSUE-6: Workflow-tool launch bracket (Fix 2a wiring + 2c heartbeat) ──
+#
+# The Workflow tool's launch tool_result is shaped differently from the
+# Agent/Task `agentId:` launch (Task ID mid-line, separate Run ID + Transcript
+# dir). These tests pin the monitor's Workflow branch: a `wf-task:<id>` key in
+# `.launched`, the matching `<task-notification>` close key, and the per-poll
+# mtime-advance heartbeat into `.bracket_heartbeats` (Fix 2c — run-state is
+# bounded by a DIR STAT only, never by parsing sidechain entries).
+
+_WF_TASK = "wtask01abc"
+_WF_RUN = "wf_run01abcd"
+
+
+def _wf_launch_text(wf_dir) -> str:
+    return (
+        f"Workflow launched in background. Task ID: {_WF_TASK}\n"
+        "Summary: background work\n"
+        f"Transcript dir: {wf_dir}\n"
+        f"Run ID: {_WF_RUN}\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_workflow_launch_recorded_as_wf_task_key(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", _wf_launch_text(wf_dir))],
+                session_id=PARENT,
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    # The launch key is the EXACT prefixed string (namespace-isolated from the
+    # Agent/Task agentId space), so it == the wf-task close key.
+    assert f"wf-task:{_WF_TASK}" in activity[PARENT].launched
+
+
+@pytest.mark.asyncio
+async def test_workflow_task_notification_closes_open_bracket_with_wf_task_key(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """Fix 2d: a <task-notification> whose Task ID matches an OPEN Workflow
+    bracket emits the matching wf-task: close key (so the bracket tombstones).
+    The realistic flow is launch → … → close (the launch opened the bracket)."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    notif = (
+        f"<task-notification>\n<task-id>{_WF_TASK}</task-id>\n"
+        "<tool-use-id>toolu_x</tool-use-id>\n<status>completed</status>\n"
+        "</task-notification>"
+    )
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", _wf_launch_text(wf_dir))],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry("user", notif, session_id=PARENT),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    assert f"wf-task:{_WF_TASK}" in activity[PARENT].completed
+
+
+@pytest.mark.asyncio
+async def test_isolated_task_notification_without_bracket_emits_no_wf_task_key(
+    monitor, tmp_path, make_jsonl_entry
+):
+    """Gate-on-bracket (Fix 2d): a <task-notification> with NO open bracket
+    (the launch was never observed — restart / bot-down between launch and
+    close) emits NO wf-task: close key. There is no route_runtime bg key to
+    tombstone in that case, so the bare normalized close key suffices — the
+    wf-task: close key is emitted ONLY when its launch bracket is open. This
+    forbids guessing 'is this a Workflow id?' from the id's character set (a
+    fragile external-format assumption); the OPEN BRACKET is the sole signal."""
+    parent_jsonl, _ = _setup_parent(monitor, tmp_path)
+    notif = (
+        f"<task-notification>\n<task-id>{_WF_TASK}</task-id>\n"
+        "<tool-use-id>toolu_x</tool-use-id>\n<status>completed</status>\n"
+        "</task-notification>"
+    )
+    _append(parent_jsonl, [make_jsonl_entry("user", notif, session_id=PARENT)])
+    await monitor.check_for_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    completed = activity[PARENT].completed if PARENT in activity else set()
+    assert f"wf-task:{_WF_TASK}" not in completed
+
+
+@pytest.mark.asyncio
+async def test_workflow_bracket_heartbeats_only_on_mtime_advance(
+    monitor, tmp_path, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+):
+    """Fix 2c: an OPEN bracket's wf_dir is stat'd each poll; a `wf-task:` activity
+    refresh is emitted ONLY when the freshest `*.jsonl` mtime ADVANCED (real new
+    sidechain writes). No advance → no heartbeat → the key ages out via TTL."""
+    parent_jsonl, sub_dir = _setup_parent(monitor, tmp_path)
+    wf_dir = sub_dir / "workflows" / _WF_RUN
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    agent_file = wf_dir / "agent-aaa111.jsonl"
+    agent_file.write_text("{}\n")
+    t0 = agent_file.stat().st_mtime
+    os.utime(agent_file, (t0, t0))
+
+    # Open the bracket via the launch parse, then drain the launch signal.
+    _append(
+        parent_jsonl,
+        [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t9", "Workflow", {"script": "..."})],
+                session_id=PARENT,
+            ),
+            make_jsonl_entry(
+                "user",
+                [make_tool_result_block("t9", _wf_launch_text(wf_dir))],
+                session_id=PARENT,
+            ),
+        ],
+    )
+    await monitor.check_for_updates({PARENT})
+    await monitor.check_sidechain_updates({PARENT})
+    monitor.pop_sidechain_activity()  # drain launch + any baseline registration
+
+    # Real new sidechain write → mtime advances → heartbeat for the wf-task key.
+    os.utime(agent_file, (t0 + 30, t0 + 30))
+    await monitor.check_sidechain_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    hb = activity[PARENT].bracket_heartbeats
+    assert f"wf-task:{_WF_TASK}" in hb
+    assert hb[f"wf-task:{_WF_TASK}"] >= t0 + 30
+
+    # No further write → no heartbeat (the gate is advance-only).
+    await monitor.check_sidechain_updates({PARENT})
+    activity = monitor.pop_sidechain_activity()
+    if PARENT in activity:
+        assert f"wf-task:{_WF_TASK}" not in activity[PARENT].bracket_heartbeats

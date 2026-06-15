@@ -1124,8 +1124,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # User just replied → Claude is no longer waiting. Flip the topic-first
     # attention card back to idle so the next idle→waiting transition fires
-    # a fresh notification.
-    await attention.dismiss(context.bot, user_id=user.id, thread_id=thread_id)
+    # a fresh notification. Fix 3c (judgment call): kind-aware so this user-text
+    # seam acks only the interactive_ui card — the notification_decision card
+    # dismisses via the route_runtime USER clear → reason=USER → the poller's
+    # reason-driven reconcile, NOT this display seam. (Flagged for codex+hermes:
+    # the dismiss-audit classed this as a genuine-resolution path that could ack
+    # any card; the contract converts it to keep the decision card's dismissal
+    # on the single reason-driven channel.)
+    await attention.dismiss_if_kind(
+        context.bot, user_id=user.id, thread_id=thread_id, kind="interactive_ui"
+    )
 
     # Start background capture for ! bash command output
     if text.startswith("!") and len(text) > 1:

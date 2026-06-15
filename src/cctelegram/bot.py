@@ -852,6 +852,14 @@ async def apply_sidechain_activity(
             seen_routes.add(route)
             for key in rec.launched:
                 await route_runtime.mark_background_agent_launched(route, key)
+            # ISSUE-6 / Fix 2c (DESIGN B): the Workflow bracket's mtime-advance
+            # heartbeat — a SEPARATE channel from rec.ticks (run-state never
+            # consumes a Workflow's sidechain entries). Placed after the launch
+            # loop so a same-tick launch→heartbeat refreshes the just-registered
+            # key, and before the completed loop so a same-tick close still
+            # tombstones last.
+            for key, mtime in rec.bracket_heartbeats.items():
+                await route_runtime.mark_background_agent_activity(route, key, mtime)
             for key, tick in rec.ticks.items():
                 await route_runtime.mark_background_agent_activity(
                     route, key, tick.max_event_ts

@@ -58,7 +58,7 @@ from ..terminal_parser import (
 )
 from ..transcript_parser import read_latest_usage
 from ..tmux_manager import TmuxWindow, tmux_manager
-from . import auq_source, notify_source, pane_signals, pick_token
+from . import attention, auq_source, notify_source, pane_signals, pick_token
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -166,6 +166,16 @@ _absent_streak: dict[tuple[int, int, str], int] = {}
 _UNSEEN = object()
 _prev_run_state: dict[tuple[int, int, str], object] = {}
 
+# Codex P2 (the EOT-gap card-dismiss race): per-route monotonic dismiss-deadline
+# for the decision card, keyed by ``(user_id, thread_id_or_0, window_id)``. Set
+# when ``_reconcile_decision_card`` first observes an END_OF_TURN clear with no
+# visible background-agent key (the card is HELD until ``now`` reaches the
+# deadline), so a lagging same-batch Workflow launch fan-out has a window to
+# become visible before we dismiss. Popped on re-commit / EOT-gap keep / any
+# other clear reason and at topic teardown; an EXPIRED deadline is left in place
+# so we don't re-enter grace every tick. See ``DECISION_CARD_EOT_GRACE_S``.
+_decision_card_eot_grace: dict[tuple[int, int, str], float] = {}
+
 # Margin between the notification's hook-fire wall clock (``set_at``) and a
 # pane capture allowed to clear it. The Wave B pane-activity clear is LEVEL +
 # time-qualified — "pane observed RUNNING at a capture taken strictly after
@@ -190,6 +200,29 @@ _prev_run_state: dict[tuple[int, int, str], object] = {}
 # satisfying it means the prompt is genuinely gone.
 NOTIFY_PANE_CLEAR_MARGIN_S = 1.5
 
+# Fix 3b: the audible "decision needed" card kind + body. No notification text
+# is ever stored (privacy contract) — the card carries only this generic
+# prompt; ``kind="notification_decision"`` makes attention render the
+# "🔔 Claude needs a decision" header.
+NOTIFY_DECISION_KIND = "notification_decision"
+NOTIFY_DECISION_PROMPT = (
+    "Claude needs a decision (approval/permission). Open the topic to respond."
+)
+
+# Codex P2 (the EOT-gap card-dismiss race): the monitor applies a parent
+# end-of-turn (clearing 🔔 with reason END_OF_TURN) DURING ``check_for_updates``
+# but applies the same-batch Workflow launch (``mark_background_agent_launched``
+# → the bg key) LATER via ``apply_sidechain_activity``. The poller's
+# ``_reconcile_decision_card`` runs on a separate task and can land in between —
+# bit cleared (END_OF_TURN) but ``background_agents`` still empty — and would
+# DISMISS the decision card prematurely; once the launch lands no re-post happens
+# (the bit is already False), so the durable card vanishes in a timing window
+# (the ISSUE-5 symptom). We grace the END_OF_TURN-with-empty-bg dismiss for a few
+# seconds — comfortably covering one monitor poll cycle so a lagging launch
+# fan-out becomes visible — and dismiss only after the grace elapses with still
+# no bg key (a genuine no-workflow end-of-turn).
+DECISION_CARD_EOT_GRACE_S = 5.0
+
 
 def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
     """Pop every poller-local route-keyed cache entry for ``(user, thread)``.
@@ -212,16 +245,99 @@ def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
         _last_published_ui_hash,
         _absent_streak,
         _prev_run_state,
+        _decision_card_eot_grace,
     )
     for cache in caches:
         for key in [k for k in cache if k[0] == user_id and k[1] == thread_id_or_0]:
             cache.pop(key, None)
 
 
-async def _consume_notification_signal(
-    user_id: int, thread_id: int | None, window_id: str
+async def _reconcile_decision_card(
+    bot: Bot, user_id: int, thread_id: int | None, route: route_runtime.Route
 ) -> None:
-    """Wave B: runtime-TTL check + Notification side-file consumption.
+    """Fix 3b: reason-driven keep/dismiss of the ``notification_decision`` card.
+
+    Runs at the END of every consume (covering the file-gone / early-return
+    paths). When the bit is False:
+
+      - KEEP iff the last clear was END_OF_TURN AND a live background-agent key
+        still projects Busy (the EOT-gap: the parent's turn ended but a Workflow
+        keeps running, and a 🔔 raised by its approval gate must survive its own
+        end-of-turn).
+      - KEEP under a short GRACE (codex P2) when the last clear was END_OF_TURN
+        but no bg key is visible YET: the monitor applies the parent end-of-turn
+        BEFORE the same-batch Workflow launch fan-out sets the key, so a lagging
+        launch may still arrive. The grace deadline (``DECISION_CARD_EOT_GRACE_S``)
+        holds the card across one monitor poll cycle; only after it elapses with
+        still no key — a genuine no-workflow end-of-turn — is the card dismissed
+        (the expired deadline is LEFT in place so we don't re-enter grace every
+        tick).
+      - Otherwise dismiss kind-aware (USER / TOOL_RESULT / TASK_NOTIFICATION /
+        INVARIANT / TTL / PANE_RUNNING, and the EOT-gap-ended case where
+        ``background_agents`` went empty past the grace).
+
+    The PANE_RUNNING / TTL clears also dismiss at their own sites for immediacy;
+    this is idempotent (``dismiss_if_kind`` no-ops when no matching card exists).
+    """
+    snap = route_runtime.snapshot(route)
+    if snap.notification_pending:
+        # Retry-while-pending: re-attempt the card every pending tick so a
+        # transient first-post failure never strands the route on the silent
+        # digest header. notify_waiting is idempotent (no-op if already up).
+        # Still gated by the double-card guard (Fix 3d).
+        _decision_card_eot_grace.pop(route, None)
+        if not has_interactive_surface(user_id, thread_id):
+            await attention.notify_waiting(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=route[2],
+                prompt_text=NOTIFY_DECISION_PROMPT,
+                kind=NOTIFY_DECISION_KIND,
+            )
+        return
+    if (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.END_OF_TURN
+        and snap.background_agents
+    ):
+        # EOT-gap with a visible bg key — keep, and exit the grace state.
+        _decision_card_eot_grace.pop(route, None)
+        return
+    if (
+        snap.notification_clear_reason
+        is route_runtime.NotificationClearReason.END_OF_TURN
+    ):
+        # bg key not visible yet — could be a lagging same-batch Workflow launch
+        # fan-out (the monitor applies lifecycle before the launch). Hold the
+        # card a short grace; a genuine no-workflow end-of-turn dismisses after
+        # it.
+        now = time.monotonic()
+        deadline = _decision_card_eot_grace.get(route)
+        if deadline is None:
+            _decision_card_eot_grace[route] = now + DECISION_CARD_EOT_GRACE_S
+            return  # start grace — keep
+        if now < deadline:
+            return  # within grace — keep
+        # Grace expired, still no bg key → dismiss. LEAVE the expired deadline so
+        # we don't re-enter grace every tick (popped on re-commit / teardown).
+        await attention.dismiss_if_kind(
+            bot, user_id=user_id, thread_id=thread_id, kind=NOTIFY_DECISION_KIND
+        )
+        return
+    # any other clear reason (USER / TOOL_RESULT / TASK_NOTIFICATION / INVARIANT
+    # / TTL / PANE_RUNNING)
+    _decision_card_eot_grace.pop(route, None)
+    await attention.dismiss_if_kind(
+        bot, user_id=user_id, thread_id=thread_id, kind=NOTIFY_DECISION_KIND
+    )
+
+
+async def _consume_notification_signal(
+    bot: Bot, user_id: int, thread_id: int | None, window_id: str
+) -> None:
+    """Wave B: runtime-TTL check + Notification side-file consumption + the
+    Fix 3b decision-card lifecycle.
 
     Runs at the TOP of the per-binding poll path — BEFORE
     ``_maybe_repaint_digest_on_transition`` (so a 🔔 transition repaints the
@@ -229,13 +345,14 @@ async def _consume_notification_signal(
     BEFORE the adaptive capture gating / early returns (a capture-skipped
     tick still consumes; plan v3 B1d).
 
-    Two phases, both pull-only:
+    Phases, all pull-only:
 
       1. Runtime-state TTL (v4 fix 2 strand-proofing): evaluated from the
          SNAPSHOT every tick, independent of side-file existence — a
          consumed/unlinked file or a permanently-None-timestamp transcript
          cannot strand 🔔 past ``NOTIFY_TTL_SECONDS``. A pending bit without
-         a set_at violates the invariant and is treated as expired.
+         a set_at violates the invariant and is treated as expired. The clear
+         passes ``reason=TTL`` and dismisses the decision card.
       2. Window-predicated side-file read → ``mark_notification_pending``.
          The returned ``NotificationMarkResult`` DRIVES the unlink (codex
          r4 P3 (b)): committed-live → generation-guarded unlink AFTER the
@@ -243,6 +360,12 @@ async def _consume_notification_signal(
          unlink (never seed; the file may belong to a not-yet-bound route).
          An on-disk record older than the TTL is treated as absent and
          unlinked without ever lighting the bit.
+      3. On ``COMMITTED_LIVE`` (first commit or §3.6 re-light), post the
+         audible ``notification_decision`` card BEFORE the unlink (Fix 3b),
+         gated by the double-card guard (Fix 3d — suppressed while a real
+         interactive AUQ/EPM surface owns the topic).
+      4. The reason-driven decision-card reconcile runs at the END, both
+         directions, covering the no-side-file / already-reflected paths.
     """
     route = (user_id, thread_id or 0, window_id)
     now = time.time()
@@ -256,24 +379,46 @@ async def _consume_notification_signal(
             route,
             snap.notification_set_at,
         )
-        await route_runtime.mark_notification_cleared(route)
+        await route_runtime.mark_notification_cleared(
+            route, reason=route_runtime.NotificationClearReason.TTL
+        )
+        await attention.dismiss_if_kind(
+            bot, user_id=user_id, thread_id=thread_id, kind=NOTIFY_DECISION_KIND
+        )
         snap = route_runtime.snapshot(route)
 
     rec = notify_source.notification_pending_for_window(window_id)
     if rec is None:
+        await _reconcile_decision_card(bot, user_id, thread_id, route)
         return
     if snap.notification_pending and snap.notification_generation == rec.generation:
+        await _reconcile_decision_card(bot, user_id, thread_id, route)
         return  # already reflected — nothing to do this tick
     if now - rec.ts > route_runtime.NOTIFY_TTL_SECONDS:
         # Expired on disk (e.g. written while the bot was down) — treated
         # absent; unlink so it doesn't re-surface every tick.
         notify_source.unlink_if_generation_matches(rec.session_id, rec.generation)
+        await _reconcile_decision_card(bot, user_id, thread_id, route)
         return
     result = await route_runtime.mark_notification_pending(
         route, set_at=rec.ts, generation=rec.generation
     )
+    if result is route_runtime.NotificationMarkResult.COMMITTED_LIVE:
+        # Fix 3b/3d: post the audible decision card BEFORE the unlink, unless a
+        # real interactive surface already owns the topic (gate on
+        # has_interactive_surface, NOT the pane bit).
+        if not has_interactive_surface(user_id, thread_id):
+            await attention.notify_waiting(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                prompt_text=NOTIFY_DECISION_PROMPT,
+                kind=NOTIFY_DECISION_KIND,
+            )
     if result is not route_runtime.NotificationMarkResult.IGNORED_NO_UNLINK:
         notify_source.unlink_if_generation_matches(rec.session_id, rec.generation)
+    await _reconcile_decision_card(bot, user_id, thread_id, route)
 
 
 async def _maybe_repaint_digest_on_transition(
@@ -414,7 +559,7 @@ async def update_status_message(
     # post-consume run_state, so a 🔔 set/clear repaints the digest on the
     # SAME tick (plan v3 B1d) — and before every capture-gating early return
     # (a capture-skipped tick still consumes).
-    await _consume_notification_signal(user_id, thread_id, window_id)
+    await _consume_notification_signal(bot, user_id, thread_id, window_id)
     # Repaint the activity-digest header on any run-state transition since the
     # last tick (e.g. a transcript reclaim flushed and flipped WAITING → Done,
     # or the reconciliation below cleared a stale bit). Placed FIRST (after the
@@ -861,7 +1006,17 @@ async def update_status_message(
                 route,
                 snap.notification_set_at,
             )
-            await route_runtime.mark_notification_cleared(route)
+            await route_runtime.mark_notification_cleared(
+                route, reason=route_runtime.NotificationClearReason.PANE_RUNNING
+            )
+            # Fix 3b/3c: the user resumed in the terminal — dismiss the
+            # decision card kind-aware (immediate at the clear site).
+            await attention.dismiss_if_kind(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                kind=NOTIFY_DECISION_KIND,
+            )
             await _maybe_repaint_digest_on_transition(
                 bot, user_id, thread_id, window_id
             )

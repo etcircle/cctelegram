@@ -1631,7 +1631,12 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
     # card (interaction semantics, not display).
     if not prefs.digest_card:
         if task.content_type == "tool_use":
-            await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
+            await attention.dismiss_if_kind(
+                bot,
+                user_id=user_id,
+                thread_id=task.thread_id,
+                kind="interactive_ui",
+            )
         if task.image_data:
             chat_id, effective_thread_id = _delivery_target(user_id, task.thread_id)
             await _send_task_images(bot, chat_id, task, effective_thread_id)
@@ -1682,7 +1687,9 @@ async def _process_activity_task(bot: Bot, user_id: int, task: MessageTask) -> N
     # New tool work means Claude is no longer waiting on the user. Dismiss the
     # attention card so the topic can flip back to "in progress" cleanly.
     if task.content_type == "tool_use":
-        await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
+        await attention.dismiss_if_kind(
+            bot, user_id=user_id, thread_id=task.thread_id, kind="interactive_ui"
+        )
     # Debounce the API call: state is already updated, the eventual flush
     # renders whatever the latest state is. Critical paths (assistant text
     # arriving, attention state changes) flush immediately via
@@ -2822,7 +2829,12 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 # (the entry above is already consumed by then).
                 task.parts_sent = len(task.parts)
                 # Tool work resumed → user no longer "needed".
-                await attention.dismiss(bot, user_id=user_id, thread_id=task.thread_id)
+                await attention.dismiss_if_kind(
+                    bot,
+                    user_id=user_id,
+                    thread_id=task.thread_id,
+                    kind="interactive_ui",
+                )
                 await _send_task_images(bot, chat_id, task, effective_thread_id)
                 await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
@@ -3032,8 +3044,13 @@ async def _maybe_attention_or_dismiss(
 
     Any prior card is dismissed regardless of attention-cue heuristic so
     routes don't get stuck in a "waiting" state once Claude resumes talking.
+    Fix 3c: kind-aware so this display-path narration cleanup (the ISSUE-5
+    burying path) can NEVER ack a ``notification_decision`` card — the decision
+    card dismisses only via the reason-driven poller path (Fix 3b).
     """
-    await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
+    await attention.dismiss_if_kind(
+        bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
+    )
 
 
 async def _convert_status_to_content(

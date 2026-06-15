@@ -546,3 +546,94 @@ async def test_pane_idle_card_clear_proceeds_while_projected_running():
     assert fired is True
     assert _st().pane_idle_cleared is True
     assert route_runtime.snapshot(ROUTE).run_state is RunState.RUNNING
+
+
+# ── ISSUE-6: the Workflow-tool bracket key (`wf-task:<id>`) ────────────────
+#
+# Fix 2 reuses the existing background-agent marks VERBATIM with a
+# prefix-namespaced `wf-task:<id>` key. These tests PIN that contract (they
+# pass on the pre-Fix-2 route_runtime — proving Fix 2 is pure wiring + parser,
+# no route_runtime surgery — and guard against regression). The actual lift
+# is wired by session_monitor (launch branch + mtime heartbeat) and bot.
+
+WF_KEY = "wf-task:wfk0a1b2c3d4"
+
+
+async def test_wf_task_key_namespace_isolated_from_agent_id():
+    """`wf-task:<id>` passes through normalize as identity (no `agent-`
+    prefix) and never collides with an Agent/Task `agentId` key."""
+    from cctelegram.utils import normalize_background_agent_key as _norm
+
+    assert _norm(WF_KEY) == WF_KEY
+    assert _norm(WF_KEY) != "wfk0a1b2c3d4"
+    # A wf-task key and an agentId key coexist as distinct entries.
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, WF_KEY)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    assert WF_KEY in _st().background_agents
+    assert KEY in _st().background_agents
+    assert _st().background_agents[WF_KEY].is_background is True
+
+
+async def test_wf_task_launch_survives_end_of_turn_prune():
+    """ISSUE-6: a Workflow bracket launched on the active parent turn keeps
+    its lift after the parent's authoritative end-of-turn (is_background key
+    is never pruned) → snapshot projects RUNNING + typing while the workflow
+    runs in the background."""
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    await route_runtime.mark_background_agent_launched(ROUTE, WF_KEY)
+    await route_runtime.mark_background_agent_activity(ROUTE, WF_KEY, 90.0)
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", stop_reason="end_turn", timestamp=100.0)
+    )
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (WF_KEY,)
+    assert _st().run_state is RunState.IDLE_RECENT
+
+
+async def test_wf_task_arm_b_relight_commits_notification_on_idle():
+    """ISSUE-5 arm B: a stored-idle route with a live `wf-task:` key accepts
+    a Notification re-fire (COMMITTED_LIVE) and projects WAITING above the
+    lift — 🔔 outranks projected Busy. This is the coupling: Fix 2's bg key
+    makes ISSUE-5's arm-B re-light fire instead of STALE_UNLINK."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_launched(ROUTE, WF_KEY)
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=T0 + 10, generation="g1"
+    )
+    assert result is NotificationMarkResult.COMMITTED_LIVE
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.notification_pending is True
+    assert snap.typing_eligible is False
+    assert _st().run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+
+
+async def test_wf_task_out_of_order_done_before_launch_stays_closed():
+    """Fix 2d fail-closed: a `<task-notification>` close that lands before
+    the launch tombstones the key; the later launch no-ops (never lifts)."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_done(ROUTE, WF_KEY)
+    snap = await route_runtime.mark_background_agent_launched(ROUTE, WF_KEY)
+    assert snap.background_agents == ()
+    assert WF_KEY in _st().background_agents_done
+
+
+async def test_wf_task_heartbeat_backstop_ages_out(monkeypatch: pytest.MonkeyPatch):
+    """Fix 2c backstop (codex R4 P2): an open bracket whose sidechain stops
+    writing (no further mtime-advance heartbeat) freezes its last_seen_wall
+    and ages out via BG_AGENT_TTL_SECONDS — a dead/never-closed Workflow
+    never lifts Busy indefinitely."""
+    await route_runtime.ingest_transcript_event(ROUTE, _evt("user", "text"))
+    await route_runtime.mark_background_agent_launched(ROUTE, WF_KEY)
+    snap = await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "text", stop_reason="end_turn", timestamp=100.0)
+    )
+    assert snap.run_state is RunState.RUNNING  # lifted while open
+    monkeypatch.setattr(
+        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 1
+    )
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+    assert snap.background_agents == ()

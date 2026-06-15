@@ -3343,7 +3343,12 @@ async def clear_interactive_msg(
                 message_id=single_msg_id,
             )
 
-    await attention.dismiss(bot, user_id=user_id, thread_id=thread_id)
+    # Fix 3c: this fires at the end of EVERY interactive-card clear (tombstone
+    # or delete, any reason) — kind-aware so it tears down only the
+    # interactive_ui card and never doubles as a notification_decision ack.
+    await attention.dismiss_if_kind(
+        bot, user_id=user_id, thread_id=thread_id, kind="interactive_ui"
+    )
 
 
 def reset_for_tests() -> None:
