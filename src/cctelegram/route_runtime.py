@@ -1575,6 +1575,57 @@ async def mark_background_agent_launched(
     return snap
 
 
+async def seed_idle_and_mark_background_agent_launched(
+    route: Route, agent_key: str
+) -> RouteRuntimeSnapshot:
+    """Like :func:`mark_background_agent_launched`, but SEEDS a stored-IDLE
+    ``_RouteState`` for an UNSEEN route in the SAME critical section (PR-1 Half B
+    / B1-FIX).
+
+    The BUSY restart reconciler re-arms a still-running Workflow's lift from the
+    filesystem after a ``launchctl kickstart``, but a backgrounded-Workflow parent
+    has NO ``_RouteState`` at startup: its turn already ENDED so
+    ``parse_pending_tools_from_jsonl`` is empty and ``seed_open_tools({})`` no-ops.
+    With no state, ``mark_background_agent_launched`` hits ``st is None →
+    _default_snapshot`` and records NOTHING → no projection lift, no typing. This
+    seam creates an ``IDLE_CLEARED`` state (``seen=True`` so the projection lifts
+    AND a later ``mark_interactive_pending`` / ``mark_notification_pending`` — the
+    Workflow's own approval gate, §3.6 — can commit) THEN records the launch with
+    ``is_background=True``, atomically under the route lock so it never races the
+    poller's locked marks.
+
+    On a route that ALREADY has state (the normal LIVE launch path, which always
+    has live state because the parent produced the launch tool_result mid-turn),
+    the seed is a NO-OP and this is byte-identical to
+    ``mark_background_agent_launched`` — so the bot fan-out can call this seam
+    unconditionally. Tombstoned key → no-op (fail-closed); the launch's
+    background provenance survives the end-of-turn prune."""
+    key = normalize_background_agent_key(agent_key)
+    lock = _lock_for_route(route)
+    async with lock:
+        st = _state.get(route)
+        if st is None:
+            st = _RouteState()  # defaults to RunState.IDLE_CLEARED
+            st.seen = True
+            _state[route] = st
+        _expire_background_agents_in_place(st)
+        if key in st.background_agents_done:
+            return _freeze(route, st)
+        rec = st.background_agents.get(key)
+        if rec is not None:
+            rec.is_background = True
+            rec.last_seen_wall = _wall_now()
+        else:
+            st.background_agents[key] = _BgAgent(
+                last_seen_wall=_wall_now(),
+                last_event_ts=None,
+                is_background=True,
+            )
+        logger.info("background_agent launched (seeded) route=%s key=%s", route, key)
+        snap = _freeze(route, st)
+    return snap
+
+
 async def mark_background_agent_done(
     route: Route, agent_key: str
 ) -> RouteRuntimeSnapshot:
@@ -2080,6 +2131,7 @@ __all__ = [
     "mark_background_agent_activity",
     "mark_background_agent_done",
     "mark_background_agent_launched",
+    "seed_idle_and_mark_background_agent_launched",
     "pane_idle_clear_due",
     "parse_pending_tools_from_jsonl",
     "reset_for_tests",

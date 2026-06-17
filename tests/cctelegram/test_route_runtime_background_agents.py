@@ -637,3 +637,49 @@ async def test_wf_task_heartbeat_backstop_ages_out(monkeypatch: pytest.MonkeyPat
     snap = route_runtime.snapshot(ROUTE)
     assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
     assert snap.background_agents == ()
+
+
+# ── reconciler seed seam (PR-1 Half B / B1-FIX) ──────────────────────────────
+#
+# The restart reconciler re-arms a still-running Workflow's busy lift from the
+# filesystem, but a backgrounded-Workflow parent has NO _RouteState at startup
+# (seed_open_tools no-ops on the zero pending tools of an ended turn), so
+# mark_background_agent_launched would no-op (st is None). The seed seam creates
+# an IDLE_CLEARED state AND records the launch in ONE critical section.
+
+
+async def test_seed_idle_and_launched_on_unseen_route_projects_running():
+    assert ROUTE not in route_runtime._state
+    snap = await route_runtime.seed_idle_and_mark_background_agent_launched(ROUTE, KEY)
+    assert snap.run_state is RunState.RUNNING  # projection lift (typing on)
+    assert snap.typing_eligible is True
+    assert snap.background_agents == (KEY,)
+    # Stored state is genuinely IDLE (projection-only lift) + observed.
+    assert _st().run_state is RunState.IDLE_CLEARED
+    assert _st().seen is True
+    assert _st().background_agents[KEY].is_background is True
+
+
+async def test_seed_idle_is_noop_seed_when_route_already_has_state():
+    """On a route that already has live state (the normal live launch path) the
+    seed is a no-op; the launch is recorded exactly like the unseeded mark —
+    identical behavior so switching the bot fan-out to this seam is safe."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    snap = await route_runtime.seed_idle_and_mark_background_agent_launched(ROUTE, KEY)
+    assert snap.run_state is RunState.RUNNING_TOOL  # active state NOT clobbered
+    assert snap.background_agents == (KEY,)
+    assert _st().background_agents[KEY].is_background is True
+
+
+async def test_seed_idle_respects_done_tombstone():
+    """A tombstoned key is not relit by the seam (fail-closed; the B2 gate-on-
+    close is the primary guard but the seam must also respect an in-memory tomb)."""
+    await _idle_transcript(end_ts=100.0)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, 150.0)
+    await route_runtime.mark_background_agent_done(ROUTE, KEY)
+    assert KEY in _st().background_agents_done
+    snap = await route_runtime.seed_idle_and_mark_background_agent_launched(ROUTE, KEY)
+    assert snap.background_agents == ()  # tombstone holds → no lift
+    assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)

@@ -492,6 +492,231 @@ class SessionMonitor:
                     f"wf-task:{task_id}"
                 ] = latest
 
+    # PR-1 Half B (BUSY restart reconciler). The fresh-mtime window for a wf_*
+    # dir to be considered a still-running Workflow — mirrors
+    # ``route_runtime.BG_AGENT_TTL_SECONDS`` (1800s) WITHOUT importing it (this
+    # module deliberately carries no route_runtime import). PER-PARENT cap on the
+    # FRESH wf_* candidates (newest-first), so a pathological many-run parent can't
+    # blow the first sweep AND a parent's stale dirs never starve a fresh one.
+    _RECONCILE_FRESH_WINDOW_S = 1800.0
+    _RECONCILE_MAX_WF_DIRS = 16
+
+    async def _scan_workflow_launches_and_closes(
+        self, jsonl_path: Path
+    ) -> tuple[dict[str, str], set[str], bool]:
+        """Bounded full-scan of a parent JSONL for Workflow launches + closes
+        (PR-1 Half B). Returns ``(launches, closes, reliable)`` where ``launches``
+        maps a ``wf_<runid>`` dir-name → its Task ID (via the launch tool_result's
+        Run ID / Transcript dir), ``closes`` is the set of ``<task-notification>``
+        task-ids, and ``reliable`` is False iff a prefiltered (potential launch or
+        close) line could NOT be parsed.
+
+        Mirrors ``_auq_tool_result_present``'s cheap byte pre-filter + whole-file
+        stream (the launch / close can scroll far past any tail on a long
+        session): only a line containing ``Task ID`` or ``task-notification`` is
+        JSON-parsed. **Fail-CLOSED on a malformed prefiltered line (codex P1):** a
+        corrupt/partial ``<task-notification>`` line would otherwise leave its
+        close OUT of ``closes`` and false-relight a COMPLETED Workflow — so any
+        such parse failure flips ``reliable`` False and the caller does NOT lift
+        for that parent. A read error returns ``({}, set(), False)`` likewise.
+
+        Launch recovery is SCOPED to a genuine Workflow launch by reading ONLY
+        ``tool_result`` block text (codex P2 — pasted launch prose lands in a user
+        ``text`` block, never a ``tool_result``) AND requiring the VALIDATED
+        Workflow ``transcript_dir`` (under ``subagents/workflows/wf_…``). Close
+        detection reads BOTH lanes (a ``<task-notification>`` close IS a user
+        ``text`` block, and a missed close must fail closed)."""
+        launches: dict[str, str] = {}
+        closes: set[str] = set()
+        reliable = True
+        from .handlers.response_builder import (
+            extract_task_notification_task_id,
+            extract_workflow_launch_info,
+        )
+
+        def _block_texts(entry: dict) -> tuple[list[str], list[str]]:
+            """Return ``(tool_result_texts, plain_texts)`` for an entry. Launch
+            recovery reads ONLY ``tool_result`` block text (a genuine Workflow
+            launch RESULT — codex P2: pasted launch prose lands in a user ``text``
+            block, never a ``tool_result``, so it can't recover a key); close
+            detection reads BOTH (a ``<task-notification>`` close is a user ``text``
+            block, and a missed close must fail closed)."""
+            msg = entry.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            tr: list[str] = []
+            tx: list[str] = []
+            # A string ``message.content`` is plain assistant text, never a
+            # tool_result wrapper → plain lane only.
+            if isinstance(content, str):
+                tx.append(content)
+            elif isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    ctype = c.get("type")
+                    if ctype == "tool_result":
+                        tc = c.get("content")
+                        if isinstance(tc, str):
+                            tr.append(tc)
+                        elif isinstance(tc, list):
+                            for b in tc:
+                                if isinstance(b, dict) and isinstance(
+                                    b.get("text"), str
+                                ):
+                                    tr.append(b["text"])
+                    elif ctype == "text" and isinstance(c.get("text"), str):
+                        tx.append(c["text"])
+            return tr, tx
+
+        try:
+            async with aiofiles.open(jsonl_path, "rb") as f:
+                async for raw in f:
+                    has_task = b"Task ID" in raw
+                    has_notif = b"task-notification" in raw
+                    if not (has_task or has_notif):
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        # A prefiltered (potential launch/close) line we could not
+                        # read. A MISSED close would false-relight a completed
+                        # Workflow → mark the scan unreliable; the caller fails
+                        # closed (no lift for this parent).
+                        reliable = False
+                        continue
+                    if not isinstance(entry, dict):
+                        reliable = False
+                        continue
+                    tr_texts, tx_texts = _block_texts(entry)
+                    if has_task:
+                        # Launches ONLY from tool_result blocks (codex P2).
+                        for text in tr_texts:
+                            info = extract_workflow_launch_info(text)
+                            # Require the VALIDATED Workflow transcript dir so a
+                            # quoted/pasted ``Task ID:`` line can't recover a key.
+                            if info and info.task_id and info.transcript_dir:
+                                for name in (
+                                    info.run_id,
+                                    Path(info.transcript_dir).name,
+                                ):
+                                    if name:
+                                        launches[name] = info.task_id
+                    if has_notif:
+                        # Closes from EITHER lane (a missed close must fail closed).
+                        for text in tr_texts + tx_texts:
+                            tid = extract_task_notification_task_id(text)
+                            if tid:
+                                closes.add(tid)
+        except OSError:
+            return {}, set(), False
+        return launches, closes, reliable
+
+    async def _reconcile_workflow_brackets_on_startup(
+        self, current_map: dict[str, str]
+    ) -> None:
+        """Re-arm a still-running Workflow's busy lift (typing + 🟡 + ↳) from the
+        FILESYSTEM after a ``launchctl kickstart`` wiped the in-memory brackets /
+        background_agents (PR-1 Half B). The owner's highest-frequency symptom.
+
+        For each tracked parent with NO live open bracket, STAT-glob
+        ``<project>/<parent_sid>/subagents/workflows/wf_*`` (anchored, never
+        ``rglob``) and, for any ``wf_*`` dir whose freshest ``*.jsonl`` mtime is
+        within ``_RECONCILE_FRESH_WINDOW_S``, recover its Task ID + close-state
+        from ONE bounded parent-JSONL scan and apply the THREE-state rule:
+
+          1. task_id recovered + NO close → LIFT: reopen a ``_WorkflowBracket``
+             (the steady-state heartbeat + Fix-5 ↳ display take over) AND emit the
+             raw ``wf-task:<id>`` launched key — the bot fan-out
+             (``apply_sidechain_activity`` → ``seed_idle_and_mark_background_agent_
+             launched``) seeds the parent route IDLE and lifts it to projected
+             RUNNING.
+          2. close FOUND → NO runtime lift (a Workflow that finished just before
+             the deploy must NOT false-relight): open a DISPLAY-ONLY ``closing``
+             bracket so ``check_sidechain_updates`` tails the wf_dir ONE final time
+             + fires the deterministic route-FIFO collapse, then drops it.
+          3. task_id UNRECOVERABLE (launch scrolled past / scan failed) → DO NOT
+             LIFT (fail-closed; prefer dark-until-next-turn over a false 🟡).
+
+        STAT-ONLY discovery (no ``agent-*.jsonl`` content read during discovery);
+        the parent JSONL is scanned ONLY when a fresh wf_* dir exists; a PER-PARENT
+        cap on the FRESH candidates (newest-first) bounds a pathological many-run
+        parent without a stale dir starving a fresh one (codex P2); the whole pass
+        is wrapped so it can never extend or break the dispatch loop. Pull-only;
+        no observer."""
+        try:
+            now = time.time()
+            relit = 0
+            for session_id in current_map.values():
+                if session_id.startswith("sub:"):
+                    continue
+                if self._open_workflow_brackets.get(session_id):
+                    continue  # idempotency: a live bracket already drives the lift
+                tracked = self.state.get_session(session_id)
+                if tracked is None or not tracked.file_path:
+                    continue
+                jsonl_path = Path(tracked.file_path)
+                if not jsonl_path.exists():
+                    continue
+                wf_root = jsonl_path.parent / session_id / "subagents" / "workflows"
+                try:
+                    wf_dirs = [d for d in wf_root.glob("wf_*") if d.is_dir()]
+                except OSError:
+                    continue
+                # STAT-ONLY freshness filter FIRST; only read the JSONL when at
+                # least one fresh dir exists (the cost-bound property). The cap is
+                # applied to the FRESH candidates (newest-first), so a parent's
+                # stale dirs never starve a genuinely-live one (codex P2).
+                fresh_with_ts: list[tuple[Path, float]] = []
+                for wf_dir in wf_dirs:
+                    try:
+                        latest = max(
+                            (f.stat().st_mtime for f in wf_dir.glob("*.jsonl")),
+                            default=0.0,
+                        )
+                    except OSError:
+                        continue
+                    if latest <= 0.0 or (now - latest) > self._RECONCILE_FRESH_WINDOW_S:
+                        continue
+                    fresh_with_ts.append((wf_dir, latest))
+                if not fresh_with_ts:
+                    continue
+                fresh_with_ts.sort(key=lambda t: t[1], reverse=True)  # newest first
+                fresh = [d for d, _ in fresh_with_ts[: self._RECONCILE_MAX_WF_DIRS]]
+                (
+                    launches,
+                    closes,
+                    reliable,
+                ) = await self._scan_workflow_launches_and_closes(jsonl_path)
+                if not reliable:
+                    # A malformed prefiltered (launch/close) line means a close may
+                    # be MISSED → fail closed for this parent rather than risk a
+                    # false relight of a completed Workflow (codex P1).
+                    continue
+                for wf_dir in fresh:
+                    task_id = launches.get(wf_dir.name)
+                    if task_id is None:
+                        continue  # STATE 3: unrecoverable → fail-closed, no lift
+                    brackets = self._open_workflow_brackets.setdefault(session_id, {})
+                    if task_id in closes:
+                        # STATE 2: finished pre-restart → display-only catch-up.
+                        brackets[task_id] = _WorkflowBracket(
+                            wf_dir=wf_dir,
+                            last_seen_mtime=0.0,
+                            launch_wall=now,
+                            closing=True,
+                        )
+                        continue
+                    # STATE 1: live → reopen bracket + emit the launched key.
+                    brackets[task_id] = _WorkflowBracket(
+                        wf_dir=wf_dir, last_seen_mtime=0.0, launch_wall=now
+                    )
+                    self._parent_activity(session_id).launched.add(f"wf-task:{task_id}")
+                    relit += 1
+            if relit:
+                logger.info("relit %d workflow brackets from filesystem", relit)
+        except Exception as e:  # never break startup
+            logger.warning("workflow-bracket reconcile failed: %s", e)
+
     def register_session(
         self, session_id: str, file_path: Path, offset: int = 0
     ) -> bool:
@@ -1998,6 +2223,14 @@ class SessionMonitor:
         # cleanup + map load so we don't hydrate from stale bindings, and
         # before the polling loop so the first tick has a populated cache.
         await self._hydrate_ask_tool_input_cache(self._last_session_map)
+
+        # PR-1 Half B: re-arm any still-running Workflow's busy lift (typing + 🟡
+        # + ↳) from the filesystem after a ``launchctl kickstart`` wiped the
+        # in-memory brackets / background_agents. Beside the AUQ hydrate (same
+        # rationale: the first tick must already reflect pre-restart state) and
+        # before the loop so the first ``pop_sidechain_activity`` drains the relit
+        # ``wf-task:`` launched keys. Self-contained + try/except-guarded.
+        await self._reconcile_workflow_brackets_on_startup(self._last_session_map)
 
         while self._running:
             try:

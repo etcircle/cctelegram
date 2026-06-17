@@ -742,6 +742,7 @@ def _reset_status_polling() -> None:
         "_absent_streak",
         "_prev_run_state",
         "_decision_card_eot_grace",
+        "_epm_surface_first_seen_at",
     ):
         attr = getattr(sp, name, None)
         if isinstance(attr, dict):

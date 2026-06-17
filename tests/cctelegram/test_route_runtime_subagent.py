@@ -431,7 +431,11 @@ async def test_bot_fanout_applies_per_route_per_key_marks(monkeypatch):
         return route_runtime.snapshot(route)
 
     monkeypatch.setattr(route_runtime, "mark_background_agent_activity", fake_activity)
-    monkeypatch.setattr(route_runtime, "mark_background_agent_launched", fake_launched)
+    # PR-1 Half B: the fan-out drives launched via the seed seam (a no-op seed
+    # on a route that already has state — identical to the old launched mark).
+    monkeypatch.setattr(
+        route_runtime, "seed_idle_and_mark_background_agent_launched", fake_launched
+    )
     monkeypatch.setattr(route_runtime, "mark_background_agent_done", fake_done)
 
     async def fake_find(session_id: str):
@@ -492,7 +496,11 @@ async def test_bot_fanout_same_key_launch_activity_done_in_one_tick(monkeypatch)
         return route_runtime.snapshot(route)
 
     monkeypatch.setattr(route_runtime, "mark_background_agent_activity", fake_activity)
-    monkeypatch.setattr(route_runtime, "mark_background_agent_launched", fake_launched)
+    # PR-1 Half B: the fan-out drives launched via the seed seam (a no-op seed
+    # on a route that already has state — identical to the old launched mark).
+    monkeypatch.setattr(
+        route_runtime, "seed_idle_and_mark_background_agent_launched", fake_launched
+    )
     monkeypatch.setattr(route_runtime, "mark_background_agent_done", fake_done)
 
     async def fake_find(session_id: str):

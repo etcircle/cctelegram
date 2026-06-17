@@ -176,6 +176,33 @@ _prev_run_state: dict[tuple[int, int, str], object] = {}
 # so we don't re-enter grace every tick. See ``DECISION_CARD_EOT_GRACE_S``.
 _decision_card_eot_grace: dict[tuple[int, int, str], float] = {}
 
+# PR-1 prose-ORDER: the ExitPlanMode emission anchor, keyed by ``(user_id,
+# thread_id_or_0, window_id)``. ExitPlanMode has no PreToolUse side file (AUQ's
+# anchor), so its prose-ordering anchor is the poller's FIRST-DETECTION instant
+# of the EPM surface on the pane — stamped via ``setdefault`` (the first
+# detection, never a sliding window) wherever ``ui_content.name ==
+# "ExitPlanMode"`` is observed, read by ``interactive_ui._maybe_post_live_prose``
+# (``peek_epm_surface_emitted_at``) as ``emitted_at`` for the additive-OR
+# freshness leg, and POPPED at every EPM lifecycle end (the interactive-clear
+# callback, the poller mode-end / in-mode-absence / window-switch / window-gone
+# seams, and topic teardown) so the NEXT EPM in the topic anchors to its OWN
+# instant (A3-FIX). Route-keyed (NOT session-keyed): only the window whose pane
+# the poller actually observes the surface on arms a stamp, so a double-``--resume``
+# sibling never lights. Render/poller-local state — NOT a route_runtime field;
+# pull-only, no observer (c313657 forbidden).
+_epm_surface_first_seen_at: dict[tuple[int, int, str], float] = {}
+
+
+def peek_epm_surface_emitted_at(
+    user_id: int, thread_id: int | None, window_id: str
+) -> float | None:
+    """Non-consuming read of the route's first-detected ExitPlanMode-surface
+    instant (the EPM prose-ordering anchor), or ``None`` when none is stamped
+    (e.g. after a restart that wiped the in-memory stamp → the prose freshness
+    degrades to TTL-only). Mirrors ``message_queue.peek_route_user_turn_at``."""
+    return _epm_surface_first_seen_at.get((user_id, thread_id or 0, window_id))
+
+
 # Margin between the notification's hook-fire wall clock (``set_at``) and a
 # pane capture allowed to clear it. The Wave B pane-activity clear is LEVEL +
 # time-qualified — "pane observed RUNNING at a capture taken strictly after
@@ -246,6 +273,7 @@ def clear_route_caches_for_topic(user_id: int, thread_id_or_0: int) -> None:
         _absent_streak,
         _prev_run_state,
         _decision_card_eot_grace,
+        _epm_surface_first_seen_at,
     )
     for cache in caches:
         for key in [k for k in cache if k[0] == user_id and k[1] == thread_id_or_0]:
@@ -461,6 +489,11 @@ def _on_interactive_clear(
     if window_id is None:
         return
     _absent_streak.pop((user_id, thread_id_or_0, window_id), None)
+    # PR-1 (A3-FIX, PRIMARY EPM-anchor clear): the bot.py tool_result EPM
+    # resolution path runs clear_interactive_msg → this callback, keyed by the
+    # CLEARED interactive-owner window. Drop the EPM emission anchor so the NEXT
+    # EPM in the topic anchors to its own instant (not this resolved one).
+    _epm_surface_first_seen_at.pop((user_id, thread_id_or_0, window_id), None)
 
 
 register_clear_callback(_on_interactive_clear)
@@ -592,6 +625,8 @@ async def update_status_message(
         _last_pane_capture.pop((user_id, thread_id or 0, window_id), None)
         _last_published_ui_hash.pop((user_id, thread_id or 0, window_id), None)
         _absent_streak.pop((user_id, thread_id or 0, window_id), None)
+        # PR-1: a gone window has no live EPM — drop its emission anchor.
+        _epm_surface_first_seen_at.pop((user_id, thread_id or 0, window_id), None)
         # GH #43: a gone window can't run shells — drop its bg-jobs record.
         pane_signals.clear_route((user_id, thread_id or 0, window_id))
         # Best-effort teardown of the poller-local repaint-dedup cache (the only
@@ -618,6 +653,11 @@ async def update_status_message(
         # capture — ``_absent_streak`` doesn't depend on pane content, only
         # on interactive lifecycle ownership.
         _absent_streak.pop(route, None)
+        # PR-1 (A3-FIX, poller mode-end EPM-anchor clear): the route is no longer
+        # in interactive mode for this window (mode popped / window-switched /
+        # ExitPlanMode resolved), so any EPM emission anchor is stale — drop it.
+        # Idempotent backstop to the interactive-clear callback.
+        _epm_surface_first_seen_at.pop(route, None)
         # Mode-ended liveness reconciliation (the UNIFIED pane-set WAITING
         # clear). Reaching this block ⟺ the route is NOT in interactive mode
         # for this window (mode popped, window-switched, or never-this-window).
@@ -717,6 +757,12 @@ async def update_status_message(
             # line until the user answers, so the poller is the only chance
             # to refresh in real time.
             _absent_streak.pop(route, None)
+            # PR-1: stamp the ExitPlanMode emission anchor on the in-mode path
+            # too (covers restart-mid-EPM where interactive mode is restored and
+            # the poller enters here without going through the new-UI dispatch).
+            # ``setdefault`` keeps the first detection.
+            if ui_content.name == "ExitPlanMode":
+                _epm_surface_first_seen_at.setdefault(route, time.time())
             # SET (a): pane-confirmed live picker (AUQ or ExitPlanMode plan
             # approval) while THIS window is in interactive mode → promote an
             # active RUNNING route to WAITING_ON_USER. Before the same-hash
@@ -904,6 +950,8 @@ async def update_status_message(
         await _maybe_repaint_digest_on_transition(bot, user_id, thread_id, window_id)
         _last_published_ui_hash.pop(route, None)
         _absent_streak.pop(route, None)
+        # PR-1: genuine in-mode absence (the picker is gone) → drop the EPM anchor.
+        _epm_surface_first_seen_at.pop(route, None)
         should_check_new_ui = False
     elif interactive_window is not None:
         # User is in interactive mode for a DIFFERENT window (window switched).
@@ -914,6 +962,8 @@ async def update_status_message(
         await clear_interactive_msg(user_id, bot, thread_id)
         _last_published_ui_hash.pop(route, None)
         _absent_streak.pop(route, None)
+        # PR-1: focus moved to a different window → this window's EPM anchor is dead.
+        _epm_surface_first_seen_at.pop(route, None)
 
     # Check for permission prompt (interactive UI not triggered via JSONL)
     # ALWAYS check UI, regardless of skip_status
@@ -924,6 +974,13 @@ async def update_status_message(
             window_id,
             thread_id,
         )
+        # PR-1: first-render of an ExitPlanMode surface — stamp the prose-ordering
+        # anchor (the FIRST poller detection instant) BEFORE the picker render so
+        # ``_maybe_post_live_prose`` (inside handle_interactive_ui below) can read
+        # it this same tick. ``setdefault`` makes it the first-detect, never a
+        # sliding window.
+        if ui_content.name == "ExitPlanMode":
+            _epm_surface_first_seen_at.setdefault(route, time.time())
         # Tag this as the poller call path so handle_interactive_ui can
         # apply AUQ pane-only safety rules when JSONL replay data is absent
         # or stale (render immediately, but suppress unsafe pick buttons).

@@ -899,6 +899,26 @@ def peek_side_file_tool_use_id(session_id: str) -> str | None:
     return rec.tool_use_id if rec else None
 
 
+def peek_side_file_written_at(session_id: str) -> float | None:
+    """Return the side file's ``written_at`` for ``session_id`` — the PreToolUse
+    hook's stamp of the AUQ tool_use INVOCATION instant.
+
+    The AUQ prose-ordering anchor (PR-1): the turn's prose finalizes just before
+    the tool_use, so ``final_at <= written_at + EPS`` pairs the prose to THIS
+    picker even when the poller detected it long after the TTL aged out. Mirrors
+    :func:`peek_side_file_tool_use_id` — a thin public accessor over the private
+    reader, read-only, pane-AGNOSTIC, no read-TTL. Returns ``None`` when no valid
+    side file exists or its ``written_at`` is implausibly in the future (the same
+    future-skew guard the liveness predicate applies — a tampered/skewed stamp
+    must not widen the freshness window)."""
+    rec = _read_pretool_side_file(session_id)
+    if rec is None:
+        return None
+    if time.time() - rec.written_at < -_PRETOOL_FUTURE_SKEW_SECONDS:
+        return None
+    return rec.written_at
+
+
 @dataclass(frozen=True)
 class RecoverySideFile:
     """The read-TTL-free side-file payload + its canonical source fingerprint.

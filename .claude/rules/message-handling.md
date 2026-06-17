@@ -331,6 +331,41 @@ below); `_emit_workflow_bracket_heartbeats` skips closing brackets. This
 a live `wf-task:` key lets `mark_notification_pending` re-commit (§3.6) instead
 of STALE_UNLINK, so a 🔔 raised by the Workflow's own approval gate is durable.
 
+**BUSY restart reconciler (PR-1 Half B — re-arm typing + 🟡 + ↳ from the
+filesystem after `launchctl kickstart`).** All the bracket / `background_agents`
+state above is IN-MEMORY, so a restart of a still-running Workflow renders the
+topic idle until a fresh parent turn — the owner's highest-frequency symptom.
+`session_monitor._reconcile_workflow_brackets_on_startup(current_map)` runs ONCE
+in `_monitor_loop` startup (beside `_hydrate_ask_tool_input_cache`, before the
+poll loop): for each tracked parent with NO live open bracket (idempotency —
+skip a parent that already has one), STAT-glob
+`<project>/<parent_sid>/subagents/workflows/wf_*` (anchored, never `rglob`) and,
+for any `wf_*` dir whose freshest `*.jsonl` mtime is within
+`_RECONCILE_FRESH_WINDOW_S` (1800s, mirrors `BG_AGENT_TTL_SECONDS` without
+importing route_runtime), recover its Task ID + close-state from ONE bounded
+parent-JSONL scan (`_scan_workflow_launches_and_closes` — the
+`_auq_tool_result_present` byte-prefilter pattern, matching the launch's Run ID /
+Transcript-dir basename to `wf_dir.name`; fail-closed `({}, set())` on any read
+error). **Three-state rule:** (1) task_id recovered + NO `<task-notification>`
+close → LIFT: reopen a `_WorkflowBracket` (steady-state heartbeat + Fix-5 ↳
+display resume) AND emit the raw `wf-task:<id>` into
+`_parent_activity(sid).launched` — the bot fan-out
+(`apply_sidechain_activity` → `route_runtime.seed_idle_and_mark_background_agent_
+launched`) SEEDS the unseeded parent route IDLE and lifts it to projected
+RUNNING (the B1-FIX: a bare `mark_background_agent_launched` would no-op on the
+unseeded route); (2) close FOUND → NO runtime lift (a Workflow that finished just
+before the deploy must not false-relight) — open a DISPLAY-ONLY `closing` bracket
+for the final ↳ tail + collapse, then it's dropped; (3) task_id UNRECOVERABLE /
+scan failed → DO NOT LIFT (fail-closed — prefer dark-until-next-turn over a false
+🟡). STAT-only discovery (the parent JSONL is read ONLY when a fresh `wf_*` dir
+exists — the cost-bound property), a per-tick `_RECONCILE_MAX_WF_DIRS` cap (16),
+and the whole pass try/except-guarded so it can never break startup. No-reflood:
+a reopened bracket's sub-files resume from the persisted `monitor_state.json`
+offset and a first-seen post-restart file starts at EOF
+(`_track_and_emit_sidechain_file`), so pre-restart ↳ blocks never replay. The
+steady-state idle-route re-scan (B3b) is deferred — the startup pass covers the
+post-kickstart symptom. Pull-only; no observer.
+
 **Fix 5 (ISSUE-6 owner decision #2 — SHIPPED): the `↳` sub-agent DISPLAY cards
 for Workflow sidechains.** A Workflow's sub-agents live one level deeper at
 `subagents/workflows/wf_<runid>/agent-*.jsonl`, so a single-level glob missed
@@ -609,16 +644,55 @@ prose by matching it).
 **Live delivery (PR-C).** `interactive_ui.handle_interactive_ui`, under the
 route lock and BEFORE the picker card / AUQ context message,
 `_maybe_post_live_prose` reads the freshest finalized capture
-(`md_capture.select_fresh_prose`, freshness = `final_at` within a per-mode TTL
-of now — `AUQ_PROSE_TTL_S` / `EPM_PROSE_TTL_S`, a previous turn's leftover ages
-out), posts it as its own message, and records a **shown-live marker** in the
-same per-session capture file. Idempotent via `md_capture.was_shown_live`
-(consume-INCLUSIVE: a re-render / poll re-detect / post-`kickstart` / the dedup
-having consumed the marker all skip a re-post). A miss is a silent no-op — the
-JSONL copy delivers post-resolution exactly as before (no marker, no dedup,
-never a delayed picker). A bounded ≤250ms retry covers the rare same-tick race
-(the prose finalizes ~0.68s before the picker blocks, so it almost never fires).
-Render-path state only — NOT a RouteRuntime field (Bug-1 contract intact).
+(`md_capture.select_fresh_prose`), posts it as its own message, and records a
+**shown-live marker** in the same per-session capture file. Idempotent via
+`md_capture.was_shown_live` (consume-INCLUSIVE: a re-render / poll re-detect /
+post-`kickstart` / the dedup having consumed the marker all skip a re-post). A
+miss is a silent no-op — the JSONL copy delivers post-resolution exactly as
+before (no marker, no dedup, never a delayed picker). A bounded ≤250ms retry
+covers the rare same-tick race. Render-path state only — NOT a RouteRuntime
+field (Bug-1 contract intact). The four `_maybe_post_live_prose` early returns
+log a miss-classification line (`no_session` / `card_exists` / `capture_absent`
+/ `not_before_reject` / `ttl_and_anchor_reject` / `empty_text` /
+`already_shown_live`) so the next miss is diagnosable (PR-1 A6).
+
+**Emission-anchor freshness — the additive-OR (PR-1, the dominant-miss fix).**
+The original freshness was render-time `now` only: `now - final_at <= TTL`
+(`AUQ_PROSE_TTL_S` 8s / `EPM_PROSE_TTL_S` 12s). The baked-in premise that "the
+prose finalizes ~0.68s before the picker blocks" was INVERTED — measured (Wave-0
+capture, Claude Code 2.1.172) the prose finalizes a gap BEFORE the picker is
+DETECTED: ~5.44s idle, up to ~20.7s under bot load (the poller only scrapes on
+its ~1s cadence and the adaptive watchdog can skip the blocked frame). So a fixed
+render-time TTL routinely aged the matching prose out and the prose never posted.
+`select_fresh_prose` now ORs the TTL leg with an **emission-anchor leg** keyed to
+a STABLE picker-emission instant `emitted_at`: keep `r` iff
+`(now - final_at <= ttl)  OR  (emitted_at is not None and  emitted_at -
+emit_anchor_lookback_s <= final_at <= emitted_at + emit_anchor_eps_s)`, all still
+AND-ed with the `not_before` turn boundary below. The OR can only WIDEN over the
+TTL leg → provably non-regressive on the upper bound. The anchor SOURCE + its
+eps/lookback constants are selected by modality in `_maybe_post_live_prose`:
+**AUQ** → `auq_source.peek_side_file_written_at(session_id)` (the PreToolUse
+side-file `written_at` ≈ the tool_use invocation; read-TTL-free, future-skew
+guarded) with `_EMIT_ANCHOR_EPS_S` (2s) / `_EMIT_ANCHOR_LOOKBACK_S` (10s);
+**ExitPlanMode** → `status_polling.peek_epm_surface_emitted_at(...)` (the poller's
+FIRST-DETECTION stamp — EPM has no side file) with `_EMIT_ANCHOR_EPS_EPM_S` (2s)
+/ `_EMIT_ANCHOR_LOOKBACK_EPM_S` (30s). The EPM lookback is LARGER because its
+poller-stamp anchor lags the tool_use by the whole detect latency, whereas AUQ's
+hook stamp sits ~at the tool_use; the AUQ lookback stays tight because it is ALSO
+the restart-asymmetry guard — across a restart the on-disk AUQ `written_at`
+survives (so `emitted_at` is non-None) while the in-memory `not_before` delivery
+stamp is wiped to None, so the lookback is the ONLY floor left and must reject a
+stale prior-turn prose finalized well before this picker's tool_use (EPM has no
+on-disk anchor → `emitted_at` is None post-restart → the OR leg simply doesn't
+fire, so its generous lookback is safe). The EPM stamp is poller-local
+state: `status_polling._epm_surface_first_seen_at[route]`, `setdefault`-stamped
+(first-detect, never a sliding window) wherever `ui_content.name ==
+"ExitPlanMode"` is observed (the new-UI dispatch + the in-mode block), POPPED at
+every EPM lifecycle end (the interactive-clear callback PRIMARY, the poller
+mode-end / in-mode-absence / window-switch / window-gone seams, and
+`clear_route_caches_for_topic`) so the NEXT EPM in the topic anchors to its OWN
+instant; route-keyed so a double-`--resume` sibling never lights. Pull-only; no
+observer.
 
 **Turn-boundary anchor (Item 3 / P2-1 — the prior-turn-prose leak).** Freshness
 was session + TTL only, so a PRIOR turn's leftover prose (still in the per-session
@@ -640,9 +714,12 @@ shares the appender's `captured_at` clock, so they compare directly. The store i
 torn down with the route (beside `_route_last_user_message`) and cleared by
 `reset_for_tests`; it is **render/callback-path state, NOT a RouteRuntime field**
 (pull-only; c313657 forbidden). **Residuals (all safe):** after a **restart** the
-in-memory stamp is gone → `not_before=None` → TTL-only (the prior-turn leak is
-NOT fixed across a restart — documented degradation, never a false-negative on the
-live path); a rare **wall-clock-backwards** jump could mis-order a stamp vs a
+in-memory stamp is gone → `not_before=None` disables THIS turn-boundary filter
+(PR-1 NOTE: the AUQ emission-anchor `written_at` survives the restart, so its
+lookback lower bound now carries the restart-asymmetry prior-turn guard — see the
+additive-OR; the freshness falls to pure TTL-only only when `emitted_at` is ALSO
+None, e.g. EPM or no side file — documented degradation, never a false-negative
+on the live path); a rare **wall-clock-backwards** jump could mis-order a stamp vs a
 `captured_at` (NO epsilon is added — accepted as a rare residual); the per-session
 file's tracked-idle disk retention is unchanged (teardown still owns reclaim). A
 **concurrent-send clobber** — a LATER delivery whose stamp overwrites the route's

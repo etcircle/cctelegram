@@ -325,6 +325,44 @@ def _write_side_file_at(
     return sidefile["tool_input"]
 
 
+class TestPeekSideFileWrittenAt:
+    """PR-1 prose-ORDER AUQ anchor: ``peek_side_file_written_at`` returns the
+    PreToolUse hook's ``written_at`` (the AUQ tool_use invocation instant) so the
+    live-prose freshness gate can anchor the prose to THIS picker. Mirrors
+    ``peek_side_file_tool_use_id``: read-TTL-free, non-mutating, future-skew
+    validated, session-keyed.
+    """
+
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    def test_returns_written_at(self, _cc_dir):
+        ts = time.time() - 123.0
+        _write_side_file_at(_cc_dir, self._SID, written_at=ts)
+        got = auq_source.peek_side_file_written_at(self._SID)
+        assert got == pytest.approx(ts)
+        # Read-only: must NOT populate the resolve cache.
+        assert not auq_source._pretool_ask_records
+
+    def test_none_when_absent(self, _cc_dir):
+        assert auq_source.peek_side_file_written_at(self._SID) is None
+
+    def test_none_on_future_skew(self, _cc_dir):
+        _write_side_file_at(
+            _cc_dir,
+            self._SID,
+            written_at=time.time() + auq_source._PRETOOL_FUTURE_SKEW_SECONDS + 30,
+        )
+        assert auq_source.peek_side_file_written_at(self._SID) is None
+
+    def test_live_past_read_ttl(self, _cc_dir):
+        """A genuinely-old-but-unanswered AUQ still yields its written_at (the
+        anchor is read-TTL-FREE — the prose-ordering freshness uses the lookback,
+        not this TTL)."""
+        ts = time.time() - (auq_source._PRETOOL_TTL_SECONDS + 60)
+        _write_side_file_at(_cc_dir, self._SID, written_at=ts)
+        assert auq_source.peek_side_file_written_at(self._SID) == pytest.approx(ts)
+
+
 class TestSideFileLiveForWindow:
     """The pane-INDEPENDENT card-clear authority (2026-05-31 disappearing-card
     fix). ``side_file_live_for_window`` is True iff a schema-valid side file

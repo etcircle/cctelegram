@@ -852,7 +852,14 @@ async def apply_sidechain_activity(
                 continue
             seen_routes.add(route)
             for key in rec.launched:
-                await route_runtime.mark_background_agent_launched(route, key)
+                # PR-1 Half B: seed an IDLE _RouteState if the parent route is
+                # unseeded (the restart reconciler's relit ``wf-task:`` keys land
+                # on a route with no state after a kickstart). For the normal LIVE
+                # launch the route always has live state, so the seed is a no-op
+                # and this is byte-identical to mark_background_agent_launched.
+                await route_runtime.seed_idle_and_mark_background_agent_launched(
+                    route, key
+                )
             # ISSUE-6 / Fix 2c (DESIGN B): the Workflow bracket's mtime-advance
             # heartbeat — a SEPARATE channel from rec.ticks (run-state never
             # consumes a Workflow's sidechain entries). Placed after the launch

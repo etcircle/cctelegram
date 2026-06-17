@@ -357,13 +357,47 @@ def read_prose_records(
     return records
 
 
-# Freshness TTLs for the live-prose render path (tunable; final values pinned by
-# the PR-C tests). The prose is captured ~0.68s before the picker blocks and the
-# poller detects the picker within ~1s, so the matching final lands a few seconds
-# before render — these bound how stale a candidate can be before it's rejected
-# (a previous turn's leftover prose) and the path falls back to JSONL delivery.
+# Freshness TTLs for the live-prose render path (the render-time `now` upper
+# bound). REALITY (PR-1, measured — NOT the old "~0.68s before the picker"
+# assumption, which was inverted): the prose finalizes a meaningful gap BEFORE
+# the picker is DETECTED — ~5.44s on an idle rig and up to ~20.7s under bot load
+# (the poller can only scrape the pane on its ~1s cadence, and the adaptive
+# capture / watchdog can skip the blocked frame). So a fixed TTL measured from
+# render-time `now` routinely ages the matching prose out before render. The TTL
+# stays as one freshness leg; PR-1 ORs it with a STABLE emission anchor (below)
+# so a lagged-but-real pairing is still accepted. These bound how stale a
+# candidate can be on the TTL leg before it's rejected (a previous turn's
+# leftover prose) and the path falls back to JSONL delivery.
 AUQ_PROSE_TTL_S = 8.0
 EPM_PROSE_TTL_S = 12.0
+
+# Emission-anchor tolerances for the PR-1 additive-OR freshness leg. The anchor
+# `emitted_at` is a STABLE picker-emission instant — AUQ: the PreToolUse
+# side-file `written_at` (the tool_use invocation, hook-stamped ~at the
+# tool_use); EPM: the poller's FIRST-DETECTION stamp (no side file). The OR leg
+# accepts a record iff `emitted_at - lookback <= final_at <= emitted_at + eps`.
+# Pinned by the Wave-0 capture (2026-06-17, Claude Code 2.1.172: EPM gap
+# detect-minus-final = 5.44s on an idle rig) + the live loaded figure (~20.7s).
+#
+# UPPER eps: the turn's prose finalizes BEFORE the tool_use / detect, so the
+# upper bound holds with eps≈0; eps only guards streaming/flush jitter where the
+# final delta lands a hair after the anchor instant.
+#
+# LOWER lookback: how far BELOW the anchor a legit same-turn prose can sit.
+#  * AUQ: written_at ≈ the tool_use instant, so the prose sits at most the
+#    in-turn prose→tool_use gap below it (≤ ~8.5s live). Kept TIGHT because it is
+#    ALSO the A1-FIX restart-asymmetry guard: post-restart the on-disk written_at
+#    survives but the in-memory not_before is wiped, so the lookback alone must
+#    reject a stale prior-turn prose.
+#  * EPM: the poller-stamp anchor lags the tool_use by the WHOLE detect latency
+#    (5.44s idle, ~20.7s loaded), so the legit prose can sit that far below it →
+#    a much larger lookback. Safe to be generous: in-process `not_before` guards
+#    prior turns, and EPM has NO on-disk anchor so `emitted_at` is None
+#    post-restart → the OR leg simply doesn't fire (TTL-only).
+_EMIT_ANCHOR_EPS_S = 2.0
+_EMIT_ANCHOR_LOOKBACK_S = 10.0
+_EMIT_ANCHOR_EPS_EPM_S = 2.0
+_EMIT_ANCHOR_LOOKBACK_EPM_S = 30.0
 
 
 def select_fresh_prose(
@@ -372,32 +406,54 @@ def select_fresh_prose(
     now: float,
     ttl_seconds: float,
     not_before: float | None = None,
+    emitted_at: float | None = None,
+    emit_anchor_eps_s: float = 0.0,
+    emit_anchor_lookback_s: float = 0.0,
     base_dir: Path | None = None,
 ) -> ProseRecord | None:
-    """Pick the freshest FINALIZED prose record whose ``final_at`` is within
-    ``ttl_seconds`` of ``now`` (a previous turn's leftover prose ages out), or
-    ``None``. Records are per-session by construction (the file is keyed by the
-    session's transcript stem), so "same session" needs no extra check; the TTL
-    is the staleness guard. Returns the MOST RECENT match — the prose that
-    streamed immediately before this picker.
+    """Pick the freshest FINALIZED prose record fresh enough to post above the
+    live picker, or ``None``. Records are per-session by construction (the file is
+    keyed by the session's transcript stem). Returns the MOST RECENT match — the
+    prose that streamed immediately before this picker.
+
+    FRESHNESS is a STRICTLY-ADDITIVE OR of two legs (PR-1):
+      * the TTL leg (today): ``now - final_at <= ttl_seconds``;
+      * the emission-anchor leg: when ``emitted_at`` is supplied (a STABLE
+        picker-emission instant — AUQ ``written_at`` / the EPM poller stamp),
+        ``emitted_at - emit_anchor_lookback_s <= final_at <= emitted_at +
+        emit_anchor_eps_s``.
+    The OR can only WIDEN acceptance over the TTL leg, so it is non-regressive on
+    the upper bound (it never rejects what the TTL accepted) while it RECOVERS the
+    dominant miss — a poller that detected the picker long after the prose
+    finalized (live: 20.7s), which blew the render-time TTL. ``emitted_at=None``
+    (the default) is byte-for-byte the prior TTL-only behavior.
 
     TURN-BOUNDARY FILTER (Item 3 / P2-1): ``not_before`` is the wall-clock
     instant the bot DELIVERED the current user turn into tmux (the same
     ``time.time()`` clock the appender stamps as ``captured_at``, so directly
-    comparable). The current turn's prose is captured AFTER delivery
-    (``final_at > not_before``); a PRIOR turn's leftover prose — still in the
-    per-session file because teardown only fires at AUQ/EPM resolution, and
-    possibly still within the TTL — finalized BEFORE it. The filter is STRICT
-    ``final_at > not_before`` (prose captured exactly at the boundary is not
-    causally after the delivered message). ``not_before=None`` (the default) is
-    byte-for-byte the prior TTL-only behavior — the restart / first-render
-    degradation where no delivery stamp exists for the route."""
-    fresh = [
-        r
-        for r in read_prose_records(session_id, base_dir=base_dir)
-        if (now - r.final_at) <= ttl_seconds
-        and (not_before is None or r.final_at > not_before)
-    ]
+    comparable). It ANDs against BOTH legs: the current turn's prose is captured
+    AFTER delivery (``final_at > not_before``); a PRIOR turn's leftover prose —
+    still in the per-session file because teardown only fires at AUQ/EPM
+    resolution — finalized BEFORE it. STRICT ``final_at > not_before`` (prose
+    captured exactly at the boundary is not causally after the delivered
+    message). ``not_before=None`` (the restart / first-render degradation) leans
+    on the anchor leg's OWN lookback lower bound (A1-FIX) to reject a stale
+    prior-turn prose — on a restart the on-disk AUQ ``written_at`` survives while
+    the in-memory ``not_before`` is wiped, so the lookback is the only floor
+    left."""
+
+    def _keep(r: ProseRecord) -> bool:
+        ttl_ok = (now - r.final_at) <= ttl_seconds
+        anchor_ok = (
+            emitted_at is not None
+            and r.final_at <= emitted_at + emit_anchor_eps_s
+            and r.final_at >= emitted_at - emit_anchor_lookback_s
+        )
+        if not (ttl_ok or anchor_ok):
+            return False
+        return not_before is None or r.final_at > not_before
+
+    fresh = [r for r in read_prose_records(session_id, base_dir=base_dir) if _keep(r)]
     return fresh[-1] if fresh else None
 
 

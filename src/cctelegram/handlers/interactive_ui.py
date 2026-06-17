@@ -2632,11 +2632,14 @@ def _build_interactive_keyboard(
 # which walks tabs in place by editing body+keyboard as the picker advances.
 
 
-# Bug 2 live-prose: the bounded retry budget when the picker is detected before
-# the matching MessageDisplay ``final`` delta has landed. The prose finalizes
-# ~0.68s BEFORE the picker blocks, so in practice the first read hits and no
-# retry runs; this only covers the rare same-tick race. Held under the route
-# lock, so it is intentionally short.
+# Bug 2 live-prose: the bounded retry budget when the picker is DETECTED before
+# the matching MessageDisplay ``final`` delta has landed. NOTE (PR-1): the prose
+# finalizes a meaningful gap BEFORE the picker is detected (~5.44s idle, ~20.7s
+# loaded — NOT the old inverted "~0.68s" claim), so in practice the final has
+# landed by the time the picker is detected and the first read hits; this only
+# covers the rare same-tick race. The freshness gate that recovers a large gap is
+# the emission-anchor additive-OR (``select_fresh_prose``), NOT this retry. Held
+# under the route lock, so it is intentionally short.
 _LIVE_PROSE_RETRY_BUDGET_S = 0.25
 _LIVE_PROSE_RETRY_STEP_S = 0.05
 
@@ -2669,6 +2672,8 @@ async def _maybe_post_live_prose(
     """
     session_id = session_id_for_window(window_id)
     if not session_id:
+        # A6 observability: the next miss should be classifiable.
+        logger.debug("Bug2 live-prose skip window=%s reason=no_session", window_id)
         return
     # If an interactive card already exists for this route we are PAST the first
     # render (a re-render / poll re-detect / UI change). Posting prose now would
@@ -2677,20 +2682,39 @@ async def _maybe_post_live_prose(
     # NOT back-filled below the card; it falls back to post-resolution JSONL
     # delivery (panel PR-C+D P2). ``was_shown_live`` below is the second guard.
     if _interactive_msgs.get((user_id, thread_id or 0)) is not None:
+        logger.debug("Bug2 live-prose skip window=%s reason=card_exists", window_id)
         return
-    ttl = (
-        md_capture.EPM_PROSE_TTL_S
-        if ui_name == "ExitPlanMode"
-        else md_capture.AUQ_PROSE_TTL_S
-    )
+    # PR-1: select the freshness TTL AND the emission anchor (+ its eps/lookback
+    # tolerances) by modality. The emission anchor is a STABLE picker-emission
+    # instant fed to ``select_fresh_prose``'s additive-OR leg so a prose the
+    # render-time TTL aged out (the poller detected the picker tens of seconds
+    # after the prose finalized — live: 20.7s) is still posted above the card:
+    #   * AUQ → the PreToolUse side-file ``written_at`` (the tool_use invocation);
+    #   * ExitPlanMode → the poller's first-detect stamp (EPM has no side file).
+    # The poller stamp import is function-local: ``status_polling`` imports this
+    # module at top, so the reverse edge must stay function-local.
+    if ui_name == "ExitPlanMode":
+        from .status_polling import peek_epm_surface_emitted_at
+
+        ttl = md_capture.EPM_PROSE_TTL_S
+        emitted_at = peek_epm_surface_emitted_at(user_id, thread_id, window_id)
+        emit_eps = md_capture._EMIT_ANCHOR_EPS_EPM_S
+        emit_lookback = md_capture._EMIT_ANCHOR_LOOKBACK_EPM_S
+    else:
+        ttl = md_capture.AUQ_PROSE_TTL_S
+        emitted_at = auq_source.peek_side_file_written_at(session_id)
+        emit_eps = md_capture._EMIT_ANCHOR_EPS_S
+        emit_lookback = md_capture._EMIT_ANCHOR_LOOKBACK_S
     # Item 3 / P2-1: the turn-boundary anchor — the wall-clock instant the bot
     # delivered THIS route's current user turn into tmux (same clock as the prose
     # ``captured_at``). Resolved INSIDE this function (not threaded through
     # ``handle_interactive_ui``'s 22 callers) so the inbound:1061 + restart
     # first-render holes auto-close. ``None`` (e.g. after a restart that wiped the
-    # in-memory stamp) degrades to TTL-only — never a false-negative on the live
-    # path. Filters out a PRIOR turn's leftover prose (final_at <= boundary)
-    # whose own turn produced no prose for this picker.
+    # in-memory stamp) DISABLES the turn-boundary filter — never a false-negative
+    # on the live path; the emission-anchor OR leg above still applies if its
+    # ``emitted_at`` is non-None (only ``emitted_at=None`` falls to TTL-only). The
+    # filter (when present) drops a PRIOR turn's leftover prose (final_at <=
+    # boundary) whose own turn produced no prose for this picker.
     from .message_queue import peek_route_user_turn_at
 
     nb = peek_route_user_turn_at(user_id, thread_id, window_id)
@@ -2698,17 +2722,55 @@ async def _maybe_post_live_prose(
     candidate: md_capture.ProseRecord | None = None
     while True:
         candidate = md_capture.select_fresh_prose(
-            session_id, now=time.time(), ttl_seconds=ttl, not_before=nb
+            session_id,
+            now=time.time(),
+            ttl_seconds=ttl,
+            not_before=nb,
+            emitted_at=emitted_at,
+            emit_anchor_eps_s=emit_eps,
+            emit_anchor_lookback_s=emit_lookback,
         )
         if candidate is not None or time.monotonic() >= deadline:
             break
         await asyncio.sleep(_LIVE_PROSE_RETRY_STEP_S)
     if candidate is None or not candidate.text.strip():
+        # A6 observability: classify the miss (capture-absent vs TTL/anchor-reject
+        # vs not_before-reject vs empty) so the next failure is diagnosable. Gated
+        # on DEBUG so the classification re-read only runs when it would be logged.
+        if logger.isEnabledFor(logging.DEBUG):
+            if candidate is not None:
+                reason = "empty_text"
+                n = 1
+            else:
+                recs = md_capture.read_prose_records(session_id)
+                n = len(recs)
+                if not recs:
+                    reason = "capture_absent"
+                elif nb is not None and all(r.final_at <= nb for r in recs):
+                    reason = "not_before_reject"
+                else:
+                    reason = "ttl_and_anchor_reject"
+            logger.debug(
+                "Bug2 live-prose miss window=%s reason=%s ui=%s n=%d ttl=%.1f "
+                "emitted_at=%s not_before=%s",
+                window_id,
+                reason,
+                ui_name,
+                n,
+                ttl,
+                emitted_at,
+                nb,
+            )
         return
     # Already delivered live (re-render / poll re-detect / post-kickstart /
     # after the dedup consumed its marker) → don't double-post. Uses the
     # consumed-inclusive guard, NOT the unconsumed-marker set.
     if md_capture.was_shown_live(session_id, candidate.md_message_id):
+        logger.debug(
+            "Bug2 live-prose skip window=%s reason=already_shown_live md_msg=%s",
+            window_id,
+            candidate.md_message_id[:8],
+        )
         return
     sent, _outcome = await topic_send(
         bot,

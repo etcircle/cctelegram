@@ -6,6 +6,7 @@ on its next 1s tick.
 """
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2990,3 +2991,213 @@ class TestSiteBSourceDriftRemint:
         finally:
             pick_token.reset_for_tests()
             route_runtime.reset_for_tests()
+
+
+# ── EPM prose-ordering anchor (PR-1) ─────────────────────────────────────────
+#
+# ExitPlanMode has no PreToolUse side file, so its prose-ordering anchor is the
+# poller's FIRST-DETECTION stamp: `_epm_surface_first_seen_at[route] = now` (via
+# `setdefault`, so it's the first detection, never a sliding window). The stamp
+# is read by `_maybe_post_live_prose` (peek_epm_surface_emitted_at) and cleared
+# at every EPM lifecycle end.
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestEpmSurfaceAnchor:
+    _WID = "@epm"
+    _ROUTE = (1, 42, "@epm")
+
+    @pytest.fixture(autouse=True)
+    def _clear_epm(self):
+        from cctelegram.handlers import status_polling
+
+        getattr(status_polling, "_epm_surface_first_seen_at", {}).clear()
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+
+        _interactive_mode.clear()
+        yield
+        getattr(status_polling, "_epm_surface_first_seen_at", {}).clear()
+        _interactive_mode.clear()
+
+    def test_peek_none_when_unstamped(self):
+        from cctelegram.handlers.status_polling import peek_epm_surface_emitted_at
+
+        assert peek_epm_surface_emitted_at(1, 42, self._WID) is None
+
+    @pytest.mark.asyncio
+    async def test_exit_plan_pane_stamps_first_detect(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan: str
+    ):
+        from cctelegram.handlers.status_polling import peek_epm_surface_emitted_at
+
+        mock_window = MagicMock()
+        mock_window.window_id = self._WID
+        with (
+            patch("cctelegram.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "cctelegram.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_exit_plan)
+            # hermes P3: the stamp must be set BEFORE handle_interactive_ui runs
+            # (that's where the real _maybe_post_live_prose reads it). Assert it
+            # is already present at the moment the render is invoked — a stamp set
+            # AFTER the render would leave emitted_at=None on the first detection.
+            stamp_at_render: list[float | None] = []
+
+            async def _capture(*args, **kwargs):
+                stamp_at_render.append(peek_epm_surface_emitted_at(1, 42, self._WID))
+                return True
+
+            mock_handle_ui.side_effect = _capture
+            before = time.time()
+            await update_status_message(
+                mock_bot, user_id=1, window_id=self._WID, thread_id=42
+            )
+        assert mock_handle_ui.called
+        assert stamp_at_render and stamp_at_render[0] is not None, (
+            "EPM anchor was not stamped BEFORE handle_interactive_ui read it"
+        )
+        stamp = peek_epm_surface_emitted_at(1, 42, self._WID)
+        assert stamp is not None and stamp >= before
+
+    @pytest.mark.asyncio
+    async def test_non_epm_pane_does_not_stamp(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        from cctelegram.handlers.status_polling import peek_epm_surface_emitted_at
+
+        mock_window = MagicMock()
+        mock_window.window_id = self._WID
+        with (
+            patch("cctelegram.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "cctelegram.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+            mock_handle_ui.return_value = True
+            await update_status_message(
+                mock_bot, user_id=1, window_id=self._WID, thread_id=42
+            )
+        # Settings picker is NOT ExitPlanMode → no stamp.
+        assert peek_epm_surface_emitted_at(1, 42, self._WID) is None
+
+    @pytest.mark.asyncio
+    async def test_setdefault_keeps_first_detect_in_mode(
+        self, mock_bot: AsyncMock, sample_pane_exit_plan: str
+    ):
+        """A second EPM observation in the SAME lifecycle (in-mode path) keeps the
+        FIRST stamp (setdefault), so the anchor is the emission instant."""
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.status_polling import peek_epm_surface_emitted_at
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+
+        # Force "in interactive mode for THIS window" so the in-mode block runs.
+        _interactive_mode[(1, 42)] = self._WID
+        status_polling._epm_surface_first_seen_at[self._ROUTE] = 100.0
+        mock_window = MagicMock()
+        mock_window.window_id = self._WID
+        with (
+            patch("cctelegram.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "cctelegram.handlers.status_polling._maybe_repaint_digest_on_transition",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "cctelegram.handlers.status_polling._remint_on_source_drift",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "cctelegram.handlers.status_polling.pick_token.refresh_route_deadlines",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "cctelegram.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ) as mock_handle_ui,
+            patch("cctelegram.handlers.status_polling.time.time", return_value=9999.0),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_exit_plan)
+            mock_handle_ui.return_value = True
+            await update_status_message(
+                mock_bot, user_id=1, window_id=self._WID, thread_id=42
+            )
+        assert peek_epm_surface_emitted_at(1, 42, self._WID) == 100.0
+
+    def test_on_interactive_clear_pops_stamp(self):
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.status_polling import (
+            _on_interactive_clear,
+            peek_epm_surface_emitted_at,
+        )
+
+        status_polling._epm_surface_first_seen_at[self._ROUTE] = 123.0
+        _on_interactive_clear(1, 42, self._WID)
+        assert peek_epm_surface_emitted_at(1, 42, self._WID) is None
+
+    def test_clear_route_caches_pops_stamp(self):
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.status_polling import (
+            clear_route_caches_for_topic,
+            peek_epm_surface_emitted_at,
+        )
+
+        status_polling._epm_surface_first_seen_at[self._ROUTE] = 123.0
+        clear_route_caches_for_topic(1, 42)
+        assert peek_epm_surface_emitted_at(1, 42, self._WID) is None
+
+
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestEpmSurfaceAnchorModeEndClear:
+    """hermes P3: pin the gap-free A3-FIX backstop — the poller mode-end
+    reconciliation pops the EPM anchor when the route is observed NOT in
+    interactive mode (an EPM that resolved without firing the clear callback), so
+    a SECOND EPM in the topic can't reuse the first's stale stamp."""
+
+    _WID = "@epm2"
+    _ROUTE = (1, 42, "@epm2")
+
+    @pytest.fixture(autouse=True)
+    def _clear_epm(self):
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+
+        status_polling._epm_surface_first_seen_at.clear()
+        _interactive_mode.clear()
+        yield
+        status_polling._epm_surface_first_seen_at.clear()
+        _interactive_mode.clear()
+
+    @pytest.mark.asyncio
+    async def test_mode_end_reconciliation_pops_stamp(self, mock_bot: AsyncMock):
+        from cctelegram.handlers import status_polling
+        from cctelegram.handlers.status_polling import peek_epm_surface_emitted_at
+
+        # A stamp left by a now-resolved EPM; the route is NOT in interactive mode
+        # (the autouse fixture cleared _interactive_mode), so the poller's
+        # interactive_window != window_id mode-end block runs.
+        status_polling._epm_surface_first_seen_at[self._ROUTE] = 111.0
+        bar = "─" * 40
+        idle_pane = f"idle output\n{bar}\n❯ \n{bar}\n  [Opus] Context: 10%\n"
+        mock_window = MagicMock()
+        mock_window.window_id = self._WID
+        with (
+            patch("cctelegram.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch(
+                "cctelegram.handlers.status_polling.handle_interactive_ui",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(return_value=idle_pane)
+            await update_status_message(
+                mock_bot, user_id=1, window_id=self._WID, thread_id=42
+            )
+        assert peek_epm_surface_emitted_at(1, 42, self._WID) is None

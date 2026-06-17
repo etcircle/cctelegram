@@ -99,6 +99,159 @@ def test_freshness_ttls_are_named_constants():
     assert md_capture.EPM_PROSE_TTL_S >= md_capture.AUQ_PROSE_TTL_S
 
 
+# ── emission-anchor additive-OR (PR-1) ───────────────────────────────────────
+#
+# The freshness upper bound was render-time `now` only, so a poller that detects
+# the picker tens of seconds after the prose finalized (live: 20.7s) blew the TTL
+# and the prose was never posted above the card. PR-1 adds a STRICTLY-ADDITIVE OR
+# leg anchored to a STABLE emission instant (AUQ: side-file `written_at`; EPM: the
+# poller's first-detect stamp): keep r iff
+#   (now - final_at) <= ttl                                   # TTL leg (today)
+#   OR (emitted_at is not None and
+#       final_at <= emitted_at + eps and                      # upper: turn-identity
+#       final_at >= emitted_at - lookback)                    # lower: A1-FIX restart guard
+#   AND (not_before is None or final_at > not_before)         # Item-3 — UNCHANGED
+
+
+def test_emit_anchor_constants_exist_and_relationships(cc_dir):
+    # Named, fixture-pinned (Wave-0 capture 2026-06-17 gap=5.44s + live 20.7s).
+    assert md_capture._EMIT_ANCHOR_EPS_S > 0
+    assert md_capture._EMIT_ANCHOR_LOOKBACK_S > 0
+    assert md_capture._EMIT_ANCHOR_EPS_EPM_S > 0
+    assert md_capture._EMIT_ANCHOR_LOOKBACK_EPM_S > 0
+    # EPM's poller-stamp anchor lags the tool_use by the whole detect latency, so
+    # EPM needs a LARGER lookback than AUQ's hook-stamped written_at.
+    assert md_capture._EMIT_ANCHOR_LOOKBACK_EPM_S > md_capture._EMIT_ANCHOR_LOOKBACK_S
+    # The EPM lookback must cover the measured idle gap (5.44s) with margin.
+    assert md_capture._EMIT_ANCHOR_LOOKBACK_EPM_S >= 20.0
+
+
+def test_anchor_or_accepts_what_ttl_accepts(cc_dir):
+    """Additive: a prose the TTL alone accepts is STILL accepted with the anchor
+    leg present (the OR can only widen)."""
+    now = time.time()
+    _seed(_SID, message_id="FRESH", delta=_PROSE, captured_at=now - 2)
+    rec = select_fresh_prose(
+        _SID,
+        now=now,
+        ttl_seconds=8.0,
+        emitted_at=now
+        - 100,  # anchor leg would NOT fire (final_at far above emitted+eps)
+        emit_anchor_eps_s=2.0,
+        emit_anchor_lookback_s=10.0,
+    )
+    assert rec is not None and rec.md_message_id == "FRESH"
+
+
+def test_anchor_or_accepts_beyond_ttl_within_anchor_window(cc_dir):
+    """The core fix: prose OUTSIDE the TTL (now - final_at > ttl) but inside the
+    emission anchor window [emitted - lookback, emitted + eps] is now accepted."""
+    now = time.time()
+    # final_at is 20s old → blows the 8s TTL. But the picker was detected (emitted_at)
+    # only ~1s after the prose finalized, so the anchor leg accepts it.
+    final_at = now - 20
+    _seed(_SID, message_id="LAGGED", delta=_PROSE, captured_at=final_at)
+    rec = select_fresh_prose(
+        _SID,
+        now=now,
+        ttl_seconds=8.0,
+        emitted_at=final_at + 1.0,  # detected 1s after prose finalized
+        emit_anchor_eps_s=2.0,
+        emit_anchor_lookback_s=30.0,
+    )
+    assert rec is not None and rec.md_message_id == "LAGGED"
+
+
+def test_anchor_or_rejects_when_neither_leg_matches(cc_dir):
+    """Outside BOTH the TTL and the anchor window → still rejected."""
+    now = time.time()
+    final_at = now - 50  # blows TTL
+    _seed(_SID, message_id="OLD", delta=_PROSE, captured_at=final_at)
+    rec = select_fresh_prose(
+        _SID,
+        now=now,
+        ttl_seconds=8.0,
+        emitted_at=now
+        - 1.0,  # anchor window [now-31, now+1]; final_at=now-50 is below it
+        emit_anchor_eps_s=2.0,
+        emit_anchor_lookback_s=30.0,
+    )
+    assert rec is None
+
+
+def test_anchor_or_upper_bound_rejects_future_prose(cc_dir):
+    """A record whose final_at is ABOVE emitted_at + eps (a later turn's prose) is
+    rejected by the anchor leg (and is outside the TTL too)."""
+    now = time.time()
+    # final_at well after the anchor instant + eps; also > ttl old? No — make it
+    # within ttl-OLD-direction impossible: place final_at slightly in the future of
+    # emitted_at+eps but still TTL-fresh would be accepted by TTL. To isolate the
+    # upper bound, blow the TTL: final_at is 30s in the past, emitted_at 60s past.
+    final_at = now - 30
+    _seed(_SID, message_id="UP", delta=_PROSE, captured_at=final_at)
+    rec = select_fresh_prose(
+        _SID,
+        now=now,
+        ttl_seconds=8.0,
+        emitted_at=now
+        - 60,  # final_at (now-30) > emitted+eps (now-58) → upper-bound reject
+        emit_anchor_eps_s=2.0,
+        emit_anchor_lookback_s=30.0,
+    )
+    assert rec is None
+
+
+def test_anchor_or_not_before_still_filters_prior_turn(cc_dir):
+    """not_before ANDs against BOTH legs: a prior-turn prose the anchor leg WOULD
+    accept is STILL filtered by not_before (the Item-3 leak stays closed in-process)."""
+    now = time.time()
+    final_at = now - 20  # outside TTL, inside anchor window
+    _seed(_SID, message_id="PRIOR", delta=_PROSE, captured_at=final_at)
+    rec = select_fresh_prose(
+        _SID,
+        now=now,
+        ttl_seconds=8.0,
+        not_before=final_at + 0.5,  # delivered AFTER this prose finalized → prior turn
+        emitted_at=final_at + 1.0,
+        emit_anchor_eps_s=2.0,
+        emit_anchor_lookback_s=30.0,
+    )
+    assert rec is None
+
+
+def test_anchor_absent_is_byte_identical_to_ttl_only(cc_dir):
+    """emitted_at=None reproduces today's TTL-only behavior exactly."""
+    now = time.time()
+    _seed(_SID, message_id="A", delta=_PROSE, captured_at=now - 3)
+    _seed(_SID, message_id="B", delta="stale", captured_at=now - 50)
+    a = select_fresh_prose(_SID, now=now, ttl_seconds=8.0, emitted_at=None)
+    b = select_fresh_prose(_SID, now=now, ttl_seconds=8.0)
+    assert a is not None and b is not None
+    assert a.md_message_id == b.md_message_id == "A"
+
+
+def test_anchor_or_lookback_rejects_stale_prior_turn_when_not_before_wiped(cc_dir):
+    """A1-FIX restart asymmetry: after a restart the on-disk AUQ `written_at`
+    survives (emitted_at non-None) but the in-memory not_before is wiped (None).
+    The OR-leg's OWN lookback lower bound must still reject a stale prior-turn prose
+    finalized far before this picker's tool_use — even with not_before=None."""
+    now = time.time()
+    written_at = now - 2  # this turn's tool_use (survives restart)
+    # A stale prior-turn prose finalized 40s before the tool_use — far outside the
+    # 10s AUQ lookback. not_before is None (wiped by restart).
+    _seed(_SID, message_id="STALE_PRIOR", delta=_PROSE, captured_at=written_at - 40)
+    rec = select_fresh_prose(
+        _SID,
+        now=now,
+        ttl_seconds=8.0,
+        not_before=None,
+        emitted_at=written_at,
+        emit_anchor_eps_s=2.0,
+        emit_anchor_lookback_s=10.0,
+    )
+    assert rec is None
+
+
 # ── not_before turn-boundary filter (Item 3 / P2-1) ──────────────────────────
 #
 # `not_before` is the wall-clock instant the bot delivered the current user turn
