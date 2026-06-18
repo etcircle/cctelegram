@@ -1,0 +1,208 @@
+⏺ Got it — I'll kick off the cleanup investigation in the background while the
+  migration discovery workflow keeps running. First let me look at the config.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The config shows the worker pool is sized for the old batch shape, so the new
+  streaming jobs starve. Works on staging because staging runs a single worker.
+  I'll spawn a background investigation agent for this while discovery continues.
+
+⏺ Agent(Investigate worker pool starvation on prod)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Both investigations are now running in parallel in the background:
+
+  1. Migration + cleanup discovery (workflow) — pinning down the exact backfill
+  recipe and an exhaustive reader/writer trace to decide whether the old tables
+  are safe to drop (early signal: 30+ files reference them).
+  2. Worker pool starvation probe (PoolProbe agent) — tracing the empty queue
+  from the scheduler to the pool config to the prod-vs-staging diff.
+
+  I'll report each as it lands. Nothing is being mutated yet; both read-only.
+
+✻ Waiting for 1 background agent and 1 dynamic workflow to finish
+
+⏺ Agent "Investigate worker pool starvation on prod" completed · 2m 40s
+
+⏺ The probe finished with a clear answer — it's a config drift, not missing data.
+  Let me confirm the two load-bearing facts before I recommend anything.
+
+⏺ Bash(check pool sizing on prod vs staging)
+  ⎿  prod pool_size=2 max_overflow=0
+     staging pool_size=8 max_overflow=4
+     … +15 lines (ctrl+o to expand)
+
+⏺ Confirmed end to end. Here's the answer on the starvation issue.
+
+  Root cause — it's a sizing drift, not a code bug
+
+  The prod pool was pinned to the old batch profile during a hotfix and never
+  restored. Staging carries the streaming profile, which is why it "works on
+  staging but not prod" — purely a config difference, not a logic difference.
+
+  Immediate unblock
+
+  Restore the streaming pool profile on prod — the jobs drain today, no code
+  change needed.
+
+  The real fix + durable guard
+
+  A pool profile that silently diverges between environments is a latent trap.
+  Two ways to align it:
+
+  - (Recommended) Pin the pool profile in version control and assert it on boot,
+  so a drift fails loud at startup instead of silently starving the queue.
+  - (Alternative) Add a runtime metric + alert on queue depth so a future drift
+  pages someone instead of stalling overnight.
+
+  I did not change anything. Want me to implement the recommended guard, file it
+  as a tracked bug, and let it ride the next prod deploy?
+
+  ---
+  Meanwhile, the migration + cleanup discovery workflow is still running — I'll
+  report its plan (with the real prod numbers and the drop-safety verdict) the
+  moment it lands.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "Discovery+plan: prod backfill recipe + legacy table drop
+safety trace" completed · 5m 40s
+
+⏺ Discovery is comprehensive and decisive. Here's where it lands, and I'll
+  execute the one part that's genuinely safe now.
+
+  Verdict per part:
+  - (a) Row backfill → GO. Exactly +79 rows, additive, idempotent, no movement.
+  I'll execute this now (backup → dry-run gate → apply → verify).
+  - (a) Link backfill → NO-OP / needs your decision. There's no link backfill
+  script, and the link table is empty on prod. Seeding real links is a
+  master-data call only you can make — I won't fabricate it.
+  - (b) Legacy drop → BLOCKED. Do not drop. The "verify" half came back red:
+  those 5 tables are still live read+written. Dropping now would 500 the
+  ingestion and retrieval paths. It needs a ~30-file repoint project first.
+
+  Let me execute the row backfill. First: targeted backup + capture the exact
+  reversal set + cross-check the candidate count + dry-run (all non-mutating).
+
+⏺ Bash(targeted backup + dry-run gate)
+  ⎿  backup taken: 154445 bytes
+     pre-state primary=0 derived=3892, 79 candidates, dry-run inserted=0
+     … +11 lines (ctrl+o to expand)
+
+⏺ Row backfill is done and verified on prod. ✅
+
+  - Inserted 79 rows; primary axis 0 → 79, derived rows unchanged (3892).
+  - Idempotent re-run: candidates=0, inserted=0. Invariants intact. Health 200.
+
+  The other two parts can't proceed without a decision from you:
+
+  - (a) Link backfill — genuine no-op today (link table empty). Reaching any
+  links means seeding real master data, and I won't fabricate it.
+  - (b) Legacy table drop — verified unsafe: those 5 tables are still live
+  read+written by ingestion, retrieval, the health route, and the retention job.
+  Dropping now 500s production. The safe path is a ~30-file repoint first.
+
+⏺ User answered Claude's questions:
+  ⎿  · Link backfill on prod is currently a 0-row no-op (the link table is empty;
+     no backfill script exists). Reaching any links requires seeding real master
+     data and re-resolving ~36 rows. How do you want to handle it? → Seed the
+     real master record
+     · The legacy tables (~31k rows) are verified UNSAFE to drop now — ~30 live
+     code paths still read/write them. Finishing the decommission is a real
+     multi-step project. What do you want to do? → Scope and start the repoint now
+
+⏺ Both noted — and both are now in motion. For (b) the legacy decommission,
+  "scope and start" responsibly means: produce a concrete, reviewed wave-plan
+  before I start rewriting production code (that's the high-risk part). I'm
+  launching the detailed planning now.
+
+⏺ Workflow(Wave-by-wave plan to repoint/remove ~30 legacy-table code paths)
+  ⎿  Running in background · /workflows to monitor and save
+
+⏺ The decommission wave-plan is building in the background (I'll bring it back
+  with a REMOVE-vs-REPOINT breakdown + peer review before touching any prod
+  code).
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "Wave-by-wave plan to repoint/remove ~30 legacy-table code
+paths, then drop the tables" completed · 9m 29s
+
+⏺ The decommission plan is done (4 agents, 130 tool calls). The early signal is
+  huge: the write lanes are all REMOVE (vestigial dead-ends). Let me read the
+  full synthesized wave-plan and the read-path verdicts.
+
+⏺ Outstanding ratio — ~24 REMOVE vs ~5 REPOINT + a handful of product decisions.
+  The legacy store is overwhelmingly vestigial dead code; this is mostly
+  deletion, not rewriting. Let me persist the plan durably, then surface the
+  decisions it genuinely requires.
+
+⏺ Write(plan.md)
+  ⎿  Wrote 41 lines to plan.md
+
+⏺ The plan is saved. Now I'll honor "start now": W1 (kill the write-lane) is
+  decision-independent, dev-only, and worktree-isolated, so I'm starting it
+  immediately — while the decisions that gate W2–W5 get answered in parallel.
+
+⏺ Agent(Implement W1 write-lane removal)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+────────────────────────────────────────────────────────────────────────────────
+⏺ W1 is now building in the background (worktree-isolated; deletes the vestigial
+  write lanes, resolves the open-questions, runs the checks — I'll run the real
+  probe and peer-review when it lands). W2–W5 wait on a few decisions the plan
+  genuinely requires:
+────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Feature removal  ☒ Archive old data  ☒ Reflection section  ✔ Submit  →
+
+     surfaces only derived rows, never raw nodes, and the cross-scope alias
+     view (no caller), plus the legacy read API (no consumer found).
+     Confirm these are OK to remove? → Yes, remove all — they're dead
+     · Before the final drop, what should happen to the historical data —
+     the frozen primary table (~4.6k rows) + the source log (~3k)? (The other
+     5 tables are pure derived, re-buildable by re-ingest.) → Drop without archive
+     · The nightly summary's 'learned today' section reads the frozen table
+     (so it's empty post-cutover). Repoint it to the live spine, or remove
+     the section? → Remove the section
+
+⏺ W1 is built and clean. ✅ (worktree-isolated, uncommitted, awaiting its gate)
+
+  Where this stands — honest picture
+
+  This decommission is a genuine multi-session program: W1 is built but ungated
+  (next: peer review of the diff, then the live probe — the real W1 gate). Then
+  W2 → W3 → W4 → W5 (the destructive prod drop), which will always require an
+  explicit GO + a fresh prod backup from you.
+
+  Threads still on your side
+
+  1. Worker pool fix — still need your pick: pin the profile in version control
+  (recommended) vs. add a runtime alert. (Immediate workaround: restore the
+  profile by hand.)
+  2. Link seed (a) — I need the real master record id (or "use the default")
+  and residence vs text-match linking.
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Decommission pace
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Decommission pace
+
+W1 of the legacy decommission is built and clean but ungated. The rest (W1 gate
+→ W2→W3→W4 dev waves → W5 prod drop) is a multi-session program with an
+irreversible endpoint. How do you want me to pace it?
+
+❯ 1. Keep driving now
+     Continue this session: peer-review W1, deploy to dev + run the live probe,
+     then build W2–W4 in gated waves. I'll merge dev waves as gates go green and
+     flag the W5 prod drop for your explicit GO + backup. Long push.
+  2. Checkpoint here, resume fresh
+     Stop at W1-built. The plan, decisions, and W1 worktree are durable. Pick up
+     the W1 gate + W2–W5 in a fresh session (cleaner context for a destructive
+     program). Recommended given how much ground we've covered today.
+  3. Gate W1 only, then pause
+     Finish just the W1 gate now (peer review + live dev probe + merge W1), then
+     pause before W2. Locks in the first wave as verified, leaves the rest.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

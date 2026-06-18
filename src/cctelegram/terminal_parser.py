@@ -1221,6 +1221,60 @@ def build_form_from_tool_input(
     )
 
 
+def _footer_block_contiguous_with_header(
+    lines: list[str], block_top_idx: int, tab_header_idx: int
+) -> bool:
+    """True iff the footer-anchored option block is CONTIGUOUS with the tab header.
+
+    PR-3 PR-A — footer-anchored stale-tab-header demotion. A multi-tab
+    ``←…→`` header governs the option parse ONLY when it sits directly above
+    the live footer-anchored option block: walking UP from the block's top to
+    ``tab_header_idx`` crosses ONLY blank lines and question-title prose — NO
+    picker-STRUCTURE marker.
+
+    Genuine multi-tab layout — ``header, [blank], title-prose, [blank],
+    options`` — reaches the header crossing only blanks + the title (contiguous
+    → GOVERN). The title may span multiple physical lines AND multiple
+    blank-separated paragraphs: Claude Code renders the whole ``question`` field
+    as prose, so a wrapped / multi-paragraph title must NOT trigger a demote
+    (hermes review — demoting on "second paragraph" was a false-demote on a live
+    multi-tab AUQ).
+
+    A STALE header left in deep scrollback by a PRIOR answered AUQ sits above
+    that prior picker's STRUCTURE — ``─`` separators, its own ``←…→`` header,
+    and answered/option ``☐``/``☒`` checkbox glyphs. Crossing ANY of those
+    walking up means the header is NOT directly above the live block → the
+    caller DEMOTES it and parses the footer-anchored live picker instead. These
+    markers never appear between a genuine header and its option block, and
+    prose titles never contain them, so they cleanly separate the two shapes
+    (structural markers, not separator-count / line-gap, are the signal).
+
+    Residual (disclosed, non-blocking — codex review): a stale single-question
+    header with NOTHING but blanks + one prose line between it and a live block
+    is indistinguishable from a genuine live multi-tab without another signal,
+    so it cosmetically governs (stale ``tabs`` are discarded in JSONL
+    resolution; the live options/title still render).
+    """
+    if block_top_idx <= tab_header_idx:
+        # Degenerate: block top is at/above the header — treat as governing.
+        return True
+    for i in range(block_top_idx - 1, tab_header_idx, -1):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue  # blank — allowed
+        # Picker-STRUCTURE markers from a PRIOR (stale) picker → not contiguous.
+        if all(c == "─" for c in stripped):
+            return False  # separator row
+        if _RE_TAB_HEADER.match(lines[i]):
+            return False  # a second (prior) tab header
+        if stripped[0] in ("☐", "☒"):
+            return False  # answered/option checkbox-glyph row
+        # else: question-title prose (possibly multi-line / multi-paragraph) —
+        # allowed; keep walking toward the header.
+    # Reached the header crossing only blanks + title prose.
+    return True
+
+
 def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     """Structured parse of the AskUserQuestion picker in ``pane_text``.
 
@@ -1276,13 +1330,6 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     if tab_header_idx is None and not has_footer and not is_review:
         return None
 
-    tabs: tuple[AskTab, ...] = ()
-    if tab_header_idx is not None:
-        parsed_tabs = _parse_tab_header(lines[tab_header_idx])
-        if parsed_tabs is None:
-            return None
-        tabs = parsed_tabs
-
     # Walk-back (single-tab path) captures a display-only question-title
     # candidate from the line above the options block. Tracked separately
     # from ``current_question_title`` (which goes into the fingerprint and
@@ -1297,29 +1344,18 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     walkback_stop_idx: int | None = None
     walkback_blank_gap: int = 0
 
-    # Collect options below the tab header (multi-tab) or in the picker
-    # region above the footer (single-tab). For multi-tab, options live
-    # between the header and the next separator / next tab header /
-    # picker footer.
-    if tab_header_idx is not None:
-        end_idx = len(lines)
-        for j in range(tab_header_idx + 1, len(lines)):
-            line = lines[j]
-            if _RE_TAB_HEADER.match(line):
-                end_idx = j
-                break
-            stripped = line.strip()
-            if stripped and all(c == "─" for c in stripped):
-                end_idx = j
-                break
-        options_region = lines[tab_header_idx + 1 : end_idx]
-    elif footer_idx is not None:
-        # Scan upward from the footer to find the contiguous numbered-options
-        # block. Walk backward until we hit a line that's clearly not part
-        # of the options block (anything other than a numbered option, a
-        # description continuation, a blank line, or a separator). This
-        # captures option 1 even when the question text is long enough to
-        # push it well above the last 25 lines.
+    # Footer-anchored upward walk: compute the live single-tab option block's
+    # top (``footer_block_top``) whenever a footer exists, INDEPENDENT of the
+    # tab header. This is the live picker's anchor; the multi-tab header only
+    # GOVERNS the parse when it is contiguous with this block (PR-3 PR-A
+    # stale-header demotion below). Scan upward from the footer to find the
+    # contiguous numbered-options block: walk backward until we hit a line
+    # that's clearly not part of the options block (anything other than a
+    # numbered option, a description continuation, a blank line, or a
+    # separator). This captures option 1 even when the question text is long
+    # enough to push it well above the last 25 lines.
+    footer_block_top: int | None = None
+    if footer_idx is not None:
         start_idx = footer_idx
         for j in range(footer_idx - 1, -1, -1):
             line = lines[j]
@@ -1371,7 +1407,62 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             if not line.startswith(("  ", "\t")):
                 walkback_stop_idx = j
             break
-        options_region = lines[start_idx : footer_idx + 1]
+        footer_block_top = start_idx
+
+    # Governance decision (PR-3 PR-A). The bare "any ←…→ header wins" rule
+    # let a STALE tab header in deep scrollback hijack the parse whenever a
+    # prior multi-tab AUQ was answered and a NEW single-tab picker rendered
+    # below it: the bottom-up header scan found the stale header, the
+    # multi-tab branch grabbed prose between it and the next separator as
+    # "options", and the live footer-anchored picker was never parsed.
+    if tab_header_idx is None:
+        tab_header_governs = False
+    elif footer_idx is None or footer_idx <= tab_header_idx:
+        # No live footer below the header → the header IS the live picker.
+        tab_header_governs = True
+    else:
+        # A footer sits below the header. The header governs ONLY when it is
+        # contiguous with the footer-anchored live block (else it is stale
+        # scrollback and is DEMOTED to the footer-anchored parse).
+        assert footer_block_top is not None
+        tab_header_governs = _footer_block_contiguous_with_header(
+            lines, footer_block_top, tab_header_idx
+        )
+
+    tabs: tuple[AskTab, ...] = ()
+    if tab_header_governs:
+        assert tab_header_idx is not None
+        parsed_tabs = _parse_tab_header(lines[tab_header_idx])
+        if parsed_tabs is None:
+            return None
+        tabs = parsed_tabs
+
+    # Collect options below the tab header (multi-tab, when it governs) or in
+    # the picker region above the footer (single-tab / demoted-header). For
+    # multi-tab, options live between the header and the next separator / next
+    # tab header / picker footer.
+    if tab_header_governs:
+        assert tab_header_idx is not None
+        end_idx = len(lines)
+        for j in range(tab_header_idx + 1, len(lines)):
+            line = lines[j]
+            if _RE_TAB_HEADER.match(line):
+                end_idx = j
+                break
+            stripped = line.strip()
+            if stripped and all(c == "─" for c in stripped):
+                end_idx = j
+                break
+        options_region = lines[tab_header_idx + 1 : end_idx]
+        # Walk-back title fields belong to the single-tab path only; the
+        # multi-tab in-region title scan below sets current_question_title.
+        walkback_stop_idx = None
+        walkback_blank_gap = 0
+    elif footer_block_top is not None:
+        # footer_block_top is set only inside the ``footer_idx is not None``
+        # block above, so the footer index is non-None here.
+        assert footer_idx is not None
+        options_region = lines[footer_block_top : footer_idx + 1]
     else:
         options_region = recent_tail
 
@@ -1388,9 +1479,11 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
     # the question text between the tab header and the first option.
     # Inputs to ``_strong_match`` and the fingerprint canonical come
     # from this field, so we only populate it from a region anchored
-    # by the tab header (a strong "this is the picker" signal).
+    # by a GOVERNING tab header (a strong "this is the picker" signal).
+    # A demoted (stale-scrollback) header must not seed the title from
+    # prose — the single-tab walk-back fills ``pane_walkback_title`` instead.
     current_question_title: str | None = None
-    if tab_header_idx is not None:
+    if tab_header_governs:
         for line in options_region:
             stripped = line.strip()
             if not stripped:
@@ -1435,12 +1528,17 @@ def parse_ask_user_question(pane_text: str) -> AskUserQuestionForm | None:
             parts.append(prev_stripped)
         pane_walkback_title = " ".join(reversed(parts))
 
-    # Build a pane excerpt for verbatim fallback rendering. We pin it to the
-    # tab header (if any) or the last ~25 lines otherwise — the renderer in
-    # PR 2 won't use the full pane scrollback.
-    excerpt_start = (
-        tab_header_idx if tab_header_idx is not None else max(0, len(lines) - 25)
-    )
+    # Build a pane excerpt for verbatim fallback rendering. Pin it to the
+    # GOVERNING tab header, else the footer-anchored live block (so a demoted
+    # stale header's scrollback is excluded — PR-3 PR-A), else the last ~25
+    # lines — the renderer won't use the full pane scrollback.
+    if tab_header_governs:
+        assert tab_header_idx is not None
+        excerpt_start = tab_header_idx
+    elif footer_block_top is not None:
+        excerpt_start = footer_block_top
+    else:
+        excerpt_start = max(0, len(lines) - 25)
     pane_excerpt = "\n".join(lines[excerpt_start:]).rstrip()
 
     options_contiguous = bool(options) and [o.number for o in options] == list(

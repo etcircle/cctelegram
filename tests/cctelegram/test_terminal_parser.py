@@ -3305,3 +3305,108 @@ class TestNonReviewFingerprintCursorBlind:
         assert [o.cursor for o in base.options] == [True, False, False]
         assert [o.cursor for o in moved.options] == [False, True, False]
         assert base.fingerprint() == moved.fingerprint()
+
+
+class TestStaleHeaderOverLivePickerDemotion:
+    """PR-3 PR-A — footer-anchored stale-tab-header demotion.
+
+    A previously-answered multi-tab AUQ leaves its ``←…→`` tab header in
+    deep scrollback. When a NEW live single-tab picker renders below it
+    (footer-anchored at ``Enter to select``), the multi-tab branch must NOT
+    win just because the stale header exists: it governs the option parse
+    ONLY when it is CONTIGUOUS with the footer-anchored live block (reachable
+    crossing only blanks + question-title prose — no picker-structure marker:
+    no ─ separator, prior ←…→ header, or ☐/☒ checkbox-glyph row). Otherwise the
+    parser demotes to the footer-anchored walk and returns the LIVE picker's
+    real options.
+
+    Keystone fixture is a PII-scrubbed capture of the owner's real failing
+    pane (di-copilot KG decommission AUQ, 2026-06-17): a stale 3-tab header
+    ~150 lines up, a numbered PROSE list below it the multi-tab branch
+    wrongly grabbed as 2 options + a prose title, then the live 3-option
+    picker at the bottom.
+    """
+
+    def test_keystone_stale_header_demotes_to_live_footer_picker(self):
+        form = parse_ask_user_question(
+            _fixture("auq_stale_tabheader_over_live_picker_S500.txt")
+        )
+        assert form is not None
+        # The stale header is DEMOTED — no tabs are parsed from it.
+        assert form.tabs == ()
+        # The footer-anchored live picker's 3 REAL options (the two affordance
+        # rows "Type something." / "Chat about this" are dropped per existing
+        # _parse_numbered_options semantics).
+        assert [o.label for o in form.options] == [
+            "Keep driving now",
+            "Checkpoint here, resume fresh",
+            "Gate W1 only, then pause",
+        ]
+        assert form.options_contiguous_from_one()
+        # The mis-parse prose title is gone; the live question prose is the
+        # walkback title (renderer reads current_question_title or
+        # pane_walkback_title).
+        title = (form.current_question_title or form.pane_walkback_title or "").lower()
+        assert "surfaces only derived rows" not in title
+        assert "pace" in title
+
+    def test_genuine_multi_tab_multiparagraph_title_still_governs(self):
+        """GREEN regression (hermes review): a GENUINE multi-tab picker whose
+        question title is a MULTI-PARAGRAPH (blank-separated) prose block must
+        STILL parse tabs. Demoting on "second paragraph" was a false-demote; the
+        demotion signal is picker-STRUCTURE markers (separator / prior header /
+        ☐☒ glyph), which a prose title never contains.
+        """
+        pane = (
+            "⏺ Earlier assistant turn\n"
+            "────────────────────────────────────\n"
+            "←  ☐ Scope  ☐ Risk  ✔ Submit  →\n"
+            "\n"
+            "How much should we cover in this first pass?\n"
+            "\n"
+            "Context: the legacy suite is flaky and the deadline is tight, so\n"
+            "there is a real tradeoff between depth and speed here.\n"
+            "\n"
+            "❯ 1. Full coverage\n"
+            "     Cover every module end to end.\n"
+            "  2. Core paths only\n"
+            "     Just the happy path and top failures.\n"
+            "  3. Type something.\n"
+            "────────────────────────────────────\n"
+            "  4. Chat about this\n"
+            "\n"
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+        )
+        form = parse_ask_user_question(pane)
+        assert form is not None
+        # The header is contiguous (only blanks + prose between it and the
+        # option block) → it GOVERNS even across the blank-line paragraph break.
+        assert len(form.tabs) >= 2
+        assert form.current_question_title == (
+            "How much should we cover in this first pass?"
+        )
+        assert [o.number for o in form.options] == [1, 2]
+
+    def test_no_footer_review_screen_with_tab_header_still_governs(self):
+        """GREEN (hermes review): a multi-Q review/Submit screen has a live
+        ``←…→`` header but NO ``Enter to select`` footer (its footer is
+        ``Ready to submit your answers?``). With ``footer_idx`` None the header
+        governs unconditionally — the review screen must still parse.
+        """
+        form = parse_ask_user_question(_fixture("auq_multiq_submit_pane.txt"))
+        assert form is not None
+        assert form.is_review_screen is True
+        assert [o.label for o in form.options] == ["Submit answers", "Cancel"]
+
+    def test_genuine_multi_tab_still_governs(self):
+        """GREEN: a genuine multi-tab picker whose header is DIRECTLY contiguous
+        with the footer-anchored option block (blank + single title line
+        between, no separator) MUST still parse tabs.
+        """
+        form = parse_ask_user_question(_fixture("auq_multiq_q1_pane.txt"))
+        assert form is not None
+        assert len(form.tabs) >= 2
+        assert form.current_question_title == (
+            "Which implementation approach should we take for the new caching layer?"
+        )
+        assert [o.number for o in form.options] == [1, 2, 3]
