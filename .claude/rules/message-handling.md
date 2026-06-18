@@ -540,6 +540,80 @@ fingerprint-agnostic, the route-based lookup also fixes the MULTI-question shape
 existing source_drift re-render, the 2nd dispatches); and a scrolled pane (visible
 options start >1) where the re-mint drops the keyboard (`p14_suppress_picks`).
 
+**Render-only rescue resolver + render-identity loop kill (PR-3 PR-B — the busy
+long-card render + duplicate-card loop).** A long-description AUQ in a BUSY topic
+rendered BROKEN and SPAMMED duplicate "📋 details" cards every ~20s: the live tmux
+pane mis-parsed / churned while the PreToolUse side file held the real question,
+and the render path was gated behind a successful pane parse (so the side-file
+rescue + the 📋 card were dropped exactly when needed), while the 1 Hz dedup hash
+over the raw interactive-content excerpt CHURNED as scrollback scrolled under the
+picker → a fresh re-render every tick. PR-A fixed the parser mis-parse; PR-B fixes
+the render path + the loop. `auq_source.resolve_auq_source_for_render(window_id,
+pane_text, explicit)` is the RENDER-path resolver (DISTINCT from the strict
+`resolve_auq_source` that `validate_and_consume` + `_remint_on_source_drift` still
+use UNCHANGED). It reads the side file READ-TTL-FREE then decides: **side_file_ok**
+— side file consistent with the pane AND within the 300s read-TTL → render from it
++ mint TRUSTED tokens (the ONLY trusted side-file path; the `within_ttl` gate makes
+it mirror the TTL'd strict resolver `validate_and_consume` re-resolves, so
+mint/validate parity holds and a long-open card flips cleanly to `bail` at the TTL
+boundary instead of stranding a trusted token the TTL'd validate rejects — no
+dead-tap, and `_remint_on_source_drift` stays loop-safe because render's trusted
+decision still agrees with the strict resolver it compares against); **bail** — the
+pane is itself a COMPLETE coherent picker (`pane_form_is_complete_picker`) that
+disagrees with the side file → a genuinely different / advanced live question →
+render the PANE (trusted; never serve the stale side file); **rescue** — the pane
+is unparseable / incomplete (busy scrollback) and the side file is the truth →
+render the side file's full content DISPLAY-ONLY (`dispatch_trusted=False`, PURE
+`build_form_from_tool_input` form — no pane overlay so the render identity can't
+leak pane/scrollback churn); **explicit_jsonl / jsonl_cache / pane** — no side file
+→ the pre-existing fallback (all trusted). `dispatch_trusted` GATES token minting
+at the `_build_pick_button_rows` callsite: rescue mints NO `pick_token` /
+`pick_intent` rows, calls `prune_for_route`, and adds a manual-nav notice (a
+busy-pane digit can't be verified against the live picker → would dead-tap). The ctx
+(📋 full-descriptions) card is driven off the decision: side_file_ok / rescue post
+the side file's descriptions (rescue is the V1/V2 fix — the card was previously
+DROPPED because `resolve_record`'s pane-consistency check rejected on the busy pane);
+**bail posts NO stale side-file card**. **Loop kill:** both `status_polling` dedup
+hash sites (`_ui_render_hash`) hash the render IDENTITY for AskUserQuestion
+(`auq_source.peek_render_identity` = the render decision + `render_signature` over
+the render/keyboard-determining form fields — tabs, is_free_text, select_mode,
+is_review_screen, options_complete, current_tab_inferred, len(questions),
+`current_question_title`, and per-option number/label/cursor/selected/recommended)
+instead of the raw interactive-content excerpt. `render_signature` uses
+`current_question_title` ONLY — NEVER `pane_walkback_title` (scraped from the
+churning scrollback above the option block; folding it in re-rendered the
+title-less `bail`/`pane` card every tick, the dominant live single-select shape —
+internal-review regression catch). This mirrors `_canonical_repr` and the OLD
+`ui_content.content` hash, both of which excluded the title region above the
+picker block, so the identity stays STABLE under scrollback churn (a rescue's
+pure side-file form has no pane fields; a complete picker's parsed form ignores
+scrollback above it) yet changes on every GENUINE transition (cursor move,
+multi-select toggle, tab advance, review screen, complete↔incomplete,
+JSONL-title, free-text, tab-inference loss). NEVER the cursor-blind pick-token
+`fingerprint()` (the renderer paints the `❯` cursor + `selected` glyphs, so a
+cursor/selection change MUST re-render — a separate render-only signature).
+Non-AUQ interactive UIs (ExitPlanMode / permission) keep the raw-content hash.
+**Disclosed residuals (all untrusted-display, never a wrong dispatch).** (1) The
+≤1-poll-cycle boundary race at the 300s ageout (unchanged from item-1) — a
+side_file_ok token minted just before the TTL and tapped just after it (before the
+poller re-mints to `bail`/pane) routes through the existing source_drift
+re-render and the 2nd tap dispatches; PR-B does not worsen it (it cleans the
+>300s STEADY state, where render now picks `bail`→pane matching the strict
+validate resolver). (2) A `rescue` renders the side-file question even if the side
+file is STALE relative to a genuinely-different INCOMPLETE live pane (the OLD path
+showed the partial live pane). Bounded — the PreToolUse hook overwrites the side
+file on every AUQ, so the common sequential case stays fresh; staleness requires a
+double-`--resume` sibling (session-keyed side file), a restart orphan, or a hook
+write lag. dispatch_trusted=False (no buttons) so it is wrong-DISPLAY only, and it
+is strictly better than the pre-PR-3 broken render (a raw scrollback blob); the
+loop-kill FREEZES the rescue card so it self-corrects only when the side file is
+overwritten / the pane becomes a complete picker. (3) A multi-question `rescue`
+renders Q1 (`build_form_from_tool_input` defaults to the first question) even if
+the live picker is on an advanced tab — only reachable when the pane is so
+degraded its `←…→` tab header is unparseable (else PR-A → bail/side_file_ok with
+the inferred tab); untrusted, and the 📋 ctx card still enumerates ALL questions.
+Pull-only; no observer (c313657 forbidden).
+
 **Restart re-dispatch (D2 — the durable mint-intent net for the case D3-β can't
 cover).** D3-β keeps a live card's tokens alive only while the process is up; a
 bot **restart** wipes the in-memory `_pick_tokens`/`_pick_token_cache`, and the
