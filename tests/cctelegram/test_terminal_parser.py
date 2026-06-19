@@ -3410,3 +3410,117 @@ class TestStaleHeaderOverLivePickerDemotion:
             "Which implementation approach should we take for the new caching layer?"
         )
         assert [o.number for o in form.options] == [1, 2, 3]
+
+    # --- PR-3 PR-A fast-follow: direct branch coverage of the demotion helper.
+    # The keystone fixture only exercises the ☐/☒ glyph branch; these lock the
+    # other demote branches (── separator, prior ←…→ header) and both arms of
+    # the degenerate guard, plus the blanks+prose contiguous-govern fall-through,
+    # at the unit level so the demotion contract can't silently drift. Coverage
+    # backfill on already-correct code → GREEN on write (RED-first is for
+    # behavior changes; this is contract-locking).
+
+    def test_helper_demotes_on_separator_marker(self):
+        """A ``──`` separator row between the header and the live block top is a
+        PRIOR picker's structure → NOT contiguous → demote (False).
+        ``terminal_parser._footer_block_contiguous_with_header`` separator branch.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ☒ Risk  ✔ Submit  →",  # 0: stale tab header (governing arg)
+            "",  # 1
+            "────────────────────────────────",  # 2: prior picker separator
+            "",  # 3
+            "❯ 1. Live option",  # 4: live footer-anchored block top
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=4, tab_header_idx=0
+            )
+            is False
+        )
+
+    def test_helper_demotes_on_prior_tab_header_marker(self):
+        """A SECOND ``←…→`` header between the governing header and the live
+        block top is a prior picker's structure → demote (False). The
+        prior-tab-header branch.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ✔ Submit  →",  # 0: the header under test
+            "",  # 1
+            "←  ☐ Other  ✔ Submit  →",  # 2: a prior (second) tab header
+            "",  # 3
+            "❯ 1. Live option",  # 4: live block top
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=4, tab_header_idx=0
+            )
+            is False
+        )
+
+    def test_helper_demotes_on_checkbox_glyph_marker(self):
+        """Unit mirror of the keystone: a ``☐``/``☒`` answered-option glyph row
+        between header and block → demote (False). The glyph branch.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ✔ Submit  →",  # 0
+            "",  # 1
+            "☒ Risk accepted",  # 2: prior answered-option glyph row
+            "",  # 3
+            "❯ 1. Live option",  # 4
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=4, tab_header_idx=0
+            )
+            is False
+        )
+
+    def test_helper_governs_on_degenerate_block_at_or_above_header(self):
+        """The degenerate guard: when the block top is at or above the header
+        index the header governs unconditionally (True) — both arms.
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = ["⏺ prose", "←  ☐ A  ✔ Submit  →", "❯ 1. opt"]
+        # block top strictly ABOVE the header
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=0, tab_header_idx=1
+            )
+            is True
+        )
+        # block top EQUAL to the header index
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=1, tab_header_idx=1
+            )
+            is True
+        )
+
+    def test_helper_governs_on_blanks_and_prose_only(self):
+        """The contiguous-govern fall-through: only blanks + multi-paragraph
+        title prose (no structural marker) between header and block → contiguous
+        → govern (True).
+        """
+        from cctelegram.terminal_parser import _footer_block_contiguous_with_header
+
+        lines = [
+            "←  ☐ Scope  ✔ Submit  →",  # 0: header
+            "",  # 1
+            "How much should we cover in this first pass?",  # 2: title prose
+            "",  # 3: paragraph break (must NOT demote)
+            "Context spanning a second prose paragraph.",  # 4: more prose
+            "❯ 1. Live option",  # 5: live block top
+        ]
+        assert (
+            _footer_block_contiguous_with_header(
+                lines, block_top_idx=5, tab_header_idx=0
+            )
+            is True
+        )
