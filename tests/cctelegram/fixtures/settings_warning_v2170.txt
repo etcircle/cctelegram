@@ -1,0 +1,17 @@
+  Settings Warning
+
+  /path/to/project/.claude/settings.json
+   └ permissions
+     └ allow: Invalid permission rule "mcp__postgres-mcp*" was skipped:
+   Wildcard tool name "mcp__postgres-mcp*" is not supported in allow rules. An
+    allow pattern must name the scope it widens — globs are permitted only in
+   the tool position after a literal mcp__<server>__ prefix. Deny and ask
+   rules accept wildcards anywhere
+
+  The values listed above were skipped; the rest of the file is in effect.
+
+  ❯ 1. Continue
+    2. Fix with Claude
+    3. Exit and fix manually
+
+  Enter to confirm · Esc to cancel

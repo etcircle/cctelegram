@@ -269,6 +269,49 @@ class TestExtractInteractiveContent:
         assert result.name == "ExitPlanMode"
         assert "Claude has written up a plan" in result.content
 
+    def test_exit_plan_mode_v2170_ctrl_plus_g(self):
+        # Claude Code v2.1.170: the footer is ``ctrl+g`` (PLUS) and the
+        # ``Esc to cancel`` line is gone (replaced by ``shift+tab to approve``).
+        # RED before the ctrl[+-]g footer fix (extract returns None → the bot
+        # surfaced NEITHER the picker card NOR the same-turn findings prose,
+        # which is gated behind detection); GREEN after.
+        pane = _fixture("epm_v2170_ctrl_plus_g.txt")
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ExitPlanMode"
+        # All FOUR v2.1.170 options captured in the excerpt.
+        assert "Yes, and bypass permissions" in result.content
+        assert "Tell Claude what to change" in result.content
+
+    def test_exit_plan_mode_legacy_ctrl_hyphen_g_only(self):
+        # Backward-compat: the OLD hyphen footer must still detect. This
+        # isolates the ctrl-g marker — the existing sample/variant tests pair
+        # ctrl-g WITH ``Esc to cancel``, so a broken ctrl-g would pass them via
+        # the Esc anchor. Here there is NO ``Esc to cancel`` line.
+        pane = (
+            "────────────────────────────────────────\n"
+            " Claude has written up a plan and is ready to execute.\n"
+            "\n"
+            " ❯ 1. Yes\n"
+            "   2. No, keep planning\n"
+            "\n"
+            " ctrl-g to edit in  Vim\n"
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "ExitPlanMode"
+
+    def test_settings_warning_v2170(self):
+        # Claude Code v2.1.170 startup "Settings Warning" pane (invalid
+        # permission rule): title is "Settings Warning", not "Settings:". RED
+        # before the Settings-top marker addition (the bot left this blocking
+        # Continue/Fix/Exit picker unsurfaced); GREEN after.
+        pane = _fixture("settings_warning_v2170.txt")
+        result = extract_interactive_content(pane)
+        assert result is not None
+        assert result.name == "Settings"
+        assert "Continue" in result.content
+
     def test_ask_user_multi_tab(self, sample_pane_ask_user_multi_tab: str):
         result = extract_interactive_content(sample_pane_ask_user_multi_tab)
         assert result is not None
@@ -667,6 +710,20 @@ class TestVisiblePaneLiveness:
             "line of plan text\n"
             "more plan text\n"
             "ctrl-g to edit in the editor · Esc to cancel\n"
+        )
+        assert visible_pane_liveness(pane) == "present"
+
+    def test_exit_plan_mode_v2170_ctrl_plus_g_footer_anchors(self):
+        # v2.1.170: the footer is ``ctrl+g`` (PLUS) with NO ``Esc to cancel``.
+        # The _PICKER_ANCHOR_MARKERS fallback (the FIRST liveness gate in
+        # handle_interactive_ui, and the long-plan-scrolled fallback) must
+        # recognize it; RED before the ctrl[+-]g anchor fix.
+        from cctelegram.terminal_parser import visible_pane_liveness
+
+        pane = (
+            "line of plan text\n"
+            "more plan text\n"
+            " ctrl+g to edit in  Vim  · ~/.claude/plans/the-plan.md\n"
         )
         assert visible_pane_liveness(pane) == "present"
 

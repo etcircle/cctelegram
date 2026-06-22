@@ -99,7 +99,12 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Claude has written up a plan"),
         ),
         bottom=(
-            re.compile(r"^\s*ctrl-g to edit in "),
+            # v2.1.170 renders the footer as ``ctrl+g`` (PLUS); pre-.170 used
+            # ``ctrl-g`` (hyphen). Tolerate both — mirrors ``ctrl[+-]o`` above.
+            # The .170 plan-approval also dropped the ``Esc to cancel`` line
+            # (replaced by ``shift+tab to approve``), so this footer is the SOLE
+            # bottom anchor on .170 and MUST match.
+            re.compile(r"^\s*ctrl[+-]g to edit in "),
             re.compile(r"^\s*Esc to (cancel|exit)"),
         ),
     ),
@@ -143,6 +148,11 @@ UI_PATTERNS: list[UIPattern] = [
         top=(
             re.compile(r"^\s*Settings:.*tab to cycle"),
             re.compile(r"^\s*Select model"),
+            # v2.1.170 startup "Settings Warning" pane (invalid permission rule
+            # etc.) — title is "Settings Warning", not "Settings:"; its body is
+            # the blocking Continue/Fix/Exit picker the user must answer. The
+            # bottom anchors ("Enter to confirm" / "Esc to cancel") already match.
+            re.compile(r"^\s*Settings Warning\b"),
         ),
         bottom=(
             re.compile(r"Esc to cancel"),
@@ -295,7 +305,7 @@ def is_interactive_ui(pane_text: str) -> bool:
 _PICKER_ANCHOR_MARKERS = (
     re.compile(r"Enter to select"),  # AskUserQuestion / RestoreCheckpoint footer
     re.compile(r"Enter to confirm"),  # Settings footer
-    re.compile(r"ctrl-g to edit"),  # ExitPlanMode footer
+    re.compile(r"ctrl[+-]g to edit"),  # ExitPlanMode footer (v2.1.170: ctrl+g)
     re.compile(r"Esc to (cancel|exit)"),  # generic dismiss footer
     re.compile(r"╰─"),  # picker frame bottom-left corner
     # Multi-question AUQ Submit-confirmation screen has none of the above
