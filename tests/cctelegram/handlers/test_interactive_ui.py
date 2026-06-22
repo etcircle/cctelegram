@@ -3283,6 +3283,148 @@ class TestClearInteractiveMsgTombstone:
         assert deletes[0]["message_id"] == 12345
 
 
+@pytest.mark.usefixtures("_clear_interactive_state")
+class TestInteractiveEditTransientOutcomeKeepsCard:
+    """Fix B (di-copilot picker churn): a TRANSIENT edit failure on a still-live
+    interactive card must NOT orphan + recreate the card.
+
+    Under a long-open AUQ the ~1Hz poller re-edit periodically TIMES OUT
+    (telegram.error.TimedOut → TopicSendOutcome.OTHER). The old gate accepted
+    only OK / MESSAGE_NOT_MODIFIED and treated everything else as "edit failed →
+    fresh send", deleting the old card and sending a new one — a new Telegram
+    message + notification per timeout (the duplicate-card churn). The card may
+    still be live, so a transient OTHER / RATE_LIMITED must KEEP it; only a
+    provably-gone MESSAGE_NOT_FOUND (and topic-broken outcomes, which need the
+    send-failed DM escalation) recreate. Mirrors dashboard.py:314.
+    """
+
+    _PANE = (
+        "Pick one.\n"
+        "\n"
+        "❯ 1. Alpha\n"
+        "  2. Beta\n"
+        "  3. Gamma\n"
+        "\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
+
+    @staticmethod
+    async def _run(mock_bot, edit_outcome, *, existing_id=777):
+        from cctelegram.handlers import interactive_ui as iui
+        from cctelegram.handlers import pick_token
+
+        pick_token.reset_for_tests()
+        window_id = "@5"
+        ikey = (1, 42)
+        iui._interactive_msgs[ikey] = existing_id
+        iui._interactive_mode[ikey] = window_id
+        sends: list = []
+        deletes: list = []
+
+        async def _fake_edit(bot, **kw):
+            return edit_outcome
+
+        async def _fake_send(bot, **kw):
+            sends.append(kw)
+            m = MagicMock()
+            m.message_id = 888
+            return m, iui.TopicSendOutcome.OK
+
+        async def _fake_delete(bot, **kw):
+            deletes.append(kw)
+            return iui.TopicSendOutcome.OK
+
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        with (
+            patch("cctelegram.handlers.interactive_ui.tmux_manager") as mock_tmux,
+            patch("cctelegram.handlers.interactive_ui.session_manager") as mock_sm,
+            patch("cctelegram.handlers.attention.session_manager") as mock_sm_att,
+            patch.object(iui, "topic_edit", _fake_edit),
+            patch.object(iui, "topic_send", _fake_send),
+            patch.object(iui, "topic_delete", _fake_delete),
+        ):
+            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+            mock_tmux.capture_pane = AsyncMock(
+                return_value=TestInteractiveEditTransientOutcomeKeepsCard._PANE
+            )
+            mock_sm.resolve_chat_id.return_value = 100
+            mock_sm_att.resolve_chat_id.return_value = 100
+            mock_sm_att.get_display_name.return_value = "topic"
+            result = await iui.handle_interactive_ui(
+                mock_bot,
+                user_id=1,
+                window_id=window_id,
+                thread_id=42,
+                from_poller=True,
+            )
+        # Only the PICKER recreate matters (content_type="tool_use"); the
+        # "📋 full details" context card (content_type="text") is an orthogonal
+        # first-render artifact of this harness, not the churn under test.
+        picker_sends = [s for s in sends if s.get("content_type") == "tool_use"]
+        return result, picker_sends, deletes, iui._interactive_msgs.get(ikey)
+
+    @pytest.mark.asyncio
+    async def test_timeout_other_keeps_card_no_recreate(self, mock_bot):
+        """A timed-out edit (OTHER) keeps the existing card: no fresh send, no
+        delete, the msg id is unchanged. RED on main (OTHER → fresh send)."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        result, sends, deletes, msg_id = await self._run(
+            mock_bot, iui.TopicSendOutcome.OTHER
+        )
+        assert sends == [], f"transient OTHER must NOT recreate the card: {sends}"
+        assert deletes == [], deletes
+        assert msg_id == 777, "the existing card id must be retained"
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_keeps_card_no_recreate(self, mock_bot):
+        """Forward-compat policy guard: IF ``topic_edit`` ever returns
+        ``RATE_LIMITED`` it must keep the card (recreating under a rate limit only
+        worsens it). NOTE: today ``topic_edit`` RE-RAISES ``RetryAfter`` rather
+        than returning ``RATE_LIMITED`` (message_sender.py:599-600), so this
+        outcome is NOT produced via the live edit path — the ``OTHER`` (timeout)
+        test above is the faithful live-churn repro. This locks the keep-set
+        policy against a future where the classifier changes (codex review P3)."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        result, sends, deletes, msg_id = await self._run(
+            mock_bot, iui.TopicSendOutcome.RATE_LIMITED
+        )
+        assert sends == [] and deletes == []
+        assert msg_id == 777
+
+    @pytest.mark.asyncio
+    async def test_topic_broken_edit_falls_through_to_send(self, mock_bot):
+        """A topic-broken EDIT outcome (TOPIC_CLOSED / TOPIC_NOT_FOUND /
+        FORBIDDEN) must FALL THROUGH to the fresh-send path (which, on a genuinely
+        broken topic, reaches the send-failed DM escalation) — it must NOT be
+        silently kept like a transient OTHER. Here the faked send succeeds, so we
+        assert the fall-through fired a picker send (internal-review P3: this path
+        was otherwise untested)."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        result, picker_sends, deletes, msg_id = await self._run(
+            mock_bot, iui.TopicSendOutcome.TOPIC_CLOSED
+        )
+        assert len(picker_sends) == 1, (
+            "topic-broken edit must fall through to a fresh send, not be kept"
+        )
+
+    @pytest.mark.asyncio
+    async def test_message_not_found_recreates_card(self, mock_bot):
+        """GREEN-preserving: a provably-deleted card (MESSAGE_NOT_FOUND) DOES
+        fall through to a fresh send (recreate) and records the new id."""
+        from cctelegram.handlers import interactive_ui as iui
+
+        result, sends, deletes, msg_id = await self._run(
+            mock_bot, iui.TopicSendOutcome.MESSAGE_NOT_FOUND
+        )
+        assert len(sends) == 1, f"MESSAGE_NOT_FOUND must recreate: {sends}"
+        assert msg_id == 888, "the new card id must be recorded"
+
+
 @pytest.mark.usefixtures("_isolated_interactive_state_file")
 class TestAuqContextMsgRecordPersistence:
     """``_auq_context_msgs`` round-trips through interactive_state.json."""

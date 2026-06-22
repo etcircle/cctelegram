@@ -556,6 +556,20 @@ async def _remint_on_source_drift(
     minted = pick_token.peek_route_source(user_id, thread_id, window_id)
     if minted is None or (live.kind, live.source_fingerprint) == minted:
         return False
+    # Fix A (di-copilot picker churn): a PANE↔PANE "drift" is capture noise, not
+    # a real source change. The card's pane token was minted from
+    # ``handle_interactive_ui``'s scrollback=500 capture, while ``live`` here is
+    # the poller's scrollback=0 capture, so their ``_pane_fingerprint`` values
+    # differ PERMANENTLY for a busy/scrolled long-open AUQ even though the source
+    # (the pane) never moved — re-minting on it re-renders the card every ~1s
+    # tick, which periodically rides an edit-timeout into a delete+recreate. When
+    # there is no side file and no jsonl_cache there is exactly ONE source (the
+    # pane), so re-minting cannot improve dispatch trust (the resolver itself
+    # documents that the pane kind can never legitimately source_drift). ``_remint``
+    # stays armed for the genuine ``side_file``→pane / ``jsonl_cache``→pane FLIP
+    # (minted kind != ``pane``) it was built for.
+    if minted[0] == "pane" and live.kind == "pane":
+        return False
     if ui_hash is not None:
         _last_published_ui_hash[(user_id, thread_id or 0, window_id)] = ui_hash
     await handle_interactive_ui(bot, user_id, window_id, thread_id, from_poller=True)

@@ -2432,6 +2432,89 @@ class TestPollerSourceDriftRemint:
         finally:
             pick_token.reset_for_tests()
 
+    async def test_same_hash_pane_to_pane_drift_does_not_remint(
+        self, mock_bot: AsyncMock
+    ):
+        """Fix A (di-copilot picker churn): a PANE↔PANE source "drift" is just
+        capture noise and must NOT re-mint. The poller resolves the live source
+        from a scrollback=0 capture while the card's pane token was minted (by
+        handle_interactive_ui) from a scrollback=500 capture, so the two
+        ``_pane_fingerprint`` values differ PERMANENTLY for a busy/scrolled
+        long-open AUQ even though the source (the pane) never changed. Re-minting
+        on that phantom drift re-renders the card every ~1s tick → the
+        duplicate-card churn. Only a genuine ``side_file``→pane FLIP (minted kind
+        != ``pane``) is a real source change.
+
+        RED pre-fix / GREEN post-fix: on current main ``_remint_on_source_drift``
+        compares fingerprints only, so a pane↔pane mismatch re-renders (awaits
+        ``handle_interactive_ui``).
+        """
+        from pathlib import Path
+
+        from cctelegram.handlers import pick_token, status_polling
+        from cctelegram.handlers.interactive_ui import _interactive_mode
+        from cctelegram.handlers.pick_token import _CacheRow, _pick_token_cache
+        from cctelegram.handlers.status_polling import extract_interactive_content
+        from cctelegram.terminal_parser import resolve_ask_form
+
+        pick_token.reset_for_tests()
+        try:
+            fx = Path(__file__).parents[1] / "fixtures"
+            pane = (fx / "auq_single_select_with_affordances_pane.txt").read_text()
+            window_id = "@5"
+            route = (1, 42, window_id)
+            mock_window = MagicMock()
+            mock_window.window_id = window_id
+            _interactive_mode[(1, 42)] = window_id
+
+            ui_content = extract_interactive_content(pane)
+            assert ui_content is not None
+            # Pin the SAME render-identity hash production uses (peek_render_identity
+            # for AUQ), so the poller takes the same-hash branch and reaches
+            # ``_remint_on_source_drift`` — NOT the new-UI re-render branch.
+            ui_hash = status_polling._ui_render_hash(window_id, pane, ui_content)
+            status_polling._last_published_ui_hash[route] = ui_hash
+
+            # Card token minted kind="pane" from a DIFFERENT capture (the
+            # 500-line render pane) → its source_fingerprint is NOT the poller's
+            # live 0-line pane fingerprint. peek_route_source is route-based, so
+            # the cache-key fingerprint is irrelevant to the lookup.
+            pane_form = resolve_ask_form(None, pane)
+            assert pane_form is not None
+            _pick_token_cache[(1, 42, window_id, pane_form.fingerprint())] = _CacheRow(
+                tokens=["panetok"],
+                row_generation=1,
+                source_kind="pane",
+                source_fingerprint="minted-from-500line-capture",
+                consumed_generation=None,
+            )
+
+            with (
+                patch.object(status_polling, "tmux_manager") as mock_tmux,
+                patch.object(
+                    status_polling.pick_token,
+                    "refresh_route_deadlines",
+                    new_callable=AsyncMock,
+                ) as mock_refresh,
+                patch.object(
+                    status_polling, "handle_interactive_ui", new_callable=AsyncMock
+                ) as mock_handle_ui,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=pane)
+
+                await status_polling.update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+
+            # Live source is pane (real fp) ≠ the minted "pane" fp, but BOTH are
+            # kind=pane → capture noise → NO re-mint. The poller refreshes
+            # deadlines instead (the live-card-preserve path).
+            mock_handle_ui.assert_not_awaited()
+            mock_refresh.assert_awaited()
+        finally:
+            pick_token.reset_for_tests()
+
     async def test_drift_remint_terminates_next_tick_does_not_remint(
         self, mock_bot: AsyncMock
     ):

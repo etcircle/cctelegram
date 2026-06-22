@@ -540,6 +540,51 @@ fingerprint-agnostic, the route-based lookup also fixes the MULTI-question shape
 existing source_drift re-render, the 2nd dispatches); and a scrolled pane (visible
 options start >1) where the re-mint drops the keyboard (`p14_suppress_picks`).
 
+**Pane↔pane drift is a no-op (the di-copilot long-open-card churn fix — Fix A).**
+The "next tick sees live `pane` == minted `pane` → no further re-render"
+loop-safety above held ONLY for the `side_file`→pane flip, where both
+fingerprints hash the SAME capture. For a pane↔pane comparison they do NOT: the
+poller resolves `live` from a `scrollback=0` pane capture, while the card's pane
+token was minted by `handle_interactive_ui` from a `scrollback=500` capture, and
+the two `_pane_fingerprint`s differ PERMANENTLY for a busy/scrolled long-open AUQ
+(the 500-line scrollback recovers options the 0-line visible pane lost). So a
+`bail_aged` AUQ (side file aged past the 300s read-TTL → `kind=pane`) re-minted
+EVERY ~1s tick forever — a per-tick in-place re-edit that periodically timed out
+and recreated the card (the duplicate-card churn the owner saw in di-copilot).
+Fix: `_remint_on_source_drift` now SHORT-CIRCUITS (returns False, no re-render)
+when `minted[0] == "pane" and live.kind == "pane"` — a pane↔pane "drift" is just
+capture noise, never a real source change (there is exactly ONE source when no
+side file / `jsonl_cache` exists; the resolver itself documents the pane kind can
+never legitimately `source_drift`). `_remint` stays armed for the genuine
+`side_file`→pane / `jsonl_cache`→pane FLIP (`minted kind != "pane"`), so item-1
+is untouched. RED-first: `test_same_hash_pane_to_pane_drift_does_not_remint`
+(+ the existing `side_file`→pane drift tests stay green).
+
+**Transient edit-outcome KEEPS the card (the churn's visible trigger — Fix B).**
+The ~1Hz interactive re-edit (whether from the source-drift loop above or any
+busy-topic re-render) periodically TIMES OUT against Telegram
+(`telegram.error.TimedOut` → `_classify_bad_request` → `TopicSendOutcome.OTHER`).
+`handle_interactive_ui`'s edit gate previously accepted only `OK` /
+`MESSAGE_NOT_MODIFIED` and treated everything else as "edit failed → fresh send",
+deleting the old card and sending a new one — a new message + notification PER
+timeout (the user-visible spam; ~37 re-creates/hour on a 99-minute AUQ). Fix: a
+transient `OTHER` / `RATE_LIMITED` edit outcome now KEEPS the existing card and
+returns (the next poll re-edits in place); ONLY `MESSAGE_NOT_FOUND` (provably
+gone) and the topic-broken outcomes (`TOPIC_NOT_FOUND` / `TOPIC_CLOSED` /
+`FORBIDDEN`, which must reach the send-failed DM escalation) fall through to the
+delete-old + send-new path. Mirrors the dashboard self-heal rule (`dashboard.py`
+— never re-send on a transient, or the still-live message orphans; hermes Wave C
+review P2-2). Behavior-narrowing (strictly FEWER sends) so it can never increase
+Telegram traffic. **Residual (P3, visual-only):** the poller advances the
+published render hash BEFORE the `handle_interactive_ui` edit (a concurrency
+guard), so if a transient edit in the genuine *new-UI* branch is KEPT (not
+recreated), that one render transition's visual update is dropped until the next
+genuine UI change (the same-hash branch won't retry it). Never a wrong dispatch
+(tokens / keyboard / pane-validated dispatch unaffected), and a strict
+improvement over the recreate-churn it replaces. RED-first:
+`TestInteractiveEditTransientOutcomeKeepsCard` (incl. the topic-broken
+fall-through case).
+
 **Render-only rescue resolver + render-identity loop kill (PR-3 PR-B — the busy
 long-card render + duplicate-card loop).** A long-description AUQ in a BUSY topic
 rendered BROKEN and SPAMMED duplicate "📋 details" cards every ~20s: the live tmux

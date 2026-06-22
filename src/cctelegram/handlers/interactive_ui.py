@@ -3222,8 +3222,34 @@ async def handle_interactive_ui(
                 # card is reserved for the topic-send-failed branch
                 # below where the user genuinely doesn't see the card.
                 return True
-            # Edit failed — fall through to fresh send while keeping
-            # the old id so we can delete it after a new one lands.
+            # Fix B (di-copilot picker churn): a TRANSIENT edit failure must
+            # NOT orphan + recreate a still-live card. Under a long-open AUQ the
+            # ~1Hz poller re-edit periodically times out (TimedOut → OTHER) or
+            # hits a RetryAfter (RATE_LIMITED); the old "any non-OK edit → fresh
+            # send" path turned each into a delete-old + send-new card (a new
+            # message + notification per timeout — the duplicate-card churn).
+            # The card is almost certainly still live, so keep it and let the
+            # next poll re-edit it in place. Only MESSAGE_NOT_FOUND (provably
+            # gone) and the topic-broken outcomes (TOPIC_NOT_FOUND / TOPIC_CLOSED
+            # / FORBIDDEN — which must reach the send-failed DM escalation below)
+            # fall through to a fresh send. Mirrors dashboard.py:314 (hermes
+            # Wave C review P2-2: re-sending on a transient orphans the
+            # still-live message).
+            if edit_outcome in (
+                TopicSendOutcome.OTHER,
+                TopicSendOutcome.RATE_LIMITED,
+            ):
+                _interactive_mode[ikey] = window_id
+                logger.debug(
+                    "interactive edit transient outcome=%s window=%s — keeping "
+                    "card, re-edit next tick (no recreate)",
+                    edit_outcome.value,
+                    window_id,
+                )
+                return True
+            # Edit failed (MESSAGE_NOT_FOUND / topic-broken) — fall through to a
+            # fresh send while keeping the old id so we can delete it after a new
+            # one lands.
 
         # Send new message (plain text — terminal content is not
         # markdown). §2.5.2: anchor the interactive card to the user's
