@@ -301,8 +301,10 @@ async def _reconcile_decision_card(
         (the expired deadline is LEFT in place so we don't re-enter grace every
         tick).
       - Otherwise dismiss kind-aware (USER / TOOL_RESULT / TASK_NOTIFICATION /
-        INVARIANT / TTL / PANE_RUNNING, and the EOT-gap-ended case where
-        ``background_agents`` went empty past the grace).
+        INVARIANT / TTL / PANE_RUNNING / BG_RUNNING, and the EOT-gap-ended case
+        where ``background_agents`` went empty past the grace). BG_RUNNING (Fix
+        #1) dismisses correctly here: the background agent resumed writing, so
+        the false "needs a decision" card is torn down exactly like PANE_RUNNING.
 
     The PANE_RUNNING / TTL clears also dismiss at their own sites for immediacy;
     this is idempotent (``dismiss_if_kind`` no-ops when no matching card exists).
@@ -354,7 +356,7 @@ async def _reconcile_decision_card(
         )
         return
     # any other clear reason (USER / TOOL_RESULT / TASK_NOTIFICATION / INVARIANT
-    # / TTL / PANE_RUNNING)
+    # / TTL / PANE_RUNNING / BG_RUNNING)
     _decision_card_eot_grace.pop(route, None)
     await attention.dismiss_if_kind(
         bot, user_id=user_id, thread_id=thread_id, kind=NOTIFY_DECISION_KIND

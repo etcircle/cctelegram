@@ -349,3 +349,191 @@ async def test_pasted_launch_prose_in_text_block_not_recovered(monitor, tmp_path
 
     assert monitor._open_workflow_brackets.get(PARENT, {}) == {}
     assert monitor.pop_sidechain_activity() == {}
+
+
+# ── Fix #5: the reconciler ALSO re-lights plain run_in_background Agents ─────
+# (subagents/agent-*.jsonl — one level UP from the Workflow shape). Structured-
+# primary discriminator (toolUseResult {status:async_launched, isAsync:True,
+# agentId}) with the prose ``agentId:`` line as fallback; the agentId IS the
+# filename stem minus ``agent-`` == the route_runtime bg key. STATE rule mirrors
+# Workflow. CRITICAL: NO persisted-tracked_sessions idempotency skip (that would
+# miss the dominant pre-restart-tracked agent).
+
+AGENT_ID = "acef75980ef7d27c9"
+
+
+def _agent_file(proj_dir, parent_sid=PARENT, agent_id=AGENT_ID) -> "object":
+    """Create a fresh plain-Agent sidechain at subagents/agent-<id>.jsonl."""
+    from pathlib import Path
+
+    p = Path(proj_dir) / parent_sid / "subagents" / f"agent-{agent_id}.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("")
+    return p
+
+
+def _agent_launch_entry(agent_id=AGENT_ID, *, structured=True, sync=False) -> dict:
+    """A parent tool_result launching a run_in_background Agent.
+
+    ``structured`` adds the entry-level ``toolUseResult`` (the version-robust
+    primary); ``sync`` makes it a synchronous-agent result (no async markers, no
+    ``agentId:`` text line) → must NOT recover.
+    """
+    if sync:
+        text = "Agent finished. Here is the final report: all done."
+        entry = {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "ta1", "content": text}
+                ]
+            },
+            "timestamp": "2026-06-17T08:00:00.000Z",
+        }
+        entry["toolUseResult"] = {"status": "completed", "isAsync": None}
+        return entry
+    text = (
+        f"Async agent launched successfully.\nagentId: {agent_id} "
+        "(internal ID - do not mention to user.)"
+    )
+    entry = {
+        "type": "user",
+        "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "ta1", "content": text}]
+        },
+        "timestamp": "2026-06-17T08:00:00.000Z",
+    }
+    if structured:
+        entry["toolUseResult"] = {
+            "status": "async_launched",
+            "isAsync": True,
+            "agentId": agent_id,
+        }
+    return entry
+
+
+def _agent_close_entry(agent_id=AGENT_ID) -> dict:
+    return _close_entry(task_id=agent_id)
+
+
+@pytest.mark.asyncio
+async def test_agent_state1_structured_async_launched_no_close_lifts(monitor, tmp_path):
+    """STATE 1 (structured): fresh agent-<id>.jsonl + a structured async launch +
+    NO close → the PLAIN bg key (no wf-task: prefix) is emitted to .launched."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    _agent_file(proj_dir)
+    _append(parent_jsonl, [_agent_launch_entry()])
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    activity = monitor.pop_sidechain_activity()
+    assert AGENT_ID in activity[PARENT].launched
+    assert f"wf-task:{AGENT_ID}" not in activity[PARENT].launched  # plain key, not wf
+
+
+@pytest.mark.asyncio
+async def test_agent_state1_prose_fallback_lifts(monitor, tmp_path):
+    """STATE 1 (prose fallback): no structured toolUseResult (older Claude Code),
+    only the ``agentId:`` text line → still recovers + lifts."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    _agent_file(proj_dir)
+    _append(parent_jsonl, [_agent_launch_entry(structured=False)])
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    activity = monitor.pop_sidechain_activity()
+    assert AGENT_ID in activity[PARENT].launched
+
+
+@pytest.mark.asyncio
+async def test_agent_state3_sync_agent_no_lift(monitor, tmp_path):
+    """STATE 3: a synchronous agent (no async markers, no agentId line) whose
+    sidechain file is fresh must NOT relight."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    _agent_file(proj_dir)
+    _append(parent_jsonl, [_agent_launch_entry(sync=True)])
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_state2_close_found_no_lift(monitor, tmp_path):
+    """STATE 2: a matching <task-notification> close → NO lift (finished pre-restart)."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    _agent_file(proj_dir)
+    _append(parent_jsonl, [_agent_launch_entry(), _agent_close_entry()])
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_unrecoverable_launch_no_lift(monitor, tmp_path):
+    """A fresh agent file whose launch is NOT in the parent JSONL → no lift."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    _agent_file(proj_dir)
+    # parent JSONL has no launch for this agent.
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_stale_mtime_no_lift(monitor, tmp_path):
+    """A stale agent file (mtime older than the fresh window) is not relit."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    p = _agent_file(proj_dir)
+    _append(parent_jsonl, [_agent_launch_entry()])
+    old = time.time() - (BG_AGENT_TTL_SECONDS + 60)
+    os.utime(p, (old, old))
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_pre_restart_tracked_still_lifts(monitor, tmp_path):
+    """THE dominant restart case: an Agent already TRACKED before the kickstart
+    (its sub:<parent>:agent-<id> key persisted in monitor_state) must STILL be
+    re-lit — the idempotency guard must NOT key on the persisted tracked_sessions
+    (the design-review break). Without the fix this stays dark."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    p = _agent_file(proj_dir)
+    _append(parent_jsonl, [_agent_launch_entry()])
+    # Simulate the agent having been tracked pre-restart (persisted offset).
+    monitor.state.update_session(
+        TrackedSession(
+            session_id=f"sub:{PARENT}:agent-{AGENT_ID}",
+            file_path=str(p),
+            last_byte_offset=0,
+            parent_session_id=PARENT,
+        )
+    )
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    activity = monitor.pop_sidechain_activity()
+    assert AGENT_ID in activity[PARENT].launched
+
+
+@pytest.mark.asyncio
+async def test_agent_corrupt_launch_line_fails_closed(monitor, tmp_path):
+    """A line carrying the agentId byte-prefilter marker but invalid JSON →
+    scan unreliable → no lift for the parent (a missed close could false-relight)."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    _agent_file(proj_dir)
+    with open(parent_jsonl, "a") as f:
+        f.write(
+            '{"type":"user","message":{"content":[{"type":"tool_result",'
+            '"content":"agentId: ' + AGENT_ID + '"}]}  <<CORRUPT\n'
+        )
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    assert monitor.pop_sidechain_activity() == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_and_workflow_coexist_one_pass(monitor, tmp_path):
+    """A parent with BOTH a fresh Workflow run AND a fresh plain Agent → both the
+    wf-task: key and the plain agent key lift from a single reconcile pass."""
+    parent_jsonl, proj_dir = _setup_parent(monitor, tmp_path)
+    wf = _wf_dir(proj_dir)
+    _make_fresh_agent_file(wf)
+    _agent_file(proj_dir)
+    _append(
+        parent_jsonl, [_launch_entry(_launch_text(proj_dir)), _agent_launch_entry()]
+    )
+    await monitor._reconcile_workflow_brackets_on_startup(_current_map())
+    activity = monitor.pop_sidechain_activity()
+    assert f"wf-task:{TASK_ID}" in activity[PARENT].launched
+    assert AGENT_ID in activity[PARENT].launched

@@ -546,6 +546,11 @@ class SessionMonitor:
     # blow the first sweep AND a parent's stale dirs never starve a fresh one.
     _RECONCILE_FRESH_WINDOW_S = 1800.0
     _RECONCILE_MAX_WF_DIRS = 16
+    # Fix #5: the same cap for plain ``run_in_background`` Agent sidechains
+    # (``subagents/agent-*.jsonl``) — bounds a pathological many-agent parent's
+    # first-sweep scan; applied to the FRESH candidates newest-first so a
+    # genuinely-live agent is never starved by many stale ones.
+    _RECONCILE_MAX_AGENT_FILES = 16
 
     async def _scan_workflow_launches_and_closes(
         self, jsonl_path: Path
@@ -657,12 +662,188 @@ class SessionMonitor:
             return {}, set(), False
         return launches, closes, reliable
 
+    async def _scan_agent_async_launches_and_closes(
+        self, jsonl_path: Path
+    ) -> tuple[set[str], set[str], bool]:
+        """Bounded full-scan of a parent JSONL for plain ``run_in_background``
+        Agent async-launches + closes (Fix #5). Returns ``(async_keys, closes,
+        reliable)`` where ``async_keys`` is the set of NORMALIZED async-launched
+        agent keys, ``closes`` the set of ``<task-notification>`` task-ids
+        (normalized — for a background Agent the task-id IS the agent key), and
+        ``reliable`` is False iff a prefiltered (potential launch/close) line
+        could not be parsed.
+
+        SEPARATE from ``_scan_workflow_launches_and_closes`` (a different byte
+        prefilter) so a malformed Agent line can never fail-close an unrelated
+        live Workflow, and vice-versa. STRUCTURED-PRIMARY (mirrors the Workflow
+        PR-2 precedent + the architecture doc's TUI-prose-drift warning): read
+        the entry-level ``toolUseResult`` via
+        ``response_builder.async_agent_launch_id_from_meta`` first, and fall
+        back to the prose ``agentId:`` line (``extract_async_agent_launch_id``)
+        ONLY when the structured field is absent (older Claude Code). Launch
+        recovery reads ONLY ``tool_result`` block text for the prose fallback
+        (a pasted ``agentId:`` line in a user ``text`` block must NOT recover);
+        close detection reads BOTH lanes. Fail-CLOSED on a malformed prefiltered
+        line / read error (a missed close would false-relight a completed
+        Agent)."""
+        async_keys: set[str] = set()
+        closes: set[str] = set()
+        reliable = True
+        from .handlers.response_builder import (
+            async_agent_launch_id_from_meta,
+            extract_async_agent_launch_id,
+            extract_task_notification_task_id,
+        )
+
+        def _tr_tx(entry: dict) -> tuple[list[str], list[str]]:
+            msg = entry.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            tr: list[str] = []
+            tx: list[str] = []
+            if isinstance(content, str):
+                tx.append(content)
+            elif isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    ctype = c.get("type")
+                    if ctype == "tool_result":
+                        tc = c.get("content")
+                        if isinstance(tc, str):
+                            tr.append(tc)
+                        elif isinstance(tc, list):
+                            for b in tc:
+                                if isinstance(b, dict) and isinstance(
+                                    b.get("text"), str
+                                ):
+                                    tr.append(b["text"])
+                    elif ctype == "text" and isinstance(c.get("text"), str):
+                        tx.append(c["text"])
+            return tr, tx
+
+        try:
+            async with aiofiles.open(jsonl_path, "rb") as f:
+                async for raw in f:
+                    has_agent = b"agentId" in raw
+                    has_notif = b"task-notification" in raw
+                    if not (has_agent or has_notif):
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        reliable = False
+                        continue
+                    if not isinstance(entry, dict):
+                        reliable = False
+                        continue
+                    if has_agent:
+                        # STRUCTURED-PRIMARY: the entry-level toolUseResult.
+                        aid = async_agent_launch_id_from_meta(
+                            entry.get("toolUseResult")
+                        )
+                        if aid is None:
+                            # PROSE FALLBACK (older Claude Code): the agentId:
+                            # line, ONLY from tool_result block text.
+                            tr_texts, _ = _tr_tx(entry)
+                            for text in tr_texts:
+                                aid = extract_async_agent_launch_id(text)
+                                if aid:
+                                    break
+                        if aid:
+                            async_keys.add(normalize_background_agent_key(aid))
+                    if has_notif:
+                        tr_texts, tx_texts = _tr_tx(entry)
+                        for text in tr_texts + tx_texts:
+                            tid = extract_task_notification_task_id(text)
+                            if tid:
+                                closes.add(normalize_background_agent_key(tid))
+        except OSError:
+            return set(), set(), False
+        return async_keys, closes, reliable
+
+    async def _reconcile_agents_for_parent(
+        self, session_id: str, jsonl_path: Path, now: float
+    ) -> int:
+        """Fix #5: re-light a still-running plain ``run_in_background`` Agent for
+        ONE parent after a kickstart. STAT-globs ``subagents/agent-*.jsonl``
+        (non-recursive — Workflow sub-agents at ``subagents/workflows/wf_*/`` are
+        a different glob and never picked up here), and for any agent file whose
+        mtime is within ``_RECONCILE_FRESH_WINDOW_S`` recovers the async-launch +
+        close state from ONE bounded parent-JSONL scan and applies the SAME
+        three-state rule as the Workflow path:
+
+          STATE 1: file fresh + agentId in the async-launch set + NO close →
+            emit the PLAIN ``<agentId>`` launched key (the bot fan-out seeds the
+            parent route IDLE + lifts it to projected RUNNING). NO bracket is
+            opened — the live ↳ display + steady-state keep-alive already run
+            every tick via ``check_sidechain_updates``'s top-level
+            ``subagents.glob("agent-*.jsonl")`` (which resumes from the persisted
+            monitor_state offset / first-sees at EOF → no reflood).
+          STATE 2: agentId in the ``<task-notification>`` close set → NO lift.
+          STATE 3: agentId NOT async-launched (synchronous / unrecoverable) → NO
+            lift (fail-closed; the structured/prose discriminator is the
+            positive-proof gate, analogous to the Workflow validated dir).
+
+        Returns the count of lifted agents. NO persisted-``tracked_sessions``
+        idempotency skip: an Agent ALREADY tracked before the kickstart (the
+        dominant restart case) MUST still re-light — its launched key + seed are
+        idempotent, and no-reflood is handled by EOF/offset registration in the
+        display path (the design-review break: keying idempotency on the
+        persisted ``tracked_sessions`` would skip exactly that common case)."""
+        sub_dir = jsonl_path.parent / session_id / "subagents"
+        if not sub_dir.is_dir():
+            return 0
+        try:
+            agent_files = [f for f in sub_dir.glob("agent-*.jsonl") if f.is_file()]
+        except OSError:
+            return 0
+        fresh_with_ts: list[tuple[Path, float]] = []
+        for f in agent_files:
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime <= 0.0 or (now - mtime) > self._RECONCILE_FRESH_WINDOW_S:
+                continue
+            fresh_with_ts.append((f, mtime))
+        if not fresh_with_ts:
+            return 0  # STAT-only cost bound: scan ONLY when a fresh file exists
+        fresh_with_ts.sort(key=lambda t: t[1], reverse=True)  # newest first
+        fresh = [f for f, _ in fresh_with_ts[: self._RECONCILE_MAX_AGENT_FILES]]
+        (
+            async_keys,
+            closes,
+            reliable,
+        ) = await self._scan_agent_async_launches_and_closes(jsonl_path)
+        if not reliable:
+            # A malformed prefiltered line → a close may be MISSED → fail closed
+            # (mirror the Workflow scan: prefer dark over a false relight).
+            return 0
+        relit = 0
+        for f in fresh:
+            key = normalize_background_agent_key(f.stem)
+            if key not in async_keys:
+                continue  # STATE 3: not async-launched → fail-closed, no lift
+            if key in closes:
+                continue  # STATE 2: finished pre-restart → no lift
+            # STATE 1: live → emit the plain launched key (the bot fan-out seeds
+            # + lifts). NO tracked_sessions guard (see docstring).
+            self._parent_activity(session_id).launched.add(key)
+            relit += 1
+        return relit
+
     async def _reconcile_workflow_brackets_on_startup(
         self, current_map: dict[str, str]
     ) -> None:
         """Re-arm a still-running Workflow's busy lift (typing + 🟡 + ↳) from the
         FILESYSTEM after a ``launchctl kickstart`` wiped the in-memory brackets /
         background_agents (PR-1 Half B). The owner's highest-frequency symptom.
+
+        Fix #5: ALSO re-lights plain ``run_in_background`` Agents
+        (``subagents/agent-*.jsonl``, one level UP from the Workflow shape) via
+        ``_reconcile_agents_for_parent`` — called for EVERY parent, independent
+        of the Workflow block below, using the structured-primary async-launch
+        discriminator + the same three-state fail-closed rule.
 
         For each tracked parent with NO live open bracket, STAT-glob
         ``<project>/<parent_sid>/subagents/workflows/wf_*`` (anchored, never
@@ -695,14 +876,22 @@ class SessionMonitor:
             for session_id in current_map.values():
                 if session_id.startswith("sub:"):
                     continue
-                if self._open_workflow_brackets.get(session_id):
-                    continue  # idempotency: a live bracket already drives the lift
                 tracked = self.state.get_session(session_id)
                 if tracked is None or not tracked.file_path:
                     continue
                 jsonl_path = Path(tracked.file_path)
                 if not jsonl_path.exists():
                     continue
+                # ── Fix #5: re-light plain run_in_background Agents
+                # (subagents/agent-*.jsonl). Runs for EVERY parent, INDEPENDENT
+                # of the Workflow block + its idempotency continue below (a
+                # parent may have a plain Agent and no Workflow, or both).
+                relit += await self._reconcile_agents_for_parent(
+                    session_id, jsonl_path, now
+                )
+                # ── Workflow reconcile (PR-1 Half B) ──
+                if self._open_workflow_brackets.get(session_id):
+                    continue  # idempotency: a live bracket already drives the lift
                 wf_root = jsonl_path.parent / session_id / "subagents" / "workflows"
                 try:
                     wf_dirs = [d for d in wf_root.glob("wf_*") if d.is_dir()]

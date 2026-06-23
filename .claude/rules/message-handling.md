@@ -210,10 +210,47 @@ lifecycle: unlinked per the mark result, on session replacement / `/clear`
 `is_live_session` conservative-skip. Pull-only; no observer (c313657 stays
 forbidden).
 
+**Fix #1 — `BG_RUNNING`: a background-agent heartbeat clears a §3.6
+projected-busy 🔔 (the dominant 30-min typing-dark strand).** When the PARENT
+foreground is idle and the only live work is a background agent, the §3.6
+commit (`mark_notification_pending` on stored-idle + a live bg key) lights 🔔
+and `typing_eligible` goes False — but the fast `PANE_RUNNING` clear requires
+the PARENT pane observed RUNNING, which never happens (parent idle), so the
+bit strands for the full 30-min TTL while the agent demonstrably works
+(verified: route @4, 🔔 17:42→18:12 ttl-expiry, agent sidechain writing
+throughout). Fix: `mark_background_agent_activity` clears the bit on a
+heartbeat that is positive proof THAT agent's bg work resumed — the background
+analogue of `PANE_RUNNING` (new reason `NotificationClearReason.BG_RUNNING`),
+scoped by FOUR conjunctive gates: (1) **shape** — stored `run_state` is
+`IDLE_RECENT`/`IDLE_CLEARED` (the §3.6 commit leaves stored state idle), so a
+transcript- or pane-set WAITING and the foreground Workflow-approval
+`RUNNING_TOOL` 🔔 are NEVER touched; (2) **sole-live-plain-key** — the live bg
+set is EXACTLY the heartbeating key AND it is a plain `run_in_background` Agent
+(not `wf-task:`). The 🔔 is a single route-level bit
+with NO per-agent linkage, so a heartbeat is resume-proof ONLY for its own
+agent; with >1 live key — sibling plain Agents, OR a Workflow whose DIR-WIDE
+`*.jsonl` mtime collapses all its sub-agents to one key — a sibling's write
+could clear a 🔔 that may be ANOTHER agent's genuine decision, so it FAILS CLOSED
+(hermes review P1); (3) **strict-newer** `event_ts > notification_set_at` (a
+buffered pre-notification flush fails closed, mirrors
+`_maybe_clear_notification_by_ts`); (4) **margin** `_wall_now() > set_at +
+NOTIFY_BG_CLEAR_MARGIN_S` (1.5s, the bg analogue of `NOTIFY_PANE_CLEAR_MARGIN_S`;
+a same-tick pre-prompt frame fails closed). Stored state stays idle; the
+projection (rule 3, live bg key) lifts the next freeze to RUNNING → typing on.
+`_reconcile_decision_card` dismisses the audible card on `BG_RUNNING` (the
+agent resumed) exactly like `PANE_RUNNING`. **Accepted residual (safety-bounded):
+a 🔔 on a route with >1 live background agent (multiple plain Agents, or any
+Workflow) is held to the 30-min TTL** — the runtime can't bind the route-level
+🔔 to a specific agent (no per-agent linkage; the `kind` field is unreliable), so
+it conservatively never auto-clears when the live set is ambiguous (the prompt
+stays discoverable on the pane). Pull-only; no observer (c313657 stays
+forbidden).
+
 **Notification clear-reason channel + durable decision card (ISSUE-5 Fix
 3a/3b/3c/3d).** Every `notification_pending` True→False transition stamps a
 typed `NotificationClearReason` (`USER` / `TOOL_RESULT` / `END_OF_TURN` /
-`TASK_NOTIFICATION` / `INVARIANT` / `PANE_RUNNING` / `TTL` / `TEARDOWN`),
+`TASK_NOTIFICATION` / `INVARIANT` / `PANE_RUNNING` / `BG_RUNNING` / `TTL` /
+`TEARDOWN`),
 surfaced on the snapshot as `notification_clear_reason` (`_clear_notification_in_place`
 takes a REQUIRED `reason`; `mark_notification_cleared(route, *, reason)` — the
 poller passes `TTL` / `PANE_RUNNING`; reset to None on each fresh commit). The
@@ -386,6 +423,30 @@ offset and a first-seen post-restart file starts at EOF
 (`_track_and_emit_sidechain_file`), so pre-restart ↳ blocks never replay. The
 steady-state idle-route re-scan (B3b) is deferred — the startup pass covers the
 post-kickstart symptom. Pull-only; no observer.
+
+**Fix #5 — the reconciler ALSO re-lights plain `run_in_background` Agents.** PR-1
+Half B covered only Workflows (`subagents/workflows/wf_*`); a plain background
+Agent (sidechain `subagents/agent-*.jsonl`, one level UP) ran dark across a
+kickstart. `_reconcile_agents_for_parent(session_id, jsonl_path, now)` runs for
+EVERY tracked parent (independent of the Workflow block + its bracket-idempotency
+continue): STAT-glob `subagents/agent-*.jsonl` (non-recursive — Workflow
+sub-agents are a different glob), fresh-mtime filter (`_RECONCILE_FRESH_WINDOW_S`)
++ a `_RECONCILE_MAX_AGENT_FILES` (16) cap newest-first, then ONE bounded parent
+scan (`_scan_agent_async_launches_and_closes`, a SEPARATE `b"agentId"` byte
+prefilter so a malformed Agent line can't fail-close an unrelated Workflow).
+**STRUCTURED-PRIMARY discriminator** (`response_builder.async_agent_launch_id_from_meta`
+reads the entry-level `toolUseResult` `{status:"async_launched", isAsync:True,
+agentId}` — version-robust, mirrors the Workflow PR-2 precedent + the TUI-drift
+warning), with the prose `agentId:` line (`extract_async_agent_launch_id`, tool_result
+lane only) as FALLBACK. **Three-state** (mirrors Workflow): STATE 1 fresh + agentId
+in the async-launch set + NO `<task-notification>` close → emit the PLAIN `<agentId>`
+launched key (the bot fan-out seeds the route IDLE + lifts to projected RUNNING; NO
+bracket — the live ↳ + keep-alive already run via the top-level agent glob); STATE 2
+close found → no lift; STATE 3 not async-launched (sync / unrecoverable) → no lift
+(fail-closed). **NO persisted-`tracked_sessions` idempotency skip** (the design-review
+break): an Agent already tracked before the kickstart is the DOMINANT case and MUST
+re-light — the launched key + seed are idempotent and no-reflood is handled by the
+display path's EOF/offset registration. Pull-only; no observer.
 
 **Fix 5 (ISSUE-6 owner decision #2 — SHIPPED): the `↳` sub-agent DISPLAY cards
 for Workflow sidechains.** A Workflow's sub-agents live one level deeper at

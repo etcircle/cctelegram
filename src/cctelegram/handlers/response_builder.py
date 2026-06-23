@@ -83,6 +83,32 @@ def extract_async_agent_launch_id(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def async_agent_launch_id_from_meta(meta: object) -> str | None:
+    """Extract a plain ``run_in_background`` Agent's ``agentId`` from the
+    STRUCTURED entry-level ``toolUseResult`` (Fix #5 — the version-robust
+    PRIMARY anchor; ``extract_async_agent_launch_id`` prose regex is the
+    fallback, mirroring the Workflow PR-2 structured-primary pattern).
+
+    ``meta`` is the raw JSONL ``toolUseResult`` dict (or ``None`` / a non-dict).
+    Returns the raw agentId (no ``agent-`` prefix — normalize before keying) or
+    ``None`` when ``meta`` is not a plain-Agent ``async_launched`` result.
+
+    Discrimination (verified on real di-copilot data): a plain async Agent
+    carries ``{status: "async_launched", isAsync: True, agentId: <hex>}``; a
+    WORKFLOW launch ALSO carries ``status == "async_launched"`` but ``agentId``
+    is absent/None (it uses ``taskId``/``runId``); a SYNCHRONOUS agent carries
+    ``status == "completed"`` and no ``agentId``. So we require ALL of
+    ``status == "async_launched"`` + ``isAsync is True`` + a non-empty
+    ``agentId`` — excluding both Workflows and sync agents.
+    """
+    if not isinstance(meta, dict):
+        return None
+    if meta.get("status") != "async_launched" or meta.get("isAsync") is not True:
+        return None
+    aid = meta.get("agentId")
+    return aid if isinstance(aid, str) and aid else None
+
+
 # The Workflow-tool launch discriminator (ISSUE-6 / Fix 2a). DIFFERENT shape
 # from the Agent/Task ``agentId:`` launch — verified against 34 real launches:
 # the Task ID is MID-LINE ("Workflow launched in background. Task ID: <id>"),

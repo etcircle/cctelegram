@@ -28,10 +28,13 @@ import pytest
 from cctelegram import route_runtime
 from cctelegram.route_runtime import (
     BG_AGENT_TTL_SECONDS,
+    NotificationClearReason,
     NotificationMarkResult,
     RunState,
     TranscriptLifecycleEvent,
 )
+
+WF_KEY = "wf-task:wrnmrbn3s"
 
 ROUTE: route_runtime.Route = (1, 42, "@7")
 KEY = "a1b2c3d4e5f6a7b89"
@@ -683,3 +686,160 @@ async def test_seed_idle_respects_done_tombstone():
     snap = await route_runtime.seed_idle_and_mark_background_agent_launched(ROUTE, KEY)
     assert snap.background_agents == ()  # tombstone holds → no lift
     assert snap.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+
+
+# ── Fix #1: bg-heartbeat clears a §3.6 projected-busy notification ──────────
+# (the dominant 30-min typing-dark strand — a background agent works while the
+# parent is idle, so the poller's PANE_RUNNING clear can never fire and only
+# the 30-min TTL clears the 🔔. A PLAIN background-agent heartbeat strictly
+# after set_at is positive proof the bg work resumed → clear, scoped HARD to
+# routes with NO live Workflow `wf-task:` key so a genuine Workflow Bash-
+# approval gate is never auto-dismissed.)
+
+_MARGIN = (
+    route_runtime.NOTIFY_BG_CLEAR_MARGIN_S
+    if hasattr(route_runtime, "NOTIFY_BG_CLEAR_MARGIN_S")
+    else 1.5
+)
+
+
+async def _idle_with_committed_bg_notification(
+    key: str = KEY,
+    *,
+    end_ts: float = T0 + 5,
+    evt_ts: float = T0 + 8,
+    set_at: float = T0 + 10,
+) -> None:
+    """Drive ROUTE to: stored-idle + a live bg key + a §3.6-committed 🔔.
+
+    All on the wall-clock T0 scale so the event_ts↔set_at strict-newer
+    comparison is meaningful (in production both are epoch seconds; the harness
+    otherwise mixes small JSONL stamps with huge wall stamps)."""
+    await _idle_transcript(end_ts=end_ts)
+    await route_runtime.mark_background_agent_activity(ROUTE, key, evt_ts)
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=set_at, generation="g1"
+    )
+    assert result is NotificationMarkResult.COMMITTED_LIVE
+    snap = route_runtime.snapshot(ROUTE)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+    assert snap.typing_eligible is False
+
+
+async def test_bg_committed_notification_cleared_by_newer_plain_agent_heartbeat(
+    monkeypatch,
+):
+    """RED pre-fix: the §3.6 idle('transcript') heartbeat falls through the
+    no-op branches and the bit holds to TTL. Post-fix: a plain heartbeat after
+    set_at+margin clears it (reason BG_RUNNING) → projected RUNNING + typing."""
+    await _idle_with_committed_bg_notification()
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 20)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 15)
+    assert snap.notification_pending is False
+    assert snap.notification_clear_reason is NotificationClearReason.BG_RUNNING
+    assert snap.run_state is RunState.RUNNING
+    assert snap.typing_eligible is True
+
+
+async def test_bg_heartbeat_within_margin_does_not_clear(monkeypatch):
+    """A heartbeat observed within NOTIFY_BG_CLEAR_MARGIN_S of set_at must NOT
+    clear (mirrors the pane-running margin — guards a same-tick pre-prompt frame)."""
+    await _idle_with_committed_bg_notification(set_at=T0 + 10)
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 10 + _MARGIN / 2)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 11)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+
+
+async def test_buffered_pre_notification_bg_heartbeat_preserves_bit(monkeypatch):
+    """A heartbeat whose event_ts is NOT strictly newer than set_at (an older
+    buffered flush) must NOT clear, even when observed past the margin."""
+    await _idle_with_committed_bg_notification(set_at=T0 + 10)
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 20)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 10)
+    assert snap.notification_pending is True
+    # And a None event_ts (parse failure) also fails closed.
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, None)
+    assert snap.notification_pending is True
+
+
+async def test_wf_task_committed_notification_not_cleared_by_heartbeat(monkeypatch):
+    """SAFETY: a route whose live bg key is a Workflow `wf-task:` key must NOT
+    have its §3.6 🔔 auto-cleared — the dir-wide heartbeat collapses all the
+    Workflow's sub-agents, so a sibling's write must never dismiss what may be
+    one sub-agent's genuine Bash-approval gate."""
+    await _idle_with_committed_bg_notification(key=WF_KEY)
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 20)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, WF_KEY, T0 + 15)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+
+
+async def test_mixed_route_plain_heartbeat_held_when_wf_task_live(monkeypatch):
+    """A route with BOTH a plain Agent key AND a live Workflow key: a plain
+    heartbeat must NOT clear (a live wf-task key could harbor a blocked gate)."""
+    await _idle_transcript(end_ts=T0 + 5)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 8)
+    await route_runtime.mark_background_agent_activity(ROUTE, WF_KEY, T0 + 8)
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=T0 + 10, generation="g1"
+    )
+    assert result is NotificationMarkResult.COMMITTED_LIVE
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 20)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 15)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+
+
+async def test_stored_waiting_notification_not_cleared_by_bg_heartbeat(monkeypatch):
+    """A foreground Workflow-approval 🔔 (stored RUNNING_TOOL → WAITING via the
+    bit) must NOT be cleared by a bg heartbeat — the shape gate requires stored
+    IDLE, so the ISSUE-5 foreground contract is fully preserved."""
+    await route_runtime.ingest_transcript_event(
+        ROUTE, _evt("assistant", "tool_use", tool_use_id="t1", tool_name="Bash")
+    )
+    assert _st().run_state is RunState.RUNNING_TOOL
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=T0 + 10, generation="g1"
+    )
+    assert result is NotificationMarkResult.COMMITTED_LIVE
+    assert route_runtime.snapshot(ROUTE).run_state is RunState.WAITING_ON_USER
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 20)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 15)
+    assert snap.notification_pending is True
+    assert snap.run_state is RunState.WAITING_ON_USER
+
+
+async def test_sibling_plain_heartbeat_holds_notification(monkeypatch):
+    """SAFETY (hermes P1): with TWO live plain Agents, a heartbeat from one
+    (KEY2) must NOT clear a 🔔 that may belong to the other (KEY1) — the bit has
+    no per-agent linkage, so the clear fails closed unless the live set is the
+    single heartbeating key."""
+    await _idle_transcript(end_ts=T0 + 5)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 8)
+    await route_runtime.mark_background_agent_activity(ROUTE, KEY2, T0 + 8)
+    result = await route_runtime.mark_notification_pending(
+        ROUTE, set_at=T0 + 10, generation="g1"
+    )
+    assert result is NotificationMarkResult.COMMITTED_LIVE
+    monkeypatch.setattr(route_runtime, "_wall_now", lambda: T0 + 20)
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY2, T0 + 15)
+    assert snap.notification_pending is True  # held — sibling proof is not enough
+    assert snap.run_state is RunState.WAITING_ON_USER
+
+
+async def test_no_live_bg_key_holds_notification(monkeypatch):
+    """If the only bg key has expired (no live bg work), TTL still owns the bit:
+    a heartbeat whose own key fails the idle re-record qualification leaves the
+    live set empty, so the singleton gate cannot clear."""
+    await _idle_with_committed_bg_notification(set_at=T0 + 10)
+    # Jump the wall clock past the BG_AGENT_TTL so the recorded key expires, and
+    # send an OLDER event_ts so the NEW-key idle re-record qualification fails
+    # (event_ts must exceed last_assistant_turn_ended_at = T0+5).
+    monkeypatch.setattr(
+        route_runtime, "_wall_now", lambda: T0 + BG_AGENT_TTL_SECONDS + 5
+    )
+    snap = await route_runtime.mark_background_agent_activity(ROUTE, KEY, T0 + 4)
+    assert snap.notification_pending is True
+    assert snap.notification_clear_reason is not NotificationClearReason.BG_RUNNING

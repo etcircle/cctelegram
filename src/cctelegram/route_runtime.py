@@ -198,6 +198,15 @@ _TURN_END_REASONS = TURN_END_REASONS  # internal alias (historic name)
 # internal tool call exceeds the TTL. Product value, mirrors NOTIFY_TTL_SECONDS.
 BG_AGENT_TTL_SECONDS = 1800.0
 
+# A background-agent key carrying this prefix is a Workflow run (``wf-task:<id>``,
+# normalize_background_agent_key keeps it verbatim). Its heartbeat is a DIR-WIDE
+# ``*.jsonl`` mtime that collapses ALL the Workflow's sub-agents to one key, so a
+# sibling sub-agent's write must NEVER auto-clear a §3.6 notification that may be
+# another sub-agent's genuine Bash-approval gate (the Fix #1 safety gate). A bare
+# (non-prefixed) key is a plain ``run_in_background`` Agent — its heartbeat is its
+# OWN sidechain, so it is safe positive-resume proof.
+_WF_TASK_KEY_PREFIX = "wf-task:"
+
 
 @dataclass
 class _BgAgent:
@@ -235,6 +244,16 @@ _EARLY_RESULTS_CAP = 128
 # strand 🔔 past the TTL (v4 fix 2 strand-proofing).
 NOTIFY_TTL_SECONDS = 1800.0
 
+# Margin a background-agent heartbeat must clear ``notification_set_at`` by
+# before it retracts a §3.6 projected-busy notification (the BG_RUNNING clear,
+# Fix #1) — the background analogue of ``status_polling.NOTIFY_PANE_CLEAR_MARGIN_S``
+# (the pane-running clear the idle parent pane structurally can't reach). Defined
+# HERE, not imported from handlers/, because route_runtime is the lower layer
+# (importing status_polling would be an import cycle); a future tune of one
+# should consider the other. Keeps a same-tick capture of a pre-notification
+# frame from clearing early.
+NOTIFY_BG_CLEAR_MARGIN_S = 1.5
+
 
 class NotificationMarkResult(Enum):
     """Outcome of ``mark_notification_pending`` — drives the CALLER's
@@ -271,6 +290,16 @@ class NotificationClearReason(Enum):
         (also the narration text/thinking invariant-only clear, Fix 1).
       - ``PANE_RUNNING`` — the poller observed the pane RUNNING sufficiently
         after set_at (the user acted in the terminal).
+      - ``BG_RUNNING`` — a PLAIN background-agent heartbeat strictly newer than
+        set_at retracted a §3.6 projected-busy 🔔 (Fix #1; the background
+        analogue of ``PANE_RUNNING`` the idle parent pane can't reach — the
+        agent demonstrably resumed writing its sidechain). Scoped to the case
+        where the heartbeating key is the route's SOLE live background key and a
+        plain Agent (not ``wf-task:``): the 🔔 has no per-agent linkage, so a
+        heartbeat is resume-proof only for its own agent — with >1 live key
+        (sibling plain Agents, or a Workflow whose dir-wide mtime collapses its
+        sub-agents) it fails closed so a genuine pending decision is never
+        auto-dismissed by a sibling's write (hermes review P1).
       - ``TTL`` — the runtime-state TTL elapsed.
       - ``TEARDOWN`` — session reset / route teardown.
     """
@@ -281,6 +310,7 @@ class NotificationClearReason(Enum):
     TASK_NOTIFICATION = "task_notification"
     INVARIANT = "invariant"
     PANE_RUNNING = "pane_running"
+    BG_RUNNING = "bg_running"
     TTL = "ttl"
     TEARDOWN = "teardown"
 
@@ -1517,6 +1547,53 @@ async def mark_background_agent_activity(
                 key,
                 event_ts,
             )
+        # ── Fix #1: BG_RUNNING notification clear ────────────────────
+        # A PLAIN background-agent heartbeat strictly after set_at is positive
+        # proof the bg work RESUMED — the background analogue of the poller's
+        # PANE_RUNNING clear, which the idle parent pane structurally cannot
+        # reach (the parent pane is idle when only a bg agent works, so the
+        # §3.6 🔔 would otherwise strand for the full 30-min TTL — the verified
+        # acef incident: typing dark 30 min while the agent wrote continuously).
+        # Scoped HARD: (1) the §3.6 shape — stored IDLE with a committed
+        # notification (so a transcript- or pane-set WAITING, both stored
+        # non-idle, and the foreground Workflow-approval RUNNING_TOOL case are
+        # NEVER touched); (2) the heartbeating key is the route's SOLE live
+        # background key AND is a PLAIN Agent (not ``wf-task:``). The 🔔 is a
+        # single route-level bit with NO per-agent linkage, so a heartbeat is
+        # positive-resume proof ONLY for the agent it came from — with >1 live
+        # key (multiple plain Agents, or any Workflow whose dir-wide mtime
+        # collapses its sub-agents) a sibling's write could clear a 🔔 that may
+        # be ANOTHER agent's genuine decision, so we FAIL CLOSED unless the live
+        # set is exactly ``(key,)`` (hermes review P1); (3) strict-newer
+        # event_ts (mirrors _maybe_clear_notification_by_ts — a buffered
+        # pre-notification flush fails closed) + (4) an observation margin
+        # (mirrors NOTIFY_PANE_CLEAR_MARGIN_S — a same-tick pre-prompt frame
+        # fails closed). Stored state stays IDLE; the projection (rule 3, live
+        # bg key) lifts the next freeze to RUNNING. Placed BEFORE the heartbeat
+        # branches so it runs for the idle('transcript') shape that falls
+        # through all of them. Residual (safety-bounded): a route with >1 live
+        # background agent holds its parent-idle 🔔 to the TTL.
+        if (
+            st.notification_pending
+            and st.notification_set_at is not None
+            and st.run_state in (RunState.IDLE_RECENT, RunState.IDLE_CLEARED)
+            and event_ts is not None
+            and event_ts > st.notification_set_at
+            and _wall_now() > st.notification_set_at + NOTIFY_BG_CLEAR_MARGIN_S
+        ):
+            live_bg = _live_background_keys(st)
+            if live_bg == (key,) and not key.startswith(_WF_TASK_KEY_PREFIX):
+                logger.info(
+                    "notification_pending cleared reason=bg-running route=%s "
+                    "set_at=%s key=%s event_ts=%s",
+                    route,
+                    st.notification_set_at,
+                    key,
+                    event_ts,
+                )
+                _clear_notification_in_place(
+                    st, reason=NotificationClearReason.BG_RUNNING
+                )
         # ── heartbeat (ported Wave A) ────────────────────────────────
         st.last_event_at = _now()
         if st.run_state is RunState.WAITING_ON_USER:
