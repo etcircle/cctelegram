@@ -23,9 +23,13 @@ from cctelegram.md_capture import (
     select_fresh_prose,
 )
 from cctelegram.session_monitor import NewMessage, filter_live_prose_duplicates
+from cctelegram.transcript_parser import BLOCK_ORIGIN_EXIT_PLAN
 
 _SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 _PROSE = "SQLite is a zero config serverless embedded relational database"
+_PLAN = (
+    "# Plan: add a docs/README.md index\n\n## Context\n\nThe docs dir lacks an index."
+)
 
 
 @pytest.fixture
@@ -409,6 +413,79 @@ def test_dedup_requires_interactive_tool_use_in_group(cc_dir):
     ]
     out = filter_live_prose_duplicates(batch)
     assert any(m.content_type == "text" for m in out)
+
+
+# ── EPM plan-body dedup (the plan-before-card fix) ───────────────────────────
+
+
+def _mark_epm_plan(session_id: str, plan_text: str) -> None:
+    md_capture.record_epm_plan_shown_live(
+        session_id, norm_hash=prose_norm_hash(plan_text), shown_at=1.0
+    )
+
+
+def test_epm_plan_dedup_suppresses_synthetic_block(cc_dir):
+    # RED before the session_monitor EPM arm: the synthetic BLOCK_ORIGIN_EXIT_PLAN
+    # block (block_origin != None) was EXCLUDED from dedup, so the plan
+    # double-posted after the card. With the arm + a recorded marker it is
+    # suppressed (consume-once), the ExitPlanMode tool_use survives.
+    _mark_epm_plan(_SID, _PLAN)
+    batch = [
+        _nm(
+            text=_PLAN,
+            content_type="text",
+            message_id="MID",
+            block_origin=BLOCK_ORIGIN_EXIT_PLAN,
+        ),
+        _nm(
+            text="**ExitPlanMode**",
+            content_type="tool_use",
+            message_id="MID",
+            tool_name="ExitPlanMode",
+        ),
+    ]
+    out = filter_live_prose_duplicates(batch)
+    assert [m.content_type for m in out] == ["tool_use"]
+    assert md_capture.read_epm_plan_shown_live_markers(_SID) == []  # consumed
+
+
+def test_epm_plan_dedup_no_marker_keeps_plan(cc_dir):
+    # No marker (plan was never posted before the card — e.g. file gone) → the
+    # JSONL plan copy MUST still deliver post-resolution (no silent loss).
+    batch = [
+        _nm(
+            text=_PLAN,
+            content_type="text",
+            message_id="MID",
+            block_origin=BLOCK_ORIGIN_EXIT_PLAN,
+        ),
+        _nm(
+            text="**ExitPlanMode**",
+            content_type="tool_use",
+            message_id="MID",
+            tool_name="ExitPlanMode",
+        ),
+    ]
+    out = filter_live_prose_duplicates(batch)
+    assert any(m.block_origin == BLOCK_ORIGIN_EXIT_PLAN for m in out)
+
+
+def test_epm_plan_marker_does_not_suppress_real_prose(cc_dir):
+    # A REAL prose block (block_origin None) with the SAME text/hash as the EPM
+    # marker must SURVIVE — the EPM arm only eats synthetic blocks; the two
+    # marker kinds never cross-match.
+    _mark_epm_plan(_SID, _PLAN)
+    batch = [
+        _nm(text=_PLAN, content_type="text", message_id="MID", block_origin=None),
+        _nm(
+            text="**ExitPlanMode**",
+            content_type="tool_use",
+            message_id="MID",
+            tool_name="ExitPlanMode",
+        ),
+    ]
+    out = filter_live_prose_duplicates(batch)
+    assert any(m.content_type == "text" and m.block_origin is None for m in out)
 
 
 def test_dedup_identical_text_different_message_id_not_suppressed(cc_dir):

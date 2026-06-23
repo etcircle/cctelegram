@@ -801,6 +801,43 @@ log a miss-classification line (`no_session` / `card_exists` / `capture_absent`
 / `not_before_reject` / `ttl_and_anchor_reject` / `empty_text` /
 `already_shown_live`) so the next miss is diagnosable (PR-1 A6).
 
+**Late-finalize stream-wait.** `_maybe_post_live_prose`'s base catch-up budget
+is 250ms (`_LIVE_PROSE_RETRY_BUDGET_S`); the common clean case finalizes prose
+BEFORE the picker is detected, so the first read hits. If the budget expires
+with no finalized prose AND `md_capture.is_prose_streaming(session_id)` is True
+(a message has deltas, no `final` yet, and its LATEST delta is within an 8s
+recency window — the latest-delta anchor keeps a long stream live while a
+crash-orphan ages out), the wait extends ONCE by
+`_LIVE_PROSE_STREAM_WAIT_BUDGET_S` (3.0s) so a prose finalizing mid-stream still
+posts BEFORE the card. A prose-less picker (no streaming) bails at the base
+budget (zero added delay); a never-finalizing stream degrades to today's miss on
+expiry (card created, JSONL delivers) — never hangs, never churns, pull-only.
+
+**ExitPlanMode plan body BEFORE the card.** The EPM card carries no plan text
+(only "Claude has written up a plan … proceed?" + options + a `ctrl+g … ·
+~/.claude/plans/<slug>.md` footer), and the plan BODY is the tool's `input.plan`
+— a synthetic `BLOCK_ORIGIN_EXIT_PLAN` text block buffered in JSONL until
+resolution — so the user used to approve blind and get the plan AFTER. Fix:
+`interactive_ui._maybe_post_epm_plan` (called from `handle_interactive_ui` AFTER
+`_maybe_post_live_prose`, BEFORE the card, under the route lock → ordering
+findings→plan→card) posts a "📋 Plan" message before the picker. The plan text
+is `tool_input.plan` (replay) or, for a LIVE pane card (`tool_input` None), read
+from the `~/.claude/plans/<slug>.md` file named in the pane footer
+(`terminal_parser.extract_epm_plan_file_path`, footer-line-anchored; the read is
+path-traversal-guarded to `~/.claude/plans/` + `asyncio.to_thread`). Idempotent
+across poll re-renders + restart via an `md_capture` marker keyed by the plan's
+`prose_norm_hash` (`record/was/read/consume_epm_plan_shown_live`, stored in the
+same per-session NDJSON so `teardown_session` reclaims it). The post-resolution
+JSONL copy is suppressed by a SECOND arm in
+`session_monitor.filter_live_prose_duplicates` that aggregates the
+`BLOCK_ORIGIN_EXIT_PLAN` block, hashes it via the SAME `prose_norm_hash` (the
+plan-file text normalize-equals `input.plan` — mint/validate parity), and
+matches the SEPARATE `epm_plan_shown_live` marker (never cross-matches real
+prose; >1 group sharing a marker suppresses none). FAIL-OPEN: a hash mismatch /
+missing file only fails to suppress (benign double-post) or skips the pre-post
+(plan via JSONL) — never a wrong/lost post, never a crash. Pull-only; no
+observer.
+
 **Emission-anchor freshness — the additive-OR (PR-1, the dominant-miss fix).**
 The original freshness was render-time `now` only: `now - final_at <= TTL`
 (`AUQ_PROSE_TTL_S` 8s / `EPM_PROSE_TTL_S` 12s). The baked-in premise that "the

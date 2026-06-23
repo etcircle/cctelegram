@@ -245,6 +245,57 @@ class TestIsProseStreaming:
         assert is_prose_streaming(_SID, now=self.NOW) is False
 
 
+class TestEpmPlanMarkers:
+    """The plan-before-card dedup bridge: markers keyed by the plan's norm_hash
+    (a plan has no MessageDisplay message id), in the per-session NDJSON so they
+    share the capture lifecycle + survive a restart."""
+
+    def test_lifecycle_record_read_consume(self, cc_dir):
+        nh = md_capture.prose_norm_hash("# Plan\n\nbody")
+        md_capture.record_epm_plan_shown_live("s1", norm_hash=nh, shown_at=1.0)
+        assert md_capture.was_epm_plan_shown_live("s1", nh) is True
+        assert len(md_capture.read_epm_plan_shown_live_markers("s1")) == 1
+        md_capture.consume_epm_plan_shown_live("s1", nh)
+        assert md_capture.read_epm_plan_shown_live_markers("s1") == []
+        # consume-inclusive: the render-path idempotency guard still True.
+        assert md_capture.was_epm_plan_shown_live("s1", nh) is True
+
+    def test_survives_restart_via_disk(self, cc_dir):
+        nh = md_capture.prose_norm_hash("plan text")
+        md_capture.record_epm_plan_shown_live("s2", norm_hash=nh, shown_at=2.0)
+        # A fresh read (no in-memory state) still finds it — file-backed.
+        assert md_capture.was_epm_plan_shown_live("s2", nh) is True
+
+    def test_norm_hash_parity_across_source_divergence(self, cc_dir):
+        # The dedup basis: the plan FILE (trailing newline) vs the JSONL
+        # input.plan must normalize-equal so mint==validate.
+        base = "# Plan: x\n\n## Context\n\nbody"
+        assert (
+            md_capture.prose_norm_hash(base)
+            == md_capture.prose_norm_hash(base + "\n")
+            == md_capture.prose_norm_hash(base + "\n\n\n")
+            == md_capture.prose_norm_hash(base.replace("\n", "\r\n"))
+        )
+
+    def test_keyed_by_hash_distinct_plans_distinct_markers(self, cc_dir):
+        h1 = md_capture.prose_norm_hash("plan one")
+        h2 = md_capture.prose_norm_hash("plan two")
+        md_capture.record_epm_plan_shown_live("s3", norm_hash=h1, shown_at=1.0)
+        assert md_capture.was_epm_plan_shown_live("s3", h1) is True
+        assert md_capture.was_epm_plan_shown_live("s3", h2) is False
+
+    def test_does_not_collide_with_shown_live_markers(self, cc_dir):
+        # A regular shown_live marker and an epm_plan marker coexist; neither
+        # reader returns the other's lines.
+        nh = md_capture.prose_norm_hash("shared")
+        md_capture.record_shown_live(
+            "s4", md_message_id="M1", norm_hash=nh, shown_at=1.0
+        )
+        md_capture.record_epm_plan_shown_live("s4", norm_hash=nh, shown_at=1.0)
+        assert len(md_capture.read_shown_live_markers("s4")) == 1
+        assert len(md_capture.read_epm_plan_shown_live_markers("s4")) == 1
+
+
 def test_read_accumulates_multiflush_in_index_order(cc_dir):
     tp = _transcript_path()
     _seed(

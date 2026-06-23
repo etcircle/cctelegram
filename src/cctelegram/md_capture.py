@@ -643,6 +643,118 @@ def was_shown_live(
     return False
 
 
+# ── ExitPlanMode plan-body markers (the dedup bridge for the plan-before-card) ─
+#
+# The EPM plan body is NOT a MessageDisplay capture (it is the tool's input.plan,
+# never streamed as displayed prose). When the render path posts it before the
+# picker (read from ~/.claude/plans/<slug>.md), it records an
+# ``epm_plan_shown_live`` marker keyed by the plan's prose ``norm_hash`` (a plan
+# has no md_message_id), in the SAME per-session NDJSON so it shares the capture
+# lifecycle (``teardown_session`` unlinks it) and is restart-safe. The batch
+# dedup matches the post-resolution synthetic ``BLOCK_ORIGIN_EXIT_PLAN`` block's
+# ``norm_hash`` and ``consume``s the marker so the JSONL copy is suppressed once.
+# A SEPARATE marker kind from ``shown_live`` so the two arms never cross-match.
+
+
+@dataclass(frozen=True)
+class ShownLiveEpmPlanMarker:
+    norm_hash: str
+    shown_at: float
+
+
+def record_epm_plan_shown_live(
+    session_id: str,
+    *,
+    norm_hash: str,
+    shown_at: float,
+    base_dir: Path | None = None,
+) -> None:
+    """Mark an ExitPlanMode plan body as posted live (before the picker card),
+    keyed by its prose ``norm_hash``."""
+    _append_json_line(
+        _resolve_session_path(session_id, base_dir),
+        {
+            "marker": "epm_plan_shown_live",
+            "norm_hash": norm_hash,
+            "shown_at": shown_at,
+        },
+    )
+
+
+def consume_epm_plan_shown_live(
+    session_id: str, norm_hash: str, *, base_dir: Path | None = None
+) -> None:
+    """Mark an EPM-plan marker consumed (its post-resolution JSONL copy was
+    suppressed) so a later read no longer returns it."""
+    _append_json_line(
+        _resolve_session_path(session_id, base_dir),
+        {"marker": "epm_plan_consumed", "norm_hash": norm_hash},
+    )
+
+
+def read_epm_plan_shown_live_markers(
+    session_id: str, *, base_dir: Path | None = None
+) -> list[ShownLiveEpmPlanMarker]:
+    """Return the UNCONSUMED EPM-plan markers (latest ``epm_plan_shown_live`` per
+    ``norm_hash`` minus any later ``epm_plan_consumed``). Keyed by ``norm_hash``
+    (a plan has no md_message_id). Missing file → ``[]``; corrupt lines skipped."""
+    try:
+        raw = _resolve_session_path(session_id, base_dir).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return []
+    shown: dict[str, ShownLiveEpmPlanMarker] = {}
+    consumed: set[str] = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        kind = rec.get("marker")
+        nh = rec.get("norm_hash")
+        if not isinstance(nh, str) or not nh:
+            continue
+        if kind == "epm_plan_shown_live":
+            sa = rec.get("shown_at")
+            if isinstance(sa, (int, float)):
+                shown[nh] = ShownLiveEpmPlanMarker(norm_hash=nh, shown_at=float(sa))
+        elif kind == "epm_plan_consumed":
+            consumed.add(nh)
+    return [m for nh, m in shown.items() if nh not in consumed]
+
+
+def was_epm_plan_shown_live(
+    session_id: str, norm_hash: str, *, base_dir: Path | None = None
+) -> bool:
+    """True if an ``epm_plan_shown_live`` marker was EVER recorded for this plan
+    ``norm_hash`` — consumed or not. The render-path idempotency guard: once a
+    plan has been posted live, never re-post it (even after the dedup consumes
+    its marker, or across a restart that wipes the in-memory card map)."""
+    try:
+        raw = _resolve_session_path(session_id, base_dir).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (
+            isinstance(rec, dict)
+            and rec.get("marker") == "epm_plan_shown_live"
+            and rec.get("norm_hash") == norm_hash
+        ):
+            return True
+    return False
+
+
 # ── Lifecycle / teardown ─────────────────────────────────────────────────────
 
 

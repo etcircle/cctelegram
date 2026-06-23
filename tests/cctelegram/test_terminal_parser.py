@@ -3581,3 +3581,44 @@ class TestStaleHeaderOverLivePickerDemotion:
             )
             is True
         )
+
+
+from cctelegram.terminal_parser import extract_epm_plan_file_path  # noqa: E402
+
+
+class TestExtractEpmPlanFilePath:
+    """The plan-before-card fix: parse ~/.claude/plans/<slug>.md from the EPM
+    footer (anchored on the ctrl[+-]g line) so the bot can read + post the plan
+    before the picker."""
+
+    def test_real_v2170_fixture(self):
+        pane = _fixture("epm_v2170_ctrl_plus_g.txt")
+        assert extract_epm_plan_file_path(pane) == "~/.claude/plans/the-plan.md"
+
+    def test_no_footer_returns_none(self):
+        assert extract_epm_plan_file_path("just shell output\n$ ls\n") is None
+
+    def test_ctrl_minus_g_variant(self):
+        pane = " ctrl-g to edit in  Vim  · ~/.claude/plans/old-slug.md\n"
+        assert extract_epm_plan_file_path(pane) == "~/.claude/plans/old-slug.md"
+
+    def test_footer_line_anchored_over_scrollback_mention(self):
+        # A stale plan path mentioned in scrollback above must NOT win over the
+        # real ctrl+g footer path.
+        pane = (
+            "earlier I edited ~/.claude/plans/STALE.md by hand\n"
+            "...\n"
+            " ctrl+g to edit in  Vim  · ~/.claude/plans/REAL.md\n"
+        )
+        assert extract_epm_plan_file_path(pane) == "~/.claude/plans/REAL.md"
+
+    def test_wrapped_footer_falls_back_to_bottom_most_path(self):
+        # If tmux wraps the footer so the path lands on its OWN line (no ctrl+g
+        # on it), the bottom-most plan path beats a stale scrollback mention
+        # above — the footer is at the bottom (review P3).
+        pane = (
+            "earlier ~/.claude/plans/STALE.md was edited\n"
+            " ctrl+g to edit in  Vim  ·\n"
+            "~/.claude/plans/REAL.md\n"
+        )
+        assert extract_epm_plan_file_path(pane) == "~/.claude/plans/REAL.md"

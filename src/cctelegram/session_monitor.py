@@ -30,7 +30,7 @@ from . import md_capture
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
-from .transcript_parser import TranscriptParser
+from .transcript_parser import BLOCK_ORIGIN_EXIT_PLAN, TranscriptParser
 from .utils import (
     normalize_background_agent_key,
     parse_iso_timestamp,
@@ -246,6 +246,11 @@ def filter_live_prose_duplicates(messages: list[NewMessage]) -> list[NewMessage]
 
     # (session_id, norm_hash) -> list of each matching group's real-prose msgs.
     by_key: dict[tuple[str, str], list[list[NewMessage]]] = {}
+    # EPM plan arm: the synthetic ``BLOCK_ORIGIN_EXIT_PLAN`` block (the plan
+    # body) is suppressed when its plan was already posted BEFORE the card
+    # (matched by ``norm_hash`` against the epm_plan marker). A SEPARATE map +
+    # marker kind from the real-prose arm so the two never cross-match.
+    epm_by_key: dict[tuple[str, str], list[list[NewMessage]]] = {}
     for (sid, _mid), grp in groups.items():
         has_interactive = any(
             g.content_type == "tool_use" and g.tool_name in _INTERACTIVE_TOOL_NAMES
@@ -258,11 +263,23 @@ def filter_live_prose_duplicates(messages: list[NewMessage]) -> list[NewMessage]
             for g in grp
             if g.content_type == "text" and g.block_origin is None and g.text
         ]
-        if not real:
-            continue
-        norm_hash = md_capture.prose_norm_hash("\n".join(g.text for g in real))
-        by_key.setdefault((sid, norm_hash), []).append(real)
-    if not by_key:
+        if real:
+            norm_hash = md_capture.prose_norm_hash("\n".join(g.text for g in real))
+            by_key.setdefault((sid, norm_hash), []).append(real)
+        if any(
+            g.content_type == "tool_use" and g.tool_name == "ExitPlanMode" for g in grp
+        ):
+            plans = [
+                g
+                for g in grp
+                if g.content_type == "text"
+                and g.block_origin == BLOCK_ORIGIN_EXIT_PLAN
+                and g.text
+            ]
+            if plans:
+                plan_hash = md_capture.prose_norm_hash("\n".join(g.text for g in plans))
+                epm_by_key.setdefault((sid, plan_hash), []).append(plans)
+    if not by_key and not epm_by_key:
         return messages
 
     markers_cache: dict[str, list[md_capture.ShownLiveMarker]] = {}
@@ -293,6 +310,35 @@ def filter_live_prose_duplicates(messages: list[NewMessage]) -> list[NewMessage]
             sid[:8],
             match.md_message_id[:8],
         )
+
+    # EPM plan arm: suppress the post-resolution plan copy iff its plan was
+    # posted before the card (the epm_plan marker matches by norm_hash). Same
+    # ambiguity safety as above (>1 group sharing one marker → suppress none).
+    epm_markers_cache: dict[str, list[md_capture.ShownLiveEpmPlanMarker]] = {}
+    for (sid, plan_hash), plan_lists in epm_by_key.items():
+        markers = epm_markers_cache.get(sid)
+        if markers is None:
+            markers = md_capture.read_epm_plan_shown_live_markers(sid)
+            epm_markers_cache[sid] = markers
+        if not any(mk.norm_hash == plan_hash for mk in markers):
+            continue
+        if len(plan_lists) > 1:
+            logger.warning(
+                "EPM plan dedup ambiguous for session %s (%d groups share one "
+                "marker); suppressing none",
+                sid[:8],
+                len(plan_lists),
+            )
+            continue
+        for g in plan_lists[0]:
+            suppress.add(id(g))
+        md_capture.consume_epm_plan_shown_live(sid, plan_hash)
+        logger.info(
+            "EPM plan deduped post-resolution copy: session=%s hash=%s",
+            sid[:8],
+            plan_hash[:8],
+        )
+
     if not suppress:
         return messages
     return [m for m in messages if id(m) not in suppress]

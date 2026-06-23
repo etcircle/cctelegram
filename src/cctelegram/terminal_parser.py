@@ -164,6 +164,35 @@ UI_PATTERNS: list[UIPattern] = [
 ]
 
 
+# ── ExitPlanMode plan-file footer ─────────────────────────────────────────
+
+# The EPM footer is "ctrl+g to edit in  Vim  · ~/.claude/plans/<slug>.md"
+# (the ctrl[+-]g tolerance mirrors the ExitPlanMode bottom anchor above). The
+# plan file referenced there exists on disk during the live prompt (the agent
+# Write-s it), so the bot can read it to post the plan BEFORE the picker card.
+_RE_EPM_FOOTER = re.compile(r"ctrl[+-]g to edit")
+_RE_EPM_PLAN_PATH = re.compile(r"(~/\.claude/plans/\S+\.md)")
+
+
+def extract_epm_plan_file_path(pane_text: str) -> str | None:
+    """Extract the ``~/.claude/plans/<slug>.md`` path from an ExitPlanMode
+    footer. Anchors on the ``ctrl[+-]g to edit`` footer line FIRST (the sole
+    bottom anchor on v2.1.170) so a stray plan-path mention elsewhere in
+    scrollback can't win. If no footer line carries the path (e.g. tmux wrapped
+    the footer onto two lines), falls back to the LAST plan path in the pane —
+    the footer is at the bottom, so the bottom-most mention beats a stale
+    scrollback mention above it. Returns the path string or None."""
+    fallback: str | None = None
+    for line in pane_text.split("\n"):
+        m = _RE_EPM_PLAN_PATH.search(line)
+        if not m:
+            continue
+        if _RE_EPM_FOOTER.search(line):
+            return m.group(1)
+        fallback = m.group(1)  # keep the LAST (bottom-most) match
+    return fallback
+
+
 # ── Post-processing ──────────────────────────────────────────────────────
 
 _RE_LONG_DASH = re.compile(r"^─{5,}$")

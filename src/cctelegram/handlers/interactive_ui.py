@@ -40,6 +40,7 @@ from ..session import (
 from ..terminal_parser import (
     REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
+    extract_epm_plan_file_path,
     extract_interactive_content,
     parse_ask_user_question,
     visible_pane_liveness,
@@ -2654,6 +2655,126 @@ _LIVE_PROSE_RETRY_STEP_S = 0.05
 _LIVE_PROSE_STREAM_WAIT_BUDGET_S = 3.0
 
 
+async def _read_epm_plan_file(footer_path: str | None) -> str | None:
+    """Read the ExitPlanMode plan file referenced in the pane footer.
+
+    Expands ``~`` and REQUIRES the resolved path to live under
+    ``~/.claude/plans/`` (path-traversal guard). Reads off the event loop
+    (``asyncio.to_thread``) since the plan can be multiple KB and this runs
+    under the route lock. Returns the content, or None on any failure
+    (missing/unreadable/outside-base/empty) — every failure degrades to
+    today's behavior (the plan arrives post-resolution via JSONL), never
+    raises."""
+    if not footer_path:
+        return None
+    try:
+        path = Path(footer_path).expanduser().resolve()
+        base = (Path.home() / ".claude" / "plans").resolve()
+        if not path.is_relative_to(base):
+            logger.warning(
+                "EPM plan path outside ~/.claude/plans/: %s — skipping", footer_path
+            )
+            return None
+        content = await asyncio.to_thread(path.read_text, encoding="utf-8")
+    except Exception as exc:  # FileNotFound / Permission / decode — degrade
+        logger.debug("EPM plan file unreadable (%s): %s", footer_path, exc)
+        return None
+    return content if content.strip() else None
+
+
+async def _maybe_post_epm_plan(
+    bot: Bot,
+    *,
+    user_id: int,
+    thread_id: int | None,
+    chat_id: int,
+    window_id: str,
+    pane_text: str,
+    tool_input: dict | None,
+) -> None:
+    """Post the ExitPlanMode plan BODY before the picker card, so the user does
+    not approve blind. The plan text is the tool's ``input.plan``, buffered in
+    JSONL until resolution — so for a LIVE pane-rendered card (``tool_input``
+    None) it is read from the ``~/.claude/plans/<slug>.md`` file named in the
+    pane footer (the agent Write-s it during the turn). A marker keyed by the
+    plan's ``norm_hash`` makes this idempotent across poll re-renders AND a
+    restart, and lets ``session_monitor.filter_live_prose_duplicates`` suppress
+    the post-resolution JSONL copy (mint/validate parity via the SAME
+    ``prose_norm_hash``). A miss (no path / file gone / send fail) is a silent
+    no-op: the JSONL copy still delivers post-resolution (no loss). Ordered
+    AFTER ``_maybe_post_live_prose`` and BEFORE the card by call-site placement,
+    under the route lock."""
+    from .response_builder import build_response_parts
+
+    # Prefer the JSONL tool_input (replay/parity-perfect); else the live file.
+    plan_text: str | None = None
+    if isinstance(tool_input, dict):
+        p = tool_input.get("plan")
+        if isinstance(p, str) and p.strip():
+            plan_text = p
+    if plan_text is None:
+        plan_text = await _read_epm_plan_file(extract_epm_plan_file_path(pane_text))
+    if not plan_text or not plan_text.strip():
+        return  # degrade: JSONL delivers post-resolution
+
+    session_id = session_id_for_window(window_id)
+    if not session_id:
+        return
+    norm_hash = md_capture.prose_norm_hash(plan_text)
+    # Idempotency: once posted (this process OR a prior one — the marker is on
+    # disk), never re-post; survives restart + the dedup consuming the marker.
+    if md_capture.was_epm_plan_shown_live(session_id, norm_hash):
+        return
+    # Re-render guard: the card already exists → we are past first render.
+    if _interactive_msgs.get((user_id, thread_id or 0)) is not None:
+        return
+
+    # Label the message so it reads as the plan, not stray assistant content.
+    # The dedup ``norm_hash`` above is on the RAW ``plan_text`` (== the JSONL
+    # ``input.plan``), NOT this display string, so the header can't break parity.
+    display = f"📋 Plan\n\n{plan_text}"
+    parts = build_response_parts(display, content_type="text", role="assistant")
+    if not parts:
+        return
+    total = len(parts)
+    sent_any = False
+    for idx, chunk in enumerate(parts, start=1):
+        try:
+            sent, _outcome = await topic_send(
+                bot,
+                op="content",
+                user_id=user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                window_id=window_id,
+                text=chunk,
+                role="assistant",
+                content_type="text",
+                session_id=session_id,
+                part_index=idx if total > 1 else 0,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("EPM plan post raised (window=%s): %s", window_id, exc)
+            return  # NO marker → JSONL still delivers; next render retries
+        if sent is None:
+            return  # send failed → NO marker (no silent loss, retry next render)
+        sent_any = True
+    if not sent_any:
+        return
+    # Record ONLY after all chunks landed — a partial/failed send leaves no
+    # marker, so the JSONL copy is not suppressed and nothing is lost.
+    md_capture.record_epm_plan_shown_live(
+        session_id, norm_hash=norm_hash, shown_at=time.time()
+    )
+    logger.info(
+        "EPM plan posted before card: window=%s session=%s len=%d hash=%s",
+        window_id,
+        session_id[:8],
+        len(plan_text),
+        norm_hash[:8],
+    )
+
+
 async def _maybe_post_live_prose(
     bot: Bot,
     *,
@@ -3210,6 +3331,21 @@ async def handle_interactive_ui(
             window_id=window_id,
             ui_name=content.name,
         )
+
+        # ExitPlanMode: post the plan BODY before the card so the user sees what
+        # they're approving (the card itself carries no plan text). Ordered
+        # AFTER the findings prose above, BEFORE the card below — same route
+        # lock. Idempotent + dedup'd against the post-resolution JSONL copy.
+        if content.name == "ExitPlanMode":
+            await _maybe_post_epm_plan(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                window_id=window_id,
+                pane_text=pane_text,
+                tool_input=tool_input,
+            )
 
         # Check if we have an existing interactive message to edit
         existing_msg_id = _interactive_msgs.get(ikey)
