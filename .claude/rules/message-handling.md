@@ -425,6 +425,37 @@ bracket-gated (live only) and anchored (never `rglob`); restart degrades in
 lockstep with run-state (in-memory brackets ⇒ no cards until a fresh launch
 re-opens a bracket). Pull-only; no observer.
 
+**Interactive-surface teardown is PARENT-only (sidechain blocks never tear
+down a live card).** `bot.handle_new_message` clears a live interactive card
+on the parent route via two seams: the explicit AUQ `tool_result`
+invalidation (`forget_ask_tool_input` + `auq_ledger.release_window`) and the
+generic *"any non-interactive message ⇒ interaction complete"* teardown
+(`if has_interactive_surface(user, thread): clear_interactive_msg(...);
+forget_ask_tool_input(wid)`). Both are now GATED on `msg.subagent_key is None`,
+mirroring the interactive-HANDLING branch at the top of the loop and the
+routing-bypass intent in `session_monitor`'s sidechain emit (*"those apply
+only to the parent's own blocks"*). A sidechain / background-agent block is
+emitted with the PARENT's `session_id` and a non-None `subagent_key`
+(`"sub:<parent>:…"`, `session_monitor.py:1599-1614`), so it resolves to the
+parent's route; without the gate, a background Workflow/Agent narrating while
+the parent is BLOCKED on a live prompt tore the card down — `clear_interactive_msg`
+`topic_delete`-s the picker and `forget_ask_tool_input` pops the by-window
+`_auq_context_posted` dedup marker, so the 1 Hz poller re-detects the
+still-live pane prompt and re-posts (the 2026-06-23 DiCopilot ~28× ctx-card
+duplication; the EPM `📋 Plan` re-post twin via `md_capture.teardown_session`).
+`has_interactive_surface` is route-keyed + UI-type-agnostic, so one gate covers
+AUQ + ExitPlanMode + Permission. The day-one (v0.1.0) asymmetry — handling
+branch gated, teardown branch not — was a dead branch until sidechain DISPLAY
+emission became unconditional (`ef086f1`, 2026-06-11) and was extended to the
+Workflow sidechain shape by Fix 5. The gate must NOT widen to skip GENUINE
+parent blocks: a parent non-interactive block (`subagent_key is None`) after a
+bypassPermissions auto-resolution still legitimately tears the card down (the
+regression-pinned case). Every prior AUQ-churn fix lived in `status_polling` /
+`interactive_ui` / `auq_source` (the *poller's* re-render heuristics); the
+re-post is the poller faithfully re-detecting a real live picker, so only this
+upstream `bot.py` gate — never a poller-side change — stops the marker-pop that
+re-armed duplication. Pull-only; no observer (c313657 forbidden).
+
 **AUQ card-liveness authority (pane is lower authority than the
 lifecycle)** — `status_polling`'s pane-absent clear gate must not tombstone
 an AskUserQuestion card on visible-pane absence alone. The visible tmux pane

@@ -1000,8 +1000,8 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # window-switch / topic-close — the uptime half of the dead-card class
         # (Codex round-2 P2, 2026-05-31).
         #
-        # This is also why the invalidation is UNCONDITIONAL (not gated on
-        # ``has_interactive_surface``): a card that status_polling's
+        # This is also why the invalidation is UNCONDITIONAL of
+        # ``has_interactive_surface``: a card that status_polling's
         # absent-streak hysteresis cleared BEFORE the JSONL ``tool_result``
         # arrives would otherwise leave the cache pointing at the
         # just-completed AUQ, and the NEXT AUQ's render overlays the new pane
@@ -1013,8 +1013,20 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # stale-D1 verbatim text). ``forget_ask_tool_input`` is ``dict.pop`` +
         # an idempotent unlink — safe to call here and again in the clear
         # branch below.
+        #
+        # GATED on ``msg.subagent_key is None`` (mirrors the interactive-
+        # HANDLING gate at the top of the loop): a SUB-AGENT that itself ran an
+        # AskUserQuestion emits a tool_result block carrying
+        # ``tool_name='AskUserQuestion'`` routed to the PARENT's session_id, and
+        # without this gate it would release the PARENT window's action-ledger
+        # rows (unmasking a dispatched-but-UNRESOLVED single-use brake) and clear
+        # the parent's AUQ cache for an unrelated, still-live parent AUQ. The
+        # ``has_interactive_surface``-independence above is orthogonal to
+        # subagent provenance — only the PARENT's own AUQ tool_result is the
+        # positive resolution proof this block acts on.
         if (
-            msg.role == "assistant"
+            msg.subagent_key is None
+            and msg.role == "assistant"
             and msg.tool_name == "AskUserQuestion"
             and msg.content_type == "tool_result"
         ):
@@ -1040,10 +1052,28 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # rows.
             auq_ledger_release_window(wid)
 
-        # Any non-interactive message means the interaction is complete —
-        # delete the UI card. ``has_interactive_surface`` is the bool
+        # Any non-interactive message from the PARENT means the interaction is
+        # complete — delete the UI card. ``has_interactive_surface`` is the bool
         # predicate the cleanup gate is written against.
-        if has_interactive_surface(user_id, thread_id):
+        #
+        # GATED on ``msg.subagent_key is None`` (mirrors the interactive-
+        # HANDLING gate at the top of the loop, and the routing-bypass intent in
+        # session_monitor's sidechain emit). A sidechain / background-agent block
+        # is emitted with the PARENT's ``session_id`` and a non-None
+        # ``subagent_key``, so it routes to the parent's route; without this gate
+        # it tore down the parent's GENUINELY-LIVE AUQ/EPM/Permission card —
+        # ``clear_interactive_msg`` topic_delete-s the picker and
+        # ``forget_ask_tool_input`` pops the by-window ``_auq_context_posted``
+        # marker, so the 1Hz poller re-detects the still-live pane prompt and
+        # re-posts (the 2026-06-23 DiCopilot ~28x ctx-card duplication while a
+        # background Workflow narrated, and the EPM '📋 Plan' re-post twin via
+        # ``md_capture.teardown_session``). ``has_interactive_surface`` is
+        # route-keyed + UI-type-agnostic, so the one gate covers AUQ + EPM +
+        # Permission. The gate must NOT widen to also skip GENUINE parent blocks:
+        # a parent non-interactive block (subagent_key is None) after a
+        # bypassPermissions auto-resolution still legitimately tears the card
+        # down — that is the regression-pinned case.
+        if msg.subagent_key is None and has_interactive_surface(user_id, thread_id):
             await clear_interactive_msg(
                 user_id, bot, thread_id, session_mgr=session_manager
             )
