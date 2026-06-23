@@ -357,6 +357,73 @@ def read_prose_records(
     return records
 
 
+def is_prose_streaming(
+    session_id: str,
+    *,
+    now: float | None = None,
+    recency_window_s: float = 8.0,
+    base_dir: Path | None = None,
+) -> bool:
+    """Whether a prose message for this session is ACTIVELY STREAMING — it has
+    deltas, no ``final`` yet, and its LATEST delta is recent.
+
+    The live-prose render path consults this ONLY when ``select_fresh_prose``
+    returned None at the base catch-up deadline: if a message is mid-stream we
+    keep waiting (bounded) for its final delta so the prose still posts BEFORE
+    the picker card; if nothing is streaming we bail immediately, so a prose-less
+    picker incurs zero added delay.
+
+    Recency is anchored on the MAX ``captured_at`` across the message's deltas
+    (NOT ``first_seen_at``): a legitimately long stream (deltas spanning tens of
+    seconds) stays "live" because its newest delta is fresh, while a
+    crash-orphaned unfinalized message ages out once its deltas stop landing — so
+    stale leftover deltas can never trigger the wait. Turn-boundary / TTL
+    staleness stays ``select_fresh_prose``'s job; this only governs whether to
+    keep polling, never lowers the freshness bar.
+
+    Tolerant exactly like ``read_prose_records`` (missing file / corrupt lines /
+    marker lines — which carry no ``payload`` dict — are ignored). Leaf-clean:
+    reads the same NDJSON, imports nothing new.
+    """
+    path = _resolve_session_path(session_id, base_dir)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return False
+
+    # message_id -> [finalized, latest_captured_at]
+    state: dict[str, list] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        payload = rec.get("payload")
+        captured_at = rec.get("captured_at")
+        if not isinstance(payload, dict) or not isinstance(captured_at, (int, float)):
+            continue
+        mid = payload.get("message_id")
+        if not isinstance(mid, str) or not mid:
+            continue
+        final = bool(payload.get("final"))
+        st = state.get(mid)
+        if st is None:
+            state[mid] = [final, float(captured_at)]
+        else:
+            st[0] = st[0] or final
+            st[1] = max(st[1], float(captured_at))
+
+    cutoff = (time.time() if now is None else now) - recency_window_s
+    return any(
+        not finalized and latest_at >= cutoff for finalized, latest_at in state.values()
+    )
+
+
 # Freshness TTLs for the live-prose render path (the render-time `now` upper
 # bound). REALITY (PR-1, measured — NOT the old "~0.68s before the picker"
 # assumption, which was inverted): the prose finalizes a meaningful gap BEFORE

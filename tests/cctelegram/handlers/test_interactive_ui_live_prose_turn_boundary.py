@@ -196,3 +196,139 @@ async def test_concurrent_send_clobber_is_bounded_degradation(cc_dir, captured_p
     # final_at (now-1.0) <= clobbered boundary (now-0.2) → filtered. The JSONL
     # copy delivers it post-resolution (the documented degradation).
     assert captured_posts == []
+
+
+def _late_record(now: float) -> md_capture.ProseRecord:
+    return md_capture.ProseRecord(
+        session_id=_SID,
+        transcript_path=f"/p/{_SID}.jsonl",
+        md_message_id="LATE",
+        text="late-finalizing findings",
+        raw_hash="r",
+        norm_hash="n",
+        first_seen_at=now - 1.0,
+        final_at=now - 0.1,
+    )
+
+
+class TestLiveProseLateFinalizeStreamWait:
+    """Late-finalize fix: when the base catch-up budget expires with no finalized
+    prose but a prose message is ACTIVELY STREAMING, extend the wait ONCE so the
+    prose still posts BEFORE the picker card (the EPM#2 'findings after the card'
+    miss). A prose-less picker adds zero delay; a never-finalizing stream
+    degrades to today's miss, bounded (never hangs)."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_then_finalizes_posts_prose_before_card(
+        self, cc_dir, captured_posts, monkeypatch
+    ):
+        # Base budget bails on the first deadline check; a generous extension
+        # keeps polling. select returns None until the 3rd poll — i.e. AFTER the
+        # base budget would have bailed pre-fix; only the extension reaches it.
+        now = time.time()
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_RETRY_BUDGET_S", 0.0)
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_STREAM_WAIT_BUDGET_S", 2.0)
+        monkeypatch.setattr(md_capture, "is_prose_streaming", lambda *a, **k: True)
+        calls = {"n": 0}
+        rec = _late_record(now)
+
+        def fake_select(*a, **k):
+            calls["n"] += 1
+            return rec if calls["n"] >= 3 else None
+
+        monkeypatch.setattr(md_capture, "select_fresh_prose", fake_select)
+
+        await interactive_ui._maybe_post_live_prose(
+            AsyncMock(),
+            user_id=1,
+            thread_id=100,
+            chat_id=42,
+            window_id="@0",
+            ui_name="ExitPlanMode",
+        )
+        # The extension kept polling past the base bail and posted the prose.
+        assert captured_posts == ["late-finalizing findings"]
+        assert calls["n"] >= 3
+
+    @pytest.mark.asyncio
+    async def test_streaming_never_finalizes_no_post_bounded(
+        self, cc_dir, captured_posts, monkeypatch
+    ):
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_RETRY_BUDGET_S", 0.05)
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_STREAM_WAIT_BUDGET_S", 0.3)
+        monkeypatch.setattr(md_capture, "is_prose_streaming", lambda *a, **k: True)
+        monkeypatch.setattr(md_capture, "select_fresh_prose", lambda *a, **k: None)
+
+        start = time.monotonic()
+        await interactive_ui._maybe_post_live_prose(
+            AsyncMock(),
+            user_id=1,
+            thread_id=100,
+            chat_id=42,
+            window_id="@0",
+            ui_name="ExitPlanMode",
+        )
+        elapsed = time.monotonic() - start
+        # Never finalized → no live post (JSONL delivers post-resolution).
+        assert captured_posts == []
+        # Fail-safe: bounded by base + extension (+ slack); never hangs.
+        assert elapsed < 0.05 + 0.3 + 1.0
+
+    @pytest.mark.asyncio
+    async def test_prose_less_picker_no_extension(
+        self, cc_dir, captured_posts, monkeypatch
+    ):
+        # No NDJSON → the REAL is_prose_streaming returns False. Spy that it is
+        # consulted exactly once at the base deadline and the (large) extension
+        # never engages — a prose-less picker incurs zero added delay.
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_RETRY_BUDGET_S", 0.05)
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_STREAM_WAIT_BUDGET_S", 5.0)
+        monkeypatch.setattr(md_capture, "select_fresh_prose", lambda *a, **k: None)
+        calls = {"n": 0}
+        real = md_capture.is_prose_streaming
+
+        def spy(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+
+        monkeypatch.setattr(md_capture, "is_prose_streaming", spy)
+
+        start = time.monotonic()
+        await interactive_ui._maybe_post_live_prose(
+            AsyncMock(),
+            user_id=1,
+            thread_id=100,
+            chat_id=42,
+            window_id="@0",
+            ui_name="ExitPlanMode",
+        )
+        elapsed = time.monotonic() - start
+        assert captured_posts == []
+        assert calls["n"] == 1  # consulted once at the base deadline, then bailed
+        assert elapsed < 0.05 + 1.0  # the 5s extension never engaged
+
+    @pytest.mark.asyncio
+    async def test_modality_agnostic_auq(self, cc_dir, captured_posts, monkeypatch):
+        # The extension is modality-agnostic — identical behavior for AUQ.
+        now = time.time()
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_RETRY_BUDGET_S", 0.0)
+        monkeypatch.setattr(interactive_ui, "_LIVE_PROSE_STREAM_WAIT_BUDGET_S", 2.0)
+        monkeypatch.setattr(md_capture, "is_prose_streaming", lambda *a, **k: True)
+        calls = {"n": 0}
+        rec = _late_record(now)
+
+        def fake_select(*a, **k):
+            calls["n"] += 1
+            return rec if calls["n"] >= 3 else None
+
+        monkeypatch.setattr(md_capture, "select_fresh_prose", fake_select)
+
+        await interactive_ui._maybe_post_live_prose(
+            AsyncMock(),
+            user_id=1,
+            thread_id=100,
+            chat_id=42,
+            window_id="@0",
+            ui_name="AskUserQuestion",
+        )
+        assert captured_posts == ["late-finalizing findings"]

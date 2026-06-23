@@ -2640,6 +2640,18 @@ def _build_interactive_keyboard(
 # under the route lock, so it is intentionally short.
 _LIVE_PROSE_RETRY_BUDGET_S = 0.25
 _LIVE_PROSE_RETRY_STEP_S = 0.05
+# Late-finalize fix: when the base budget above expires with no finalized prose
+# AND a prose message is actively streaming (``md_capture.is_prose_streaming``),
+# extend the wait ONCE by this much so a prose that finalizes mid-stream (the
+# picker was detected before its final delta landed) still posts BEFORE the card
+# instead of arriving after it via the post-resolution JSONL path. Triggers only
+# on a real streaming signal (a prose-less picker bails at the base budget, zero
+# added delay) and degrades to today's miss on expiry (never hangs). The detect-
+# latency figure (~5-21s) is NOT this budget — the prose is already finalized
+# during that lag (the first read hits); this only covers the genuine
+# mid-stream-at-detection window. Held under the route lock (which no user-tap
+# path contends on), so it is bounded.
+_LIVE_PROSE_STREAM_WAIT_BUDGET_S = 3.0
 
 
 async def _maybe_post_live_prose(
@@ -2717,6 +2729,7 @@ async def _maybe_post_live_prose(
 
     nb = peek_route_user_turn_at(user_id, thread_id, window_id)
     deadline = time.monotonic() + _LIVE_PROSE_RETRY_BUDGET_S
+    extended = False
     candidate: md_capture.ProseRecord | None = None
     while True:
         candidate = md_capture.select_fresh_prose(
@@ -2728,8 +2741,28 @@ async def _maybe_post_live_prose(
             emit_anchor_eps_s=emit_eps,
             emit_anchor_lookback_s=emit_lookback,
         )
-        if candidate is not None or time.monotonic() >= deadline:
+        if candidate is not None:
             break
+        if time.monotonic() >= deadline:
+            # Base catch-up budget exhausted with no finalized prose. The common
+            # clean case finalizes prose BEFORE detection (the first read hits,
+            # never reaching here). Extend the wait ONCE iff a prose message is
+            # actively streaming — so a late-finalizing prose still posts BEFORE
+            # the card; a prose-less picker bails here immediately (zero added
+            # delay). Fail-safe: on the extended deadline we fall through to the
+            # unchanged miss path (card created, JSONL delivers post-resolution).
+            if extended or not md_capture.is_prose_streaming(
+                session_id, now=time.time()
+            ):
+                break
+            extended = True
+            deadline = time.monotonic() + _LIVE_PROSE_STREAM_WAIT_BUDGET_S
+            logger.debug(
+                "Bug2 live-prose stream-wait extend window=%s ui=%s budget=%.1fs",
+                window_id,
+                ui_name,
+                _LIVE_PROSE_STREAM_WAIT_BUDGET_S,
+            )
         await asyncio.sleep(_LIVE_PROSE_RETRY_STEP_S)
     if candidate is None or not candidate.text.strip():
         # A6 observability: classify the miss (capture-absent vs TTL/anchor-reject

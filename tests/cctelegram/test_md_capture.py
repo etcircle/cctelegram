@@ -28,6 +28,7 @@ from cctelegram import md_capture
 from cctelegram.md_capture import (
     ProseRecord,
     appender_path,
+    is_prose_streaming,
     normalize_prose,
     read_prose_records,
 )
@@ -176,6 +177,72 @@ def _seed(cc_dir: Path, session_id: str, lines: list[dict]) -> Path:
     p = d / f"{session_id}.ndjson"
     p.write_text("".join(json.dumps(ln) + "\n" for ln in lines))
     return p
+
+
+def _streaming_line(captured_at: float, *, message_id="M1", index=0, final=False):
+    return {
+        "captured_at": captured_at,
+        "payload": _md_payload(
+            message_id=message_id, index=index, final=final, delta="streaming"
+        ),
+    }
+
+
+class TestIsProseStreaming:
+    """Late-finalize fix: the live-prose render path waits past the base budget
+    ONLY when a prose message is actively streaming. Recency anchors on the
+    LATEST delta captured_at (not first_seen_at), so a long stream stays live
+    and a crash-orphaned leftover ages out."""
+
+    NOW = 1000.0
+
+    def test_unfinalized_recent_true(self, cc_dir):
+        _seed(cc_dir, _SID, [_streaming_line(self.NOW - 1.0)])
+        assert is_prose_streaming(_SID, now=self.NOW) is True
+
+    def test_finalized_false(self, cc_dir):
+        _seed(cc_dir, _SID, [_streaming_line(self.NOW - 1.0, final=True)])
+        assert is_prose_streaming(_SID, now=self.NOW) is False
+
+    def test_long_stream_latest_delta_fresh_true(self, cc_dir):
+        # A 25s-long stream: the FIRST delta is far outside the 8s window, but
+        # the LATEST is fresh. Anchoring on first_seen_at would (wrongly) say
+        # False — this is the deliberate RED guard for the anchor choice.
+        lines = [
+            _streaming_line(self.NOW - dt, index=i)
+            for i, dt in enumerate([25.0, 20.0, 10.0, 3.0, 0.3])
+        ]
+        _seed(cc_dir, _SID, lines)
+        assert is_prose_streaming(_SID, now=self.NOW) is True
+
+    def test_stale_orphan_false(self, cc_dir):
+        # A crash-orphaned unfinalized message whose deltas stopped 50s ago: its
+        # latest delta has aged past the window → not "streaming".
+        _seed(cc_dir, _SID, [_streaming_line(self.NOW - 50.0)])
+        assert is_prose_streaming(_SID, now=self.NOW) is False
+
+    def test_missing_file_false(self, cc_dir):
+        assert is_prose_streaming("no-such-session", now=self.NOW) is False
+
+    def test_corrupt_lines_skipped(self, cc_dir):
+        d = cc_dir / "msg_display"
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        p = d / f"{_SID}.ndjson"
+        good = json.dumps(_streaming_line(self.NOW - 1.0))
+        p.write_text("{not json\n" + good + "\n")
+        assert is_prose_streaming(_SID, now=self.NOW) is True
+
+    def test_ignores_markers(self, cc_dir):
+        # A shown_live marker line (no payload dict) must not count as streaming.
+        _seed(
+            cc_dir,
+            _SID,
+            [
+                {"marker": "shown_live", "md_message_id": "M1", "norm_hash": "h"},
+                _streaming_line(self.NOW - 1.0, final=True),
+            ],
+        )
+        assert is_prose_streaming(_SID, now=self.NOW) is False
 
 
 def test_read_accumulates_multiflush_in_index_order(cc_dir):
