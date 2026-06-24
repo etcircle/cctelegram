@@ -311,6 +311,39 @@ _NEG_WORKFLOW_COMPLETE_THEN_PROSE = (
 )
 
 
+# (e) Round-2 Codex P1: a COMPLETE quoted Permission gate (real options +
+# ``(esc)``) in scrollback, FOLLOWED BY the live pane's normal input box +
+# status bar. A live gate REPLACES that chrome (the bgshells fixture proves it),
+# so a gate WITH ready-for-input chrome below the footer is a quoted false
+# positive — no card.
+_NEG_PERMISSION_QUOTED_THEN_INPUTBOX = (
+    " Do you want to allow Claude to fetch this content?\n"
+    " ❯ 1. Yes\n"
+    "   2. Yes, and don't ask again for example.com\n"
+    "   3. No, and tell Claude what to do differently (esc)\n"
+    "\n"
+    "────────────────────────────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────────────────────────────\n"
+    "  ? for shortcuts · ← for agents\n"
+)
+# (f) A COMPLETE quoted Workflow block then input box + status bar.
+_NEG_WORKFLOW_QUOTED_THEN_INPUTBOX = (
+    " Run a dynamic workflow?\n"
+    " This dynamic workflow will spin up subagents.\n"
+    " Dynamic workflows can use a lot of tokens quickly.\n"
+    " ❯ 1. Yes, run it\n"
+    "   2. View raw script\n"
+    "   3. No\n"
+    " Esc to cancel · Tab to amend\n"
+    " ctrl+g to edit script in $EDITOR\n"
+    "\n"
+    "────────────────────────────────────────────────────────────────────────\n"
+    "❯ \n"
+    "  Opus 4.8 (1M context) · Context left: 42% · ↓ to manage\n"
+)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "pane",
@@ -319,13 +352,17 @@ _NEG_WORKFLOW_COMPLETE_THEN_PROSE = (
         _NEG_PERMISSION_NOT_AT_BOTTOM,
         _NEG_WORKFLOW_NO_OPTIONS,
         _NEG_WORKFLOW_COMPLETE_THEN_PROSE,
+        _NEG_PERMISSION_QUOTED_THEN_INPUTBOX,
+        _NEG_WORKFLOW_QUOTED_THEN_INPUTBOX,
     ],
 )
 async def test_quoted_gate_shapes_post_no_card(
     scenario: ScenarioHarness, gate_on, pane: str
 ) -> None:
-    """With the flag ON, a quoted / explained / non-bottom gate posts NO card
-    and does NOT promote the route to WAITING_ON_USER (S-8 fail-closed, P1b)."""
+    """With the flag ON, a quoted / explained / non-bottom gate — INCLUDING a
+    complete-but-quoted gate followed by the input box + status bar (round-2
+    Codex P1) — posts NO card and does NOT promote the route to WAITING_ON_USER
+    (S-8 fail-closed, P1b)."""
     wid = _bind(scenario, pane)
     route = _route(scenario, wid)
     await route_runtime.mark_inbound_sent(route)  # RUNNING
@@ -338,3 +375,25 @@ async def test_quoted_gate_shapes_post_no_card(
     snap = route_runtime.snapshot(route)
     assert snap.run_state is RunState.RUNNING  # NOT promoted
     assert snap.interactive_pending is False
+
+
+@pytest.mark.asyncio
+async def test_live_gate_with_bg_shells_posts_card(
+    scenario: ScenarioHarness, gate_on
+) -> None:
+    """Round-2 Hermes P2 refuted by data: a LIVE WebFetch gate captured WITH 2
+    background shells running (``permission_webfetch_bgshells_v2.1.190.txt``)
+    still posts the card + promotes to WAITING — the footer is the bottom, so
+    the tightened bottom-terminal check does NOT false-negative it."""
+    wid = _bind(scenario, _load("permission_webfetch_bgshells_v2.1.190.txt"))
+    route = _route(scenario, wid)
+    await route_runtime.mark_inbound_sent(route)  # RUNNING
+
+    assert await _render(scenario, wid)
+    await _poll(scenario, wid, 2)
+
+    card = _last_interactive_card_text(scenario)
+    assert card is not None
+    assert interactive_ui._GATE_NAV_NOTICE in card
+    assert "Do you want to allow Claude to fetch this content?" in card
+    assert route_runtime.snapshot(route).run_state is RunState.WAITING_ON_USER

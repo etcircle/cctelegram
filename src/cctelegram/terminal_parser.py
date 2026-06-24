@@ -1903,64 +1903,89 @@ def _gate_options_above(lines: list[str], footer_idx: int) -> tuple[AskOption, .
     )
 
 
-# ── Bottom-terminal requirement (S-8 fail-closed) ─────────────────────────
+# ── Bottom-terminal requirement (S-8 fail-closed; round-2 Codex P1) ────────
 #
-# A genuine LIVE approval gate is the ACTIVE prompt: its option block + footer
-# sit at/near the pane bottom, with nothing but KNOWN chrome below the footer.
-# Assistant prose that QUOTES a complete gate and then keeps talking (the
-# Hermes third repro) leaves arbitrary non-chrome text below the footer — so
-# requiring "only chrome follows the footer" rejects the quoted block while
-# keeping the live gate (whose visible-pane capture ends at/near the footer,
-# at most the input-box / status-bar chrome below).
+# A genuine LIVE approval gate is the ACTIVE bottom prompt: when Claude blocks
+# on it, the gate REPLACES the entire input box / status bar — the option block
+# + footer (plus the gate's own ``ctrl+<x>`` footer continuations) is the LAST
+# semantic content in the pane. EMPIRICAL RESOLUTION (round-2,
+# ``permission_webfetch_bgshells_v2.1.190.txt``, captured WITH 2 background
+# shells running): a live gate has NO ``❯`` input box, NO ``? for shortcuts``
+# status bar, and NO ``· N shell`` line below its footer — the ``· 2 shells``
+# line lives in the scrollback ABOVE the gate, never below it.
 #
-# DEFERRED RESIDUAL (PR-2, do NOT fix in PR-1): a fully-quoted gate that is
-# LITERALLY the last thing in the pane (nothing — not even chrome — after the
-# footer) is indistinguishable from a live gate by pane content alone, so it
-# still passes this check. In PR-1 (display-only) that is at worst a cosmetic
-# bogus card — no dispatch, no auto-approval. The definitive fix belongs in PR-2
-# (where dispatch makes it matter): gate the gate-card render/promotion on the
-# route's ``route_runtime.snapshot(route).notification_pending`` bit — a GENUINE
-# gate fires the Notification hook; quoted prose does not. It is deliberately
-# NOT coupled here in PR-1: tying render to the notification bit risks delaying a
-# legitimate card on the hook's timing, and PR-1 ships no dispatch.
+# So ``_only_chrome_below`` is an ALLOW-LIST (round-2 tightening over the
+# round-1 version, which wrongly allowed the input box + status bar and let a
+# fully-quoted gate-in-scrollback + the pane's normal input box still pass):
+# below the footer only BLANK lines, BARE box-drawing separators, and the
+# gate's OWN ``ctrl+<x>`` footer-continuation hints (``ctrl+g to edit script`` /
+# ``ctrl+e to explain`` / other ``ctrl+<x>`` continuations) are allowed. The
+# READY-FOR-INPUT chrome that only renders when the gate is NOT the live prompt
+# — the ``❯`` input box, the ``? for shortcuts`` / ``← for agents`` /
+# ``↓ to manage`` / ``esc to interrupt`` status bar, the ``· N shell(s)``
+# background-jobs line, the ``◐ … /effort`` indicator, the model/context status
+# bar — and any non-blank assistant prose all REJECT (a live gate replaces
+# them). Hermes's "a live gate with ``· N shell`` below its footer would be
+# false-negatived" worry is REFUTED by the bgshells capture (no status line
+# below a live footer), so the check is deliberately NOT loosened for it.
+#
+# Codex was correct (the input-box/status chrome reject closes the realistic
+# quoted-gate false positive); Hermes's false-negative is refuted by data.
+#
+# DEFERRED RESIDUAL (now NARROW; PR-2, do NOT fix in PR-1): a fully-quoted gate
+# that is the LITERAL last semantic content in the pane — with NO ready-for-input
+# chrome (no input box / status bar) below it — is indistinguishable from a live
+# gate by pane content alone, so it still passes. This is rare: it requires the
+# pane to be captured with the quoted gate at the very bottom AND Claude not
+# showing its input box (e.g. the capture landed between frames). In PR-1
+# (display-only) that is at worst a cosmetic bogus card — no dispatch, no
+# auto-approval. The definitive close belongs in PR-2 (where dispatch makes it
+# matter): gate the gate-card render/promotion on the route's
+# ``route_runtime.snapshot(route).notification_pending`` bit — a GENUINE gate
+# fires the Notification hook; quoted prose does not. It is deliberately NOT
+# coupled here in PR-1 (PR-1 stays pane-only per the plan): tying render to the
+# notification bit risks delaying a legitimate card on the hook's timing, and
+# PR-1 ships no dispatch. The empirically-tightened chrome check closes the
+# realistic case.
 
-# The Workflow ``ctrl+g to edit script in $EDITOR`` line is legitimate chrome
-# rendered on its OWN line BELOW the ``Esc to cancel`` footer.
-_RE_GATE_TRAILING_CTRLG = re.compile(r"^\s*ctrl[+-]g to edit script\b")
-# Claude Code input-box / status-bar chrome that can render below a live gate:
-# box-drawing corners/edges, the empty ``❯`` prompt, the model/context status
-# bar, and the run-interrupt hint. Anything else NON-BLANK below the footer is
-# treated as assistant prose → the gate is NOT the live bottom prompt.
-_RE_GATE_TRAILING_CHROME = re.compile(
-    r"^\s*(?:"
-    r"[─╌╭╮╰╯│┌┐└┘├┤┬┴┼━┃▐▌▛▜▝▘▗▖█\s]+"  # box-drawing / separator / banner
-    r"|❯\s*$"  # empty input prompt
-    r"|❯\s+\S.*$"  # input prompt with queued text (chrome, not gate prose)
-    r"|.*\besc to interrupt\b.*"  # run-interrupt hint
-    r"|⏵.*"  # auto-accept chrome
-    r"|.*Context(?: left)?:\s*\d+%.*"  # context status bar
-    r"|/[a-z-]+ for .*"  # slash-command hint footer
-    r")$"
-)
+# A BARE box-drawing / separator / banner line (no other content). Tolerated
+# below the footer ONLY when nothing ready-for-input follows it — a separator
+# that FRAMES an input box is harmless on its own (the input-box rule rejects
+# the ``❯`` line itself).
+_RE_GATE_TRAILING_SEPARATOR = re.compile(r"^\s*[─╌╭╮╰╯│┌┐└┘├┤┬┴┼━┃▐▌▛▜▝▘▗▖█\s]+$")
+# The gate's OWN footer continuation: a ``ctrl+<x> …`` hint line (``ctrl+g to
+# edit script`` for Workflow, ``ctrl+e to explain``, etc.) that renders on its
+# own line BELOW the ``Esc to cancel`` footer. char-class tolerant on the
+# ``+``/``-`` join.
+_RE_GATE_TRAILING_CTRL_HINT = re.compile(r"^\s*ctrl[+-]\S")
 
 
 def _only_chrome_below(lines: list[str], footer_idx: int) -> bool:
-    """True iff every non-blank line BELOW ``footer_idx`` is known chrome.
+    """True iff every non-blank line BELOW ``footer_idx`` is the gate's OWN
+    footer chrome (round-2 ALLOW-LIST, Codex P1).
 
-    The bottom-terminal requirement: a live gate's footer is at/near the pane
-    bottom (S-8). A blank line, a separator/box-drawing/banner line, the
-    Workflow ``ctrl+g to edit script`` line, the empty ``❯`` prompt, the
-    context/model status bar, and the run-interrupt hint are all chrome; any
-    other non-blank line is assistant prose ⇒ the gate is QUOTED, not live.
+    The bottom-terminal requirement: a live gate is the ACTIVE bottom prompt and
+    REPLACES the input box / status bar, so below the footer ONLY blank lines,
+    BARE box-drawing separators, and the gate's own ``ctrl+<x>`` footer
+    continuations are allowed. The ``❯`` input box, the ``? for shortcuts`` /
+    ``← for agents`` / ``↓ to manage`` / ``esc to interrupt`` status bar, the
+    ``· N shell(s)`` background-jobs line, the ``◐ … /effort`` indicator, the
+    model/context status bar, and any assistant prose all mean the gate is NOT
+    the live prompt (it is QUOTED in scrollback above a still-ready pane) ⇒
+    return False. Note the option cursor ``❯ 1.`` is ABOVE the footer, so any
+    ``❯`` line below it is the input box.
     """
     for i in range(footer_idx + 1, len(lines)):
         line = lines[i]
         if not line.strip():
             continue
-        if _RE_GATE_TRAILING_CTRLG.match(line):
+        if _RE_GATE_TRAILING_CTRL_HINT.match(line):
             continue
-        if _RE_GATE_TRAILING_CHROME.match(line):
+        if _RE_GATE_TRAILING_SEPARATOR.match(line):
             continue
+        # Anything else — an ``❯`` input box, a status-bar / shell-count line,
+        # the ``◐ /effort`` indicator, or arbitrary assistant prose — is
+        # ready-for-input chrome / quoted prose, never a live gate's own footer.
         return False
     return True
 

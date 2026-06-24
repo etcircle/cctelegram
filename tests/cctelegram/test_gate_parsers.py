@@ -514,33 +514,170 @@ def test_terminal_parser_imports_without_config_isolated() -> None:
     assert result.stdout.strip() == "False", result.stdout
 
 
-# ── Bottom-terminal: trailing input-box chrome does NOT false-reject ───────
+# ── Round-2 Codex P1: a QUOTED gate + the input box / status bar REJECTS ───
+#
+# EMPIRICAL RESOLUTION (``permission_webfetch_bgshells_v2.1.190.txt``): a live
+# blocking gate REPLACES the entire status bar — the option/footer block is the
+# LAST content, with NOTHING (no ``❯`` input box, no ``? for shortcuts`` status
+# bar, no ``· N shell`` line) below it. So a fully-quoted gate sitting in
+# scrollback FOLLOWED BY the pane's normal input box + status bar is exactly the
+# false positive the round-1 ``_only_chrome_below`` let through (it allowed the
+# empty ``❯`` box + status lines). The tightened check rejects that ready-for-
+# input chrome below the footer; the gate's OWN footer-continuation lines
+# (``ctrl+g``/``ctrl+e``) stay allowed.
+
+# A fully-quoted Permission gate (real options + ``(esc)``) in scrollback, then
+# the live pane's normal input box + status bar below it.
+_NEG_PERMISSION_QUOTED_THEN_INPUTBOX = (
+    " Do you want to allow Claude to fetch this content?\n"
+    " ❯ 1. Yes\n"
+    "   2. Yes, and don't ask again for example.com\n"
+    "   3. No, and tell Claude what to do differently (esc)\n"
+    "\n"
+    "────────────────────────────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────────────────────────────\n"
+    "  ? for shortcuts · ← for agents\n"
+)
+# A fully-quoted Workflow block (real options + footer) then input box + status.
+_NEG_WORKFLOW_QUOTED_THEN_INPUTBOX = (
+    " Run a dynamic workflow?\n"
+    " This dynamic workflow will spin up subagents.\n"
+    " Dynamic workflows can use a lot of tokens quickly.\n"
+    " ❯ 1. Yes, run it\n"
+    "   2. View raw script\n"
+    "   3. No\n"
+    " Esc to cancel · Tab to amend\n"
+    " ctrl+g to edit script in $EDITOR\n"
+    "\n"
+    "────────────────────────────────────────────────────────────────────────\n"
+    "❯ \n"
+    "  Opus 4.8 (1M context) · Context left: 42% · ↓ to manage\n"
+)
 
 
-@pytest.mark.parametrize("fixture", _PERMISSION_FIXTURES)
-def test_permission_with_trailing_input_box_chrome_still_detects(
-    gate_on, fixture: str
+@pytest.mark.parametrize(
+    ("pane", "gate"),
+    [
+        (_NEG_PERMISSION_QUOTED_THEN_INPUTBOX, "Permission"),
+        (_NEG_WORKFLOW_QUOTED_THEN_INPUTBOX, "Workflow"),
+    ],
+)
+def test_quoted_gate_then_inputbox_chrome_does_not_detect(
+    gate_on, pane: str, gate: str
 ) -> None:
-    """A LIVE permission gate followed by the Claude Code input-box / status-bar
-    chrome (the real live-pane shape) still detects — the bottom-terminal check
-    only rejects arbitrary assistant PROSE below the footer, not chrome."""
-    live = _load(fixture) + (
-        "\n"
-        "────────────────────────────────────────\n"
-        "❯ \n"
-        "────────────────────────────────────────\n"
-        "  Opus 4.8 · Context left: 42%\n"
-    )
-    result = extract_interactive_content(live)
-    assert result is not None, fixture
-    assert result.name == "Permission", fixture
+    """Round-2 Codex P1: a complete-but-QUOTED gate followed by the input box +
+    status bar (the pane's ready-for-input chrome) must NOT light a card — a
+    LIVE gate replaces that chrome (proven by the bgshells fixture)."""
+    assert extract_interactive_content(pane) is None, gate
 
 
-def test_workflow_with_trailing_ctrlg_and_chrome_still_detects(gate_on) -> None:
-    """The Workflow ``ctrl+g to edit script`` line + input-box chrome below the
-    footer are known chrome — the gate still detects."""
-    live = _load("workflow_dynamic_launch_v2.1.190.txt") + (
-        "\n────────────────────────────────────────\n❯ \n  Opus 4.8 · Context: 42%\n"
+def test_quoted_permission_then_inputbox_strict_parse_rejects(gate_on) -> None:
+    """The strict parser rejects the quoted-then-inputbox shape directly."""
+    assert parse_permission_prompt(_NEG_PERMISSION_QUOTED_THEN_INPUTBOX) is None
+
+
+def test_quoted_workflow_then_inputbox_strict_parse_rejects(gate_on) -> None:
+    """Same for the Workflow variant (input box / status bar below the footer)."""
+    assert parse_workflow_approval(_NEG_WORKFLOW_QUOTED_THEN_INPUTBOX) is None
+
+
+@pytest.mark.parametrize(
+    "status_line",
+    [
+        "  ? for shortcuts",
+        "  ← for agents",
+        "  ↓ to manage",
+        "  esc to interrupt",
+        "  ✻ Churned for 7s · 2 shells still running",
+        "  · 3 shell",
+        "  · 2 shells",
+        "  ◐ Opus 4.8 · /effort high",
+        "  Opus 4.8 (1M context) · Context left: 42%",
+    ],
+)
+def test_permission_with_status_chrome_below_footer_rejects(
+    gate_on, status_line: str
+) -> None:
+    """Any ready-for-input status-bar line below the footer means the gate is
+    NOT the live bottom prompt (a live gate replaces the status bar)."""
+    pane = _load("permission_bash_v2.1.190.txt") + f"\n{status_line}\n"
+    assert extract_interactive_content(pane) is None, status_line
+
+
+def test_permission_with_input_box_below_footer_rejects(gate_on) -> None:
+    """An ``❯`` input-box line below the footer (the option cursor ``❯ 1.`` is
+    ABOVE the footer, so a ``❯`` below it is the input box) rejects."""
+    pane = _load("permission_bash_v2.1.190.txt") + "\n❯ \n"
+    assert extract_interactive_content(pane) is None
+    pane2 = _load("permission_bash_v2.1.190.txt") + "\n❯ some queued text\n"
+    assert extract_interactive_content(pane2) is None
+
+
+# ── Round-2: the empirically-captured LIVE gate (with bg shells) STILL detects ─
+#
+# Hermes raised a false-negative worry: a live gate with a ``· N shell`` bg-jobs
+# status line below its footer would be rejected. The bgshells fixture REFUTES
+# that with real data — a live blocking gate has NO status line below the footer
+# (the option/footer block is the bottom; the ``· 2 shells`` line is in the
+# scrollback ABOVE, not below). Pin it as the regression.
+
+
+def test_live_gate_with_bg_shells_still_detects(gate_on) -> None:
+    """``permission_webfetch_bgshells_v2.1.190.txt`` — a LIVE WebFetch gate
+    captured with 2 background shells running. The footer is the bottom; there
+    is NO ``2 shells`` / status line below it, so the tightened bottom-terminal
+    check does NOT false-negative it (Hermes P2 refuted by data)."""
+    result = extract_interactive_content(
+        _load("permission_webfetch_bgshells_v2.1.190.txt")
     )
-    result = extract_interactive_content(live)
+    assert result is not None
+    assert result.name == "Permission"
+
+
+def test_live_gate_with_bg_shells_strict_parses(gate_on) -> None:
+    """The strict parser also accepts the bgshells live gate."""
+    form = parse_permission_prompt(_load("permission_webfetch_bgshells_v2.1.190.txt"))
+    assert form is not None
+    assert (
+        form.current_question_title
+        == "Do you want to allow Claude to fetch this content?"
+    )
+    assert [o.label for o in form.options] == [
+        "Yes",
+        "Yes, and don't ask again for example.org",
+        "No, and tell Claude what to do differently",
+    ]
+
+
+# ── Round-2: the gate's OWN footer-continuation chrome stays ALLOWED ───────
+
+
+def test_workflow_with_trailing_ctrlg_continuation_still_detects(gate_on) -> None:
+    """The Workflow ``ctrl+g to edit script`` line is the gate's OWN footer
+    continuation (renders below ``Esc to cancel`` on its own line) — it is NOT
+    ready-for-input chrome, so the gate still detects. (The fixture already has
+    it; this pins the behavior explicitly.)"""
+    result = extract_interactive_content(_load("workflow_dynamic_launch_v2.1.190.txt"))
     assert result is not None and result.name == "Workflow"
+
+
+def test_permission_with_trailing_ctrl_hint_continuation_still_detects(
+    gate_on,
+) -> None:
+    """A ``ctrl+e to explain`` footer-continuation line below the footer is the
+    gate's own chrome (not ready-for-input) — still detects."""
+    pane = _load("permission_bash_v2.1.190.txt") + "\n ctrl+e to explain\n"
+    result = extract_interactive_content(pane)
+    assert result is not None and result.name == "Permission"
+
+
+def test_permission_with_bare_trailing_separator_still_detects(gate_on) -> None:
+    """A bare trailing box-drawing separator with NOTHING after it is tolerated
+    (only an input box / status line BELOW it would reject)."""
+    pane = (
+        _load("permission_bash_v2.1.190.txt")
+        + "\n────────────────────────────────────────\n"
+    )
+    result = extract_interactive_content(pane)
+    assert result is not None and result.name == "Permission"
