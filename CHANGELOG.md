@@ -4,6 +4,22 @@ All notable changes to cc-telegram. Format loosely follows [Keep a Changelog](ht
 this project's package version is bumped per release, not per deploy (see the `--no-cache` note in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
+## [0.2.1] — 2026-06-24
+
+### Fixed
+- **AskUserQuestion descriptions card was suppressed for recommended options.** An AUQ whose
+  recommended option label ended in the literal `(Recommended)` lost its `📋 AskUserQuestion —
+  full details` message (the separate, multi-part-splittable message posted *before* the picker
+  card). The pane parser strips `(Recommended)` into a structured flag, but the PreToolUse
+  side-file label keeps it verbatim, so the pane-consistency predicate false-mismatched and the
+  render resolver bailed (`bail_label_mismatch`) — dropping the descriptions for the *same*
+  question (observed live on a busy topic; recurred on every AUQ whose recommended option carried
+  the suffix). Fixed by normalizing the trailing recommended suffix on both sides of the
+  side-file↔pane label compare (`auq_source._strip_recommended`, reusing the parser's
+  `_RE_RECOMMENDED`); confined to the suffix only, so wrong-question protection and mint/validate
+  parity are unchanged. The details-message and picker rendering are untouched. Peer-reviewed
+  (Codex + Hermes, both PASS); RED-first tests added.
+
 ## [0.2.0] — 2026-06-24
 
 The "busy-signal + AskUserQuestion bridge" release: ~190 commits since v0.1.0 making Telegram a
@@ -71,5 +87,6 @@ Initial tagged release: Telegram ↔ Claude Code bridge, topic-only architecture
 per-route message queues, MarkdownV2 output, streaming tool/thinking/status, photos + voice,
 reply context, and SQLite provenance.
 
+[0.2.1]: https://github.com/etcircle/cc-telegram/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/etcircle/cc-telegram/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/etcircle/cc-telegram/releases/tag/v0.1.0
