@@ -75,6 +75,48 @@ def _write_affordance_side_file(cc_dir: Path, session_id: str) -> dict:
     return tool_input
 
 
+# The di-copilot @4 false-bail shape, derived from the REAL affordance fixture:
+# the recommended option's LABEL carries the literal ``(Recommended)`` suffix.
+# The pane renders the suffix; the terminal parser strips it into a structured
+# ``recommended`` flag, so the visible pane label loses the suffix while the
+# side-file label keeps it — a naive label compare then false-mismatches.
+def _build_recommended_tool_input() -> dict:
+    sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
+    tool_input = json.loads(json.dumps(sidefile["tool_input"]))  # deep copy
+    opt0 = tool_input["questions"][0]["options"][0]
+    opt0["label"] = opt0["label"] + " (Recommended)"
+    return tool_input
+
+
+def _build_recommended_pane() -> str:
+    lines = _AFFORDANCE_PANE.read_text().splitlines()
+    lines[0] = lines[0].rstrip() + " (Recommended)"  # option 1's cursor line
+    return "\n".join(lines) + "\n"
+
+
+_RECOMMENDED_TOOL_INPUT = _build_recommended_tool_input()
+_RECOMMENDED_PANE = _build_recommended_pane()
+
+
+def _write_recommended_side_file(cc_dir: Path, session_id: str) -> dict:
+    """Write a side file whose recommended option label carries ``(Recommended)``."""
+    sidefile = json.loads(_AFFORDANCE_SIDEFILE.read_text())
+    pending = cc_dir / "auq_pending"
+    pending.mkdir(mode=0o700, exist_ok=True)
+    (pending / f"{session_id}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": session_id,
+                "tool_use_id": sidefile["tool_use_id"],
+                "written_at": time.time(),
+                "tool_input": _RECOMMENDED_TOOL_INPUT,
+            }
+        )
+    )
+    return _RECOMMENDED_TOOL_INPUT
+
+
 # ── side_file kind ───────────────────────────────────────────────────────────
 
 
@@ -624,6 +666,26 @@ class TestResolveAuqSourceForDispatch:
         finally:
             _unbind_window(self._WID)
 
+    def test_recommended_suffix_side_file_stays_side_file(self, _cc_dir):
+        """Dispatch path: a side file whose recommended option label carries the
+        literal ``(Recommended)`` suffix must still resolve to ``side_file``
+        (consistent) — the pane parser strips the suffix while the side-file
+        label keeps it, and the predicate normalizes both sides. Pre-fix this
+        fail-closed to ``pane`` (label_mismatch) — the di-copilot @4 shape that
+        also dropped the descriptions card on the render path.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_recommended_side_file(_cc_dir, self._SID)
+            src = auq_source.resolve_auq_source_for_dispatch(
+                self._WID, _RECOMMENDED_PANE
+            )
+            assert src.kind == "side_file"
+            assert src.payload == tool_input
+            assert src.form is not None
+        finally:
+            _unbind_window(self._WID)
+
     def test_aged_side_file_stays_side_file_unlike_resolve_auq_source(self, _cc_dir):
         """The drift kill: a side file aged PAST the 300s read-TTL flips
         ``resolve_auq_source`` to ``pane`` but ``..._for_dispatch`` keeps it
@@ -897,6 +959,49 @@ class TestRenderResolver:
             assert r.dispatch_trusted is True
         finally:
             _unbind_window(self._WID)
+
+    def test_recommended_suffix_label_is_side_file_ok_not_false_bail(self, _cc_dir):
+        """A side file whose recommended option label carries the literal
+        ``(Recommended)`` suffix must still be judged CONSISTENT with the live
+        pane and yield ``side_file_ok`` (so the 📋 descriptions card posts).
+
+        The pane parser strips ``(Recommended)`` from the visible label into a
+        structured flag, while the PreToolUse side file retains it verbatim — so
+        a naive label compare false-mismatches and the resolver bails
+        (``bail_label_mismatch``), dropping the descriptions for the SAME
+        question. Regression from di-copilot @4 (2026-06-24): every AUQ whose
+        recommended option carried the suffix lost its descriptions card.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _write_recommended_side_file(_cc_dir, self._SID)
+            r = auq_source.resolve_auq_source_for_render(self._WID, _RECOMMENDED_PANE)
+            assert r.decision == "side_file_ok"
+            assert r.kind == "side_file"
+            assert r.dispatch_trusted is True
+            assert r.payload == tool_input
+        finally:
+            _unbind_window(self._WID)
+
+    def test_recommended_suffix_record_consistent_with_pane(self, _cc_dir):
+        """Unit: the consistency predicate accepts a recommended-suffix label
+        mismatch (the root predicate behind the false bail above)."""
+        from cctelegram.handlers.auq_source import (
+            PreToolAskRecord,
+            _record_consistent_with_pane,
+        )
+
+        tool_input = _RECOMMENDED_TOOL_INPUT
+        record = PreToolAskRecord(
+            session_id=self._SID,
+            tool_use_id="toolu_rec_test",
+            tool_input=tool_input,
+            written_at=time.time(),
+            input_fingerprint="",
+        )
+        pane_form = resolve_ask_form(None, _RECOMMENDED_PANE)
+        assert pane_form is not None
+        assert _record_consistent_with_pane(record, pane_form) == (True, "ok")
 
 
 class TestRenderIdentity:

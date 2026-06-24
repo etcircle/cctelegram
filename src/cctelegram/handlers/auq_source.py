@@ -704,16 +704,36 @@ def _safe_record_labels(question: dict) -> tuple[str, ...] | None:
     return tuple(labels)
 
 
+def _strip_recommended(label: str) -> str:
+    """Strip a trailing case-insensitive ``(Recommended)`` suffix from a label.
+
+    The pane parser removes this suffix into the structured ``recommended``
+    flag (``terminal_parser._parse_numbered_options``), but the PreToolUse
+    side-file label retains it verbatim. Normalizing BOTH sides before a label
+    compare keeps a recommended option from spuriously failing the
+    pane-consistency check — the di-copilot ``bail_label_mismatch`` false bail
+    that dropped the 📋 descriptions card for the SAME question. Confined to the
+    recommended suffix ONLY — deliberately NOT lowercasing / whitespace-
+    collapsing, which would loosen the wrong-question protection.
+    """
+    from ..terminal_parser import _RE_RECOMMENDED
+
+    return _RE_RECOMMENDED.sub("", label).rstrip()
+
+
 def _labels_are_subsequence(visible: tuple[str, ...], full: tuple[str, ...]) -> bool:
     """True if ``visible`` is a contiguous subsequence of ``full``.
 
     The pane may render only the visible region; earlier options can be
     pushed off the top by long descriptions. We still accept the record
     if whatever IS visible matches the corresponding contiguous slice of
-    the record's labels.
+    the record's labels. Labels are compared recommended-suffix-normalized
+    (the pane strips ``(Recommended)``; the side file keeps it).
     """
     if not visible:
         return False
+    visible = tuple(_strip_recommended(v) for v in visible)
+    full = tuple(_strip_recommended(f) for f in full)
     if len(visible) > len(full):
         return False
     for start in range(len(full) - len(visible) + 1):
@@ -745,7 +765,9 @@ def _pane_labels_match_candidate_by_number(
         assert option.number is not None
         index = option.number - 1
         if 0 <= index < len(candidate_labels):
-            if candidate_labels[index] != option.label:
+            if _strip_recommended(candidate_labels[index]) != _strip_recommended(
+                option.label
+            ):
                 return False
             checked_any = True
         else:
