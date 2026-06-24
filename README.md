@@ -28,29 +28,45 @@ Zero to working bot in a handful of commands:
 
 ```bash
 git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
-uv tool install --force .
-mkdir -p ~/.cc-telegram && $EDITOR ~/.cc-telegram/.env  # TELEGRAM_BOT_TOKEN, ALLOWED_USERS, TMUX_SESSION_NAME, CLAUDE_COMMAND
+uv tool install --force --no-cache .   # --no-cache REQUIRED — see note below
+mkdir -p ~/.cc-telegram && $EDITOR ~/.cc-telegram/.env  # TELEGRAM_BOT_TOKEN + ALLOWED_USERS (the only two required)
 cc-telegram hook --install
-cc-telegram doctor       # verify all green
-# Then either: cc-telegram (foreground) or install the launchd plist
+cc-telegram doctor       # checks token/users/tmux/claude/SessionStart-hook/config-dir
+cc-telegram              # foreground, or daemonize on macOS with: bash bin/install-service.sh
 ```
+
+> **`--no-cache` is mandatory.** uv's wheel cache is keyed on the package version, and the version is not bumped on every deploy — so `uv tool install --force .` *alone* silently reinstalls a stale cached wheel (exits 0, your code never ships). See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for the full end-to-end guide: launchd setup, the upgrade recipe and why, Claude Code auth, verification, and troubleshooting. New code agent? Start at **[AGENTS.md](AGENTS.md)**.
 
 ## Requirements
 
 - Python 3.12+
 - `uv`
 - `tmux`
-- Claude Code CLI (`claude`) in `PATH`
+- Claude Code CLI (`claude`) in `PATH`, **independently authenticated** — run `claude` once interactively to log in (cc-telegram manages no Anthropic credentials; it only drives the `claude` binary, so an unauthenticated CLI shows opaque failures inside the topic)
 - Telegram bot token from [@BotFather](https://t.me/BotFather)
 - A Telegram supergroup with forum topics enabled
 
 ## Install
 
+Two modes — pick one.
+
+**Install as a tool (production / the deploy path):**
+
 ```bash
-git clone https://github.com/etcircle/cc-telegram.git
-cd cc-telegram
-uv sync --all-extras
+git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
+uv tool install --force --no-cache .   # puts `cc-telegram` on PATH at ~/.local/bin
 ```
+
+Then use bare `cc-telegram …`. `--no-cache` is required because the version is not bumped on every deploy (see the Quick start note).
+
+**Run from source (development):**
+
+```bash
+git clone https://github.com/etcircle/cc-telegram.git && cd cc-telegram
+uv sync --all-extras          # creates the dev .venv; does NOT put `cc-telegram` on PATH
+```
+
+Then always prefix commands with `uv run` (e.g. `uv run cc-telegram doctor`, `uv run cc-telegram`).
 
 ## Configure
 
@@ -69,7 +85,7 @@ Core variables:
 - `TMUX_SESSION_NAME` — tmux session driven by the bot; default `cc-telegram`.
 - `CLAUDE_COMMAND` — command used for new windows; default `claude`.
 - `CLAUDE_CONFIG_DIR` — Claude config root; projects default to `$CLAUDE_CONFIG_DIR/projects`.
-- `CC_TELEGRAM_CLAUDE_PROJECTS_PATH` — explicit Claude projects directory override.
+- `CC_TELEGRAM_CLAUDE_PROJECTS_PATH` — explicit Claude projects directory override. Precedence: `CC_TELEGRAM_CLAUDE_PROJECTS_PATH` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`.
 - `MONITOR_POLL_INTERVAL` — JSONL poll interval; default `2.0`.
 - `CC_TELEGRAM_BROWSE_ROOT` — directory picker root; default `~`.
 - `OPENAI_API_KEY` / `OPENAI_BASE_URL` — optional voice transcription provider.
@@ -96,6 +112,7 @@ Useful behavior knobs:
 - `CC_TELEGRAM_TOOL_SUMMARY_MAX_CHARS` — max input shown in `**Tool**(...)`; default `40`.
 - `CC_TELEGRAM_AGENT_PROMPT_PREVIEW_CHARS` — subagent dispatch excerpt; default `400`.
 - `CC_TELEGRAM_REPLY_CONTEXT` — inject reply/quote context; default `true`.
+- `CC_TELEGRAM_REPLY_CROSS_SESSION` — when `true` (default), a reply quoting a message from a previous Claude session is rendered with an annotated cross-session marker rather than silently dropped; set `false` to revert to the older silent-drop behavior.
 - `CC_TELEGRAM_QUOTE_INJECTION_MAX_CHARS` — max quoted text injected into Claude; default `1600`.
 - `CC_TELEGRAM_AGGREGATOR_DEBOUNCE_SECONDS` — media/caption coalescing window; default `1.5`.
 - `CC_TELEGRAM_AGGREGATOR_MAX_ATTACHMENTS` — per-bundle attachment cap; default `10`.
@@ -128,13 +145,13 @@ All state files are safe to delete — the bot re-creates what it needs on next 
 
 ## Voice transcription
 
-Voice notes are transcribed via a standard OpenAI `POST $OPENAI_BASE_URL/audio/transcriptions` call with `Authorization: Bearer $OPENAI_API_KEY`. Point `OPENAI_BASE_URL` at anything that speaks that shape:
+Voice notes are transcribed via a standard OpenAI `POST $OPENAI_BASE_URL/audio/transcriptions` call with `Authorization: Bearer $OPENAI_API_KEY`. The transcription model is **hardcoded to `gpt-4o-transcribe`** (`transcribe.py`; no override env var), so the backend must expose that exact model name. `OPENAI_API_KEY` is required **for voice only** — without it, voice notes fail with a raw 401. Point `OPENAI_BASE_URL` at anything that speaks that shape:
 
 - `https://api.openai.com/v1` — the default.
-- `https://openrouter.ai/api/v1` — OpenRouter exposes whisper-1 over the same API.
-- A local LiteLLM, vLLM, or other OpenAI-compatible gateway.
+- A local LiteLLM, vLLM, or other OpenAI-compatible gateway that serves `gpt-4o-transcribe`.
+- A backend exposing only a different STT model (e.g. OpenRouter's `whisper-1`) will return a model-not-found error unless fronted by a model-name-translating proxy.
 
-If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whisper.cpp` server with its `/inference` endpoint), front it with a small shape-translating proxy. A 130-line stdlib-only example lives next to this repo as [`whisper-openai-proxy/`](../whisper-openai-proxy) — clone or copy, point `OPENAI_BASE_URL` at it.
+If your backend doesn't natively speak OpenAI's STT shape (e.g., a local `whisper.cpp` server with its `/inference` endpoint), or serves a different model name, front it with a small shape-translating proxy and point `OPENAI_BASE_URL` at that. (An external `whisper-openai-proxy` example — a ~130-line stdlib-only shim — is an optional companion; it is not part of this repo.)
 
 ## Install the Claude Code hook
 
@@ -174,6 +191,8 @@ This writes/updates `~/.claude/settings.json` with three managed hook entries:
 ```
 
 The `SessionStart` hook writes `session_map.json` so the bot can route messages back to the right tmux window. The `PreToolUse` hook (matcher `AskUserQuestion`) captures the structured question payload before Claude renders the picker — see the next section. The `Notification` hook (matcher-less) writes a window-keyed `notify_pending/<session_id>.json` marker when Claude blocks on a permission / approval prompt, so the bot can flip the topic to "🔔 Waiting on you" — the only detection path for approval gates that never reach the session JSONL. No notification text is stored in the marker. If either the `PreToolUse` or the `Notification` entry is missing, the bot logs a one-time startup warning; re-run `cc-telegram hook --install` to repair.
+
+> **`cc-telegram doctor` only verifies the `SessionStart` hook.** Confirm all three managed entries installed with `grep -c 'cc-telegram hook' ~/.claude/settings.json` (expect `3`); a missing `PreToolUse`/`Notification` also surfaces as the one-time startup-log warning above.
 
 ### AskUserQuestion (AUQ) descriptions
 
@@ -227,11 +246,22 @@ If installed as a tool:
 cc-telegram
 ```
 
-For day-to-day use, run it inside tmux or a process supervisor.
+For day-to-day use, run it under launchd (below) or a process supervisor.
+
+## Run under launchd (macOS)
+
+**No main-bot plist ships in the repo.** Generate and load the LaunchAgent (label `com.cc-telegram`) with the bundled installer:
+
+```bash
+bash bin/install-service.sh          # writes ~/Library/LaunchAgents/com.cc-telegram.plist, then bootstrap + enable
+bash bin/install-service.sh --print  # dry-run: print the plist it would write (still needs cc-telegram on PATH)
+```
+
+`cc-telegram` must already be on PATH (install as a tool, above). The script sets an explicit `PATH` in the plist so launchd can find `cc-telegram`/`tmux`/`claude`, enables `KeepAlive`+`RunAtLoad`, and redirects stdout/stderr to `$CC_TELEGRAM_DIR/launchd.{out,err}.log`. Hand-written-plist instructions and the full rationale are in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** section 7.
 
 ## Restart the service
 
-If the bot runs under launchd (the recommended setup on macOS), restart it with:
+Once the LaunchAgent exists, restart (kill + relaunch) the bot with:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.cc-telegram
@@ -345,7 +375,12 @@ src/cctelegram/_md_display_appender.py    tiny stdlib MessageDisplay hook (appen
 tests/                              pytest suite
 tests/scenarios/                    black-box behavior floor (@pytest.mark.scenario)
 bin/post-wave-check.sh              repo-health diff for the architecture campaign
+bin/install-service.sh              generate + load the com.cc-telegram LaunchAgent (macOS)
+bin/install-log-rotate.sh           install the log-rotation LaunchAgent
 .claude/rules/                      architecture notes loaded by Claude Code
+docs/DEPLOYMENT.md                  end-to-end deploy + upgrade + troubleshooting guide
+AGENTS.md                           top-level orientation for code agents
+CLAUDE.md                           build/test commands + core design constraints
 ```
 
 ## License
