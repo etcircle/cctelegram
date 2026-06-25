@@ -32,7 +32,7 @@ import pytest
 
 from cctelegram import bot as bot_module
 from cctelegram.handlers import inbound_telegram as inbound_module
-from cctelegram import route_runtime, transcript_event_adapter
+from cctelegram import route_runtime, terminal_parser, transcript_event_adapter
 from cctelegram.session import session_manager as _real_sm
 from cctelegram.tmux_manager import TmuxWindow, tmux_manager as _real_tmux
 from cctelegram.utils import app_dir
@@ -775,6 +775,11 @@ def _reset_all_handler_state() -> None:
     auq_ledger.reset_for_tests()
     route_runtime.reset_for_tests()
     transcript_event_adapter.reset_for_tests()
+    # Re-read the CC_TELEGRAM_PERMISSION_PROMPTS gate-detection flag from the
+    # environment so a scenario that enabled it (set_permission_prompts_enabled
+    # / env) never leaks into the next scenario (the leaf autouse fixture in
+    # tests/cctelegram/conftest.py covers unit tests; scenarios live elsewhere).
+    terminal_parser.reset_for_tests()
     attention.reset_for_tests()
     message_queue.reset_for_tests()
     interactive_ui.reset_for_tests()

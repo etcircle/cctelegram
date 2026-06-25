@@ -1,0 +1,24 @@
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Bug fixes and reliabil… │
+│   Opus 4.8 (1M context) with me… · Claude Max ·    │ Added `sandbox.credent… │
+│   user@example.com's Organization                │ Added org-configured m… │
+│             /private/tmp/gatecap-work              │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Fetch https://example.com and tell me the page title in one line.
+
+⏺ Fetch(https://example.com)
+
+────────────────────────────────────────────────────────────────────────────────
+ Fetch
+
+   url: "https://example.com", prompt: "What is the page title (the <title>
+   element)?"
+   Claude wants to fetch content from example.com
+
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for example.com
+   3. No, and tell Claude what to do differently (esc)

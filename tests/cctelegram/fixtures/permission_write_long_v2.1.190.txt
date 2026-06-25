@@ -1,0 +1,24 @@
+  29 The deepest trenches hide in a pressure no light has seen.
+  30 Strange luminous fish haunt those crushing black abysses.
+  31 The ocean covers most of the world yet remains half unknown.
+  32 Every river hurries toward this vast and final home.
+  33 Rain falls and the sea quietly welcomes back its own.
+  34 The tide breathes out and the long beach lies bare and gleaming.
+  35 Crabs scuttle sideways across the wet reflecting sand.
+  36 The wind reads the water like a restless open book.
+  37 Sunset spills molten gold across the heaving waves.
+  38 Night drapes the sea in a blanket stitched with stars.
+  39 The lighthouse blinks its lonely warning to the dark.
+  40 Foam laces the rocks like the trim of an old gown.
+  41 The sea remembers everything and confesses nothing at all.
+  42 It will outlast the towns and the names we give to shores.
+  43 Listen closely and the ocean tells you that you are very small.
+  44 Yet standing at its edge you feel impossibly alive.
+  45 The ocean rolls on, patient and eternal, long after we are gone.
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create poem.txt?
+ ❯ 1. Yes
+   2. Yes, allow all edits during this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend

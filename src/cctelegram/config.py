@@ -121,6 +121,20 @@ class Config:
             os.getenv("CC_TELEGRAM_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Interactive approval-gate cards (Permission / Workflow). Default OFF.
+        # When ON, tool-permission prompts (bridged user-launched / resumed,
+        # non-bypass sessions) and the Workflow tool's dynamic-workflow-launch
+        # approval surface in Telegram as a card with the manual ↑/↓/⏎/Esc nav
+        # keyboard (display-only in this release — no one-tap option button).
+        # config OWNS this canonical declaration for documentation + the README
+        # sync rule; ``terminal_parser`` is a pure stdlib leaf and reads the
+        # SAME env var via a LOCAL ``os.getenv`` (it must not import config,
+        # which raises without a bot token), so this attribute is intentionally
+        # not the runtime authority — the parser flag is.
+        self.permission_prompts_enabled = os.getenv(
+            "CC_TELEGRAM_PERMISSION_PROMPTS", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
         # Max length of the per-tool input string surfaced in tool_use summary
         # lines (e.g. "**Bash**(<command>)", "**Read**(<path>)"). Long inputs
         # are truncated with a "…" marker. Default 40 keeps the activity feed

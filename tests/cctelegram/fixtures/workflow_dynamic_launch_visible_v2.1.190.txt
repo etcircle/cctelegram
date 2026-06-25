@@ -1,0 +1,24 @@
+
+
+⏺ Workflow(Summarize three aspects of the ocean in parallel: tides, depth, life)
+
+────────────────────────────────────────────────────────────────────────────────
+ Run a dynamic workflow?
+
+  Summarize three aspects of the ocean in parallel: tides, depth, life
+
+  This dynamic workflow will spin up multiple subagents across the following
+  phases:
+    1. Summarize — one agent per aspect
+       · "a.prompt"
+
+  Dynamic workflows can use a lot of tokens quickly by running many subagents
+  in parallel — which counts against your usage limit. Stop a running workflow
+  at any time with /workflows, or disable dynamic workflows in /config.
+
+  ❯ 1. Yes, run it
+    2. View raw script
+    3. No
+
+  Esc to cancel · Tab to amend
+  ctrl+g to edit script in $EDITOR

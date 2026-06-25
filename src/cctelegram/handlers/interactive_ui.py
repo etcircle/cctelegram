@@ -4,7 +4,10 @@ Handles interactive terminal UIs displayed by Claude Code:
   - AskUserQuestion: Multi-choice question prompts (one rolling card per
     route; multi-question forms are walked tab-by-tab in the same card).
   - ExitPlanMode: Plan mode exit confirmation
-  - Permission Prompt: Tool permission requests
+  - Permission / Workflow approval gates: tool-permission prompts and the
+    Workflow dynamic-workflow-launch approval — DISPLAY-ONLY in PR-1 (a labels
+    card + the manual ↑/↓/⏎/Esc nav keyboard, no semantic option-pick button),
+    behind the ``CC_TELEGRAM_PERMISSION_PROMPTS`` flag.
   - RestoreCheckpoint: Checkpoint restoration selection
 
 Provides:
@@ -40,6 +43,7 @@ from ..session import (
 from ..terminal_parser import (
     REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
+    InteractiveUIContent,
     extract_epm_plan_file_path,
     extract_interactive_content,
     parse_ask_user_question,
@@ -2625,6 +2629,39 @@ def _build_interactive_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+# ── Interactive approval-gate (Permission / Workflow) display-only card ────
+#
+# PR-1 surfaces the gates with the EXISTING window-keyed manual ↑/↓/⏎/Esc nav
+# keyboard and NO semantic option-pick buttons. The card honestly labels the
+# nav controls as raw, un-cursor-verified live-pane keystrokes (Hermes P2-1):
+# a ⏎/Esc tap sends a literal keystroke to whatever the live cursor is on,
+# with no classify / verify / ledger (those are PR-2). The card body already
+# carries the full pane region (extracted question + options + — for Workflow
+# — phases + token warning), so the user reads the choices before acting.
+
+_GATE_RENDER_NAMES: frozenset[str] = frozenset({"Permission", "Workflow"})
+
+_GATE_NAV_NOTICE = (
+    "⚠️ These controls type directly into the live terminal and are NOT "
+    "double-checked against the cursor — read the options above, then tap "
+    "↑/↓ to move and ⏎ Enter to confirm (or ⎋ Esc to decline)."
+)
+
+
+def _gate_card_text(content: InteractiveUIContent) -> str:
+    """Compose the display-only gate card body: the extracted pane region
+    (question + options, and for Workflow the phases + token-cost warning)
+    followed by the honest un-verified-keystroke notice (P2-1).
+
+    The raw extracted region (``content.content``) is the body — it already
+    contains everything the user needs to read, including the Workflow phases
+    and the "Dynamic workflows can use a lot of tokens" warning. PR-1 adds NO
+    pick buttons; PR-2 will add a verified one-tap "Yes".
+    """
+    body = content.content.rstrip()
+    return f"{body}\n\n{_GATE_NAV_NOTICE}"
+
+
 # The per-tab card state machine (PRs #11/12/13) was retired in Wave 2 —
 # git history pre-2026-05-26 has the deleted implementation. Multi-question
 # AskUserQuestion forms are now handled by the single-card path below,
@@ -2969,9 +3006,11 @@ async def handle_interactive_ui(
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
 
-    Handles AskUserQuestion, ExitPlanMode, Permission Prompt, and
-    RestoreCheckpoint UIs. Returns True if UI was detected and sent,
-    False otherwise.
+    Handles AskUserQuestion, ExitPlanMode, RestoreCheckpoint, and — behind the
+    ``CC_TELEGRAM_PERMISSION_PROMPTS`` flag — the Permission / Workflow approval
+    gates (display-only in PR-1: a labels card + the manual nav keyboard, no
+    option-pick buttons). Returns True if UI was detected and sent, False
+    otherwise.
 
     ``tool_input`` is the raw JSONL ``tool_use.input`` dict when explicitly
     available from JSONL dispatch/replay. For a live pending AskUserQuestion,
@@ -3173,6 +3212,14 @@ async def handle_interactive_ui(
                 )
                 if built:
                     pick_rows = built
+    elif content.name in _GATE_RENDER_NAMES:
+        # PR-1 interactive approval gate (Permission / Workflow), DISPLAY-ONLY.
+        # No pick buttons (pick_rows stays None) — the user answers via the
+        # window-keyed manual ↑/↓/⏎/Esc nav keyboard below. The card body is
+        # the extracted pane region + the honest un-verified-keystroke notice
+        # (P2-1). PR-2 will add a verified one-tap "Yes" through a gate-aware
+        # validator; until then there is NO semantic option-button dispatch.
+        text = _gate_card_text(content)
 
     # Build message with navigation keyboard (structured rows on top when
     # available, keystroke nav row below for free-text / manual paths).
@@ -3323,14 +3370,21 @@ async def handle_interactive_ui(
         # a stale entry about to be replaced must NOT suppress live prose (codex
         # PR-C+D re-review). Idempotent + best-effort; a no-op when there's no
         # fresh live capture. Covers both AskUserQuestion and ExitPlanMode.
-        await _maybe_post_live_prose(
-            bot,
-            user_id=user_id,
-            thread_id=thread_id,
-            chat_id=chat_id,
-            window_id=window_id,
-            ui_name=content.name,
-        )
+        #
+        # §6: SKIP live-prose for the Permission / Workflow gates. The dedup
+        # (``session_monitor.filter_live_prose_duplicates``) is AUQ/EPM-only, so
+        # a gate live-prose post would DOUBLE with the post-resolution JSONL
+        # copy. Gate prose flows through the normal JSONL path (undeduped but
+        # single).
+        if content.name not in _GATE_RENDER_NAMES:
+            await _maybe_post_live_prose(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                chat_id=chat_id,
+                window_id=window_id,
+                ui_name=content.name,
+            )
 
         # ExitPlanMode: post the plan BODY before the card so the user sees what
         # they're approving (the card itself carries no plan text). Ordered

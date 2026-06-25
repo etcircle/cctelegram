@@ -325,6 +325,24 @@ async def _reconcile_decision_card(
                 prompt_text=NOTIFY_DECISION_PROMPT,
                 kind=NOTIFY_DECISION_KIND,
             )
+        else:
+            # PR-1 dismiss-on-surface (interactive approval gate §3): both
+            # gates ALWAYS fire the Notification hook, so on tick 1 the generic
+            # "🔔 needs a decision" card can win the race and be posted BEFORE
+            # the gate card publishes (has_interactive_surface was False then).
+            # On subsequent ticks the has_interactive_surface gate above only
+            # SUPPRESSES a re-post — it never dismissed an already-posted card,
+            # so the two cards coexisted for the whole live window. Now that the
+            # actionable gate card owns the surface, dismiss the redundant
+            # generic nudge (kind-scoped + idempotent — no-op when no decision
+            # card exists or a different-kind card is live). The bit still
+            # drives the digest 🔔 + typing-off (the route IS waiting).
+            await attention.dismiss_if_kind(
+                bot,
+                user_id=user_id,
+                thread_id=thread_id,
+                kind=NOTIFY_DECISION_KIND,
+            )
         return
     if (
         snap.notification_clear_reason

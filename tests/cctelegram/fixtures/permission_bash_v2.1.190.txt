@@ -1,0 +1,24 @@
+⏺ Here's the contents of /tmp/gatecap-work:
+
+  - sample.txt (21 bytes)
+  - scratch.py (22 bytes)
+
+✻ Sautéed for 5s
+
+❯ Run the bash command: touch /tmp/gatecap-work/probe.txt && echo done
+
+⏺ Running 1 shell command…
+  ⎿  $ touch /tmp/gatecap-work/probe.txt && echo done
+
+────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   touch /tmp/gatecap-work/probe.txt && echo done
+   Create probe.txt and echo done
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to gatecap-work/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain

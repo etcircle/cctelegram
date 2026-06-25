@@ -1,0 +1,6 @@
+⏺ A dynamic workflow can spin up subagents. The picker normally asks
+  "Run a dynamic workflow?" and warns that
+  "Dynamic workflows can use a lot of tokens quickly". This message is
+  just narration — no numbered options, no Esc footer below it.
+
+✻ Cooking for 2s

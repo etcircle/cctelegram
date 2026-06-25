@@ -8,6 +8,24 @@ import time
 
 import pytest
 
+from cctelegram import terminal_parser
+
+
+# ── Reset-seam protocol (leaf modules) ────────────────────────────────────
+#
+# ``terminal_parser`` is a pure stdlib leaf carrying the
+# ``CC_TELEGRAM_PERMISSION_PROMPTS`` gate-detection flag as module state. A
+# test that toggles it (via ``set_permission_prompts_enabled`` or by setting
+# the env var) must not leak the value into the next test — so re-read the
+# flag from the environment before AND after every test in this package
+# (MEMORY ``feedback_reset_seam_promotion`` / ``feedback_test_reset_silent_noop``).
+@pytest.fixture(autouse=True)
+def _reset_terminal_parser_flag():
+    terminal_parser.reset_for_tests()
+    yield
+    terminal_parser.reset_for_tests()
+
+
 # ── JSONL entry factories ────────────────────────────────────────────────
 
 

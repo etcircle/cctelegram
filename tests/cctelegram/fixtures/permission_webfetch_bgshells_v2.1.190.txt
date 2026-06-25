@@ -1,0 +1,24 @@
+❯ Use the Bash tool with run_in_background=true to run: sleep 600 . Do not wait
+  for it.
+
+  Ran 1 shell command
+
+⏺ Started sleep 600 in the background (ID: b60ji6o1i). Not waiting on it.
+
+✻ Churned for 7s · 2 shells still running
+
+❯ Fetch https://example.org and give me its title.
+
+⏺ Fetch(https://example.org)
+
+────────────────────────────────────────────────────────────────────────────────
+ Fetch
+
+   url: "https://example.org", prompt: "What is the page title (the <title>
+   element)?"
+   Claude wants to fetch content from example.org
+
+ Do you want to allow Claude to fetch this content?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for example.org
+   3. No, and tell Claude what to do differently (esc)

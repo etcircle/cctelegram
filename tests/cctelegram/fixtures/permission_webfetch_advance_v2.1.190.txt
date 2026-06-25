@@ -1,0 +1,24 @@
+│               Welcome back Emiliyan!               │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Bug fixes and reliabil… │
+│   Opus 4.8 (1M context) with me… · Claude Max ·    │ Added `sandbox.credent… │
+│   user@example.com's Organization                │ Added org-configured m… │
+│             /private/tmp/gatecap-work              │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Fetch https://example.com and tell me the page title in one line.
+
+⏺ Fetch(https://example.com)
+  ⎿  Received 559 bytes (200 OK)
+
+⏺ The page title is: Example Domain
+
+✻ Brewed for 8s
+
+────────────────────────────────────────────────────────────────────────────────
+❯ also fetch the first link on the page
+────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts · ← for agents

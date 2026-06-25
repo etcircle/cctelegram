@@ -1,0 +1,7 @@
+⏺ When Claude wants to fetch a URL it shows a prompt asking
+  "Do you want to allow Claude to fetch this content?". You answer it
+  in the terminal — there is no option block here, just my explanation.
+
+✻ Brewed for 3s
+──────────────────────────────────────
+❯
