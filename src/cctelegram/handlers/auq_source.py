@@ -1241,6 +1241,136 @@ def read_side_file_for_recovery(session_id: str) -> RecoverySideFile | None:
     )
 
 
+_CTX_EVIDENCE_MIN_NUMBERED_MATCHES = (
+    2  # defeats a SINGLE coincidental label (round-2 P1b);
+)
+#                                         LOAD-BEARING — recovers the DiCopilot 3-option case
+#                                         (2 surviving matches). N>=3 re-breaks the bug. Do not
+#                                         change without re-confirming the DiCopilot positive.
+_CTX_TITLE_MIN_CHARS = 8  # GENUINE absolute floor — NOT min(8, len(shorter)),
+#                           which is tautological vs `len(shorter) >= threshold`
+#                           (see terminal_parser._strong_match:2501-2512). A fixed
+#                           literal: a sub-8-char coincidental pane title can NEVER
+#                           clear Leg A; only genuine >=8-char corroboration does.
+
+
+def _ctx_recovery_candidate(record, pane_form):
+    """Read-only re-derivation of the SAME candidate question
+    _record_consistent_with_pane chose (auq_source.py:808-834), so the floor
+    scores against the MATCHED question. FAIL-CLOSED SUBSET of the resolver's
+    candidate-pick (single-Q -> q0; tab-inferred+title -> bidirectional-startswith
+    title match; else subsequence-first fallthrough) WITHOUT mutating anything.
+    Returns the dict or None.
+
+    NOTE (round-3 P3, candidate-parity is a SUBSET, not exact): this helper's
+    fallthrough picks the first question whose labels are a CONTIGUOUS
+    SUBSEQUENCE of the visible pane labels (_labels_are_subsequence, mirroring
+    _record_consistent_with_pane:822-834). But the resolver's FINAL accept
+    (_pane_labels_match_candidate_by_number, auq_source.py:745-777) is
+    numbered-SLOT based, which can ACCEPT a gappy-but-slot-consistent partial
+    pane that this subsequence picker REJECTS. So the helper recovers a STRICT
+    SUBSET of the resolver's acceptances (fail-closed: it can only return a
+    candidate the resolver also accepts, never a candidate the resolver would
+    reject -> never a wrong card; it may decline a card the resolver-loose path
+    would have allowed -> a bounded, safe false-negative). The parity unit
+    asserts SUBSET (helper-accepts => resolver-accepts), NOT exact equality.
+
+    Intentionally DUPLICATES the resolver's pick (~15 read-only LoC) instead of
+    refactoring _record_consistent_with_pane to surface its candidate — that
+    would touch a function the plan forbids changing. A shared
+    `_pick_candidate_question` is a cleaner follow-up ONLY if a reviewer insists
+    (resolver-touching -> out of scope here)."""
+    raw = record.tool_input.get("questions")
+    if not isinstance(raw, list) or not raw:
+        return None
+    pane_title = (pane_form.current_question_title or "").strip()
+    if len(raw) == 1 and isinstance(raw[0], dict):
+        return raw[0]
+    if pane_form.current_tab_inferred and pane_title:
+        for q in raw:
+            if isinstance(q, dict):
+                qt = (q.get("question") or "").strip()
+                if qt and (qt.startswith(pane_title) or pane_title.startswith(qt)):
+                    return q
+    pane_labels = tuple(o.label for o in pane_form.options)
+    for q in raw:
+        if isinstance(q, dict):
+            ql = _safe_record_labels(q)
+            if ql is not None and _labels_are_subsequence(pane_labels, ql):
+                return q
+    return None
+
+
+def _ctx_evidence_floor_ok(record, pane_form):
+    """Helper-LOCAL anti-coincidence floor (round-2 P1b). Run AFTER
+    _record_consistent_with_pane returns True. Requires EITHER a reliable
+    current_question_title substring match >= _CTX_TITLE_MIN_CHARS chars (NEVER
+    pane_walkback_title) OR >= _CTX_EVIDENCE_MIN_NUMBERED_MATCHES distinct
+    non-affordance NUMBERED visible options matching the candidate by slot.
+    Read-only; never mutates _pretool_ask_records."""
+    from ..terminal_parser import is_affordance_label
+
+    candidate = _ctx_recovery_candidate(record, pane_form)
+    if candidate is None:
+        return False
+    candidate_labels = _safe_record_labels(candidate)
+    if candidate_labels is None:
+        return False
+
+    # Leg A — reliable title corroboration (current_question_title ONLY).
+    # GENUINE fixed-8 floor (round-2 P2): NOT min(8, len(shorter)).
+    pane_title = (pane_form.current_question_title or "").strip().lower()
+    cand_title = (candidate.get("question") or "").strip().lower()
+    if pane_title and cand_title:
+        shorter = min(pane_title, cand_title, key=len)
+        if len(shorter) >= _CTX_TITLE_MIN_CHARS and (
+            pane_title in cand_title or cand_title in pane_title
+        ):
+            return True
+
+    # Leg B — >= N distinct non-affordance NUMBERED slot-matches.
+    matched_slots: set[int] = set()
+    for o in pane_form.options:
+        if o.number is None:
+            return False  # no stable slot to score → Leg B cannot run; fail closed
+        if is_affordance_label(o.label):
+            continue
+        idx = o.number - 1
+        if 0 <= idx < len(candidate_labels) and _strip_recommended(
+            candidate_labels[idx]
+        ) == _strip_recommended(o.label):
+            matched_slots.add(o.number)
+    return len(matched_slots) >= _CTX_EVIDENCE_MIN_NUMBERED_MATCHES
+
+
+def recover_consistent_side_file_for_ctx(window_id, pane_text):
+    """Read-TTL-free side-file payload for the CTX card ONLY on a consistent
+    PARTIAL-pane bail (the long-open busy-topic card whose top options scrolled
+    off the pane). Returns None for: a complete-picker bail (the pane is the
+    user's real, genuinely-different/advanced live question — the side file
+    would be the WRONG question), an inconsistent partial bail, a coincidental
+    single-label match that fails the evidence floor (round-2 P1b), pane_form is
+    None (the rescue path owns that), or no side file. Never mutates
+    _pretool_ask_records (read-only; resolve_record stays the sole mutator)."""
+    from ..terminal_parser import resolve_ask_form
+
+    pane_form = resolve_ask_form(None, pane_text) if pane_text else None
+    if pane_form is None or pane_form_is_complete_picker(pane_form):
+        return None  # rescue path / complete-picker (trusted) bail handled elsewhere
+    record = _read_live_pretool_record(window_id, apply_ttl=False)
+    if record is None:
+        return None
+    consistent, _reason = _record_consistent_with_pane(record, pane_form)
+    if not consistent:
+        return None  # inconsistent partial bail -> wrong question -> no ctx card
+    if not _ctx_evidence_floor_ok(record, pane_form):  # round-2 P1b floor
+        return None
+    return RecoverySideFile(
+        payload=record.tool_input,
+        source_fingerprint=_canonical_dict_fingerprint(record.tool_input),
+    )
+
+
 def gc_stale(*, is_live_session: Callable[[str], bool] | None = None) -> int:
     """Delete AUQ side files older than ``_PRETOOL_GC_AGE_SECONDS``.
 
