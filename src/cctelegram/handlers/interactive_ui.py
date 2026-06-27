@@ -2135,6 +2135,51 @@ def _clip_card_body(body: str) -> str:
     return clipped + marker
 
 
+# The selection (picker) card lists option LABELS only; the full question +
+# per-option descriptions live in the separate "📋 full details" card. On the
+# side-file/JSONL render path the ENTIRE ``questions[i].question`` string
+# becomes ``form.current_question_title`` (terminal_parser.build_form_from_tool_input),
+# so a multi-paragraph question would otherwise render verbatim above the
+# options — pushing the tappable choices to the bottom and risking
+# ``_clip_card_body``'s tail clip cutting the option lines off entirely. Cap
+# the preamble shown in the picker card.
+_SELCARD_TITLE_MAX_CHARS = 200
+
+
+def _clip_card_title(title: str | None) -> str:
+    """Clip the question/preamble shown in the SELECTION (picker) card.
+
+    DISPLAY-only: this clips the LOCAL render string passed to the picker body.
+    ``form.current_question_title`` is NEVER mutated, so the form fingerprint
+    (``AskUserQuestionForm._canonical_repr`` → ``fingerprint``) stays
+    byte-identical and tap-dispatch / ``pick_token`` mint+validate / the render
+    dedup key are all unaffected. Clipping happens BEFORE the option lines are
+    appended, so a long PREAMBLE can no longer be the reason the option lines
+    get tail-clipped by ``_clip_card_body``. (NOT an absolute guarantee that
+    options always survive: a pathological card with very many / very long
+    OPTION labels, or a huge multi-question tab strip, can still exceed
+    ``_CARD_BODY_CHAR_CAP`` and tail-clip — a separate, pre-existing
+    ``_clip_card_body`` limit this change does not address.)
+
+    A plain ellipsis (not a "see full details above" pointer) is used on
+    purpose: the "📋 full details" card is suppressed on the ``bail_no_ctx``
+    paths, where a pointer to a non-existent card would mislead — the full
+    question still lives in that details card on the common paths and always on
+    the tmux pane.
+    """
+    if not title:
+        return title or ""
+    if len(title) <= _SELCARD_TITLE_MAX_CHARS:
+        return title
+    head = title[:_SELCARD_TITLE_MAX_CHARS]
+    # Prefer a word boundary in the last ~30% so the cut never lands mid-word;
+    # fall back to a hard cut when there is no nearby space (e.g. a long token).
+    cut = head.rfind(" ")
+    if cut >= int(_SELCARD_TITLE_MAX_CHARS * 0.7):
+        head = head[:cut]
+    return head.rstrip() + "…"
+
+
 def _render_ask_user_question(form: AskUserQuestionForm) -> str:
     """Render a structured AskUserQuestion form into Telegram-friendly text.
 
@@ -2195,7 +2240,11 @@ def _render_ask_user_question(form: AskUserQuestionForm) -> str:
     # authoritative title and falls through to the walk-back guess.
     title = form.current_question_title or form.pane_walkback_title
     if title:
-        lines.append(title)
+        # Cap the preamble so the picker card stays short and a long question
+        # no longer pushes the option lines off the bottom (DISPLAY-only — the
+        # form is not mutated; the full question lives in the "📋 full details"
+        # card).
+        lines.append(_clip_card_title(title))
         lines.append("")
 
     if form.options:
