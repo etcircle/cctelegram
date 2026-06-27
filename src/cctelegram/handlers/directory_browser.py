@@ -144,16 +144,22 @@ def build_directory_browser(
         path = Path.cwd()
 
     try:
-        subdirs = sorted(
-            [
-                d.name
-                for d in path.iterdir()
-                if d.is_dir()
-                and (config.show_hidden_dirs or not d.name.startswith("."))
-            ]
-        )
+        entries = list(path.iterdir())
     except (PermissionError, OSError):
-        subdirs = []
+        entries = []
+    # Check each entry individually: on Windows mounts (/mnt/c) unreadable
+    # system files (pagefile.sys, swapfile.sys, DumpStack.log.tmp) make
+    # is_dir() raise, which must not wipe out the whole listing.
+    names = []
+    for d in entries:
+        if not (config.show_hidden_dirs or not d.name.startswith(".")):
+            continue
+        try:
+            if d.is_dir():
+                names.append(d.name)
+        except (PermissionError, OSError):
+            continue
+    subdirs = sorted(names)
 
     total_pages = max(1, (len(subdirs) + DIRS_PER_PAGE - 1) // DIRS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
