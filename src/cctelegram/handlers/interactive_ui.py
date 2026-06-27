@@ -3287,7 +3287,34 @@ async def handle_interactive_ui(
                 ctx_source = render_source.payload
                 dedup_key = f"pretool:{render_source.source_fingerprint[:16]}"
                 source_tag = f"dict_via_render_{render_source.decision}"
-            elif render_source.decision == "bail":
+            elif (
+                render_source.decision == "bail" and not render_source.dispatch_trusted
+            ):
+                # round-2 P1b: a PARTIAL-pane bail whose side file is consistent AND clears
+                # the evidence floor -> post the full-options ctx card from the side-file
+                # dict. ACCEPTED RESIDUAL (round-2 convergent P1, §3.3 / §11(c)): the
+                # pretool:<fp> marker this mints is NOT carried across a tmux @old->@new
+                # renumber (the :949-961 remap keys on the picker's tool_use_id, None for an
+                # aged card; broadening the prune-loop remap was REJECTED because it breaks
+                # test_hydrate_mismatch_marker_not_remapped and strands the marker after
+                # /clear). Bounded to <=1 duplicate per uninterrupted hydrate/render cycle on
+                # the rare restart-during-live-renumbered-partial-bail coincidence;
+                # PRE-EXISTING for the side_file_ok/rescue branch above (interactive_ui.py
+                # :3288).
+                recovered = auq_source.recover_consistent_side_file_for_ctx(
+                    window_id, pane_text
+                )
+                if recovered is not None:
+                    ctx_source = recovered.payload
+                    dedup_key = f"pretool:{recovered.source_fingerprint[:16]}"  # STABLE side-file fp
+                    source_tag = "dict_via_render_bail_recover"
+                else:
+                    ctx_source = None
+                    dedup_key = ""
+                    source_tag = "bail_no_ctx"
+            elif (
+                render_source.decision == "bail"
+            ):  # complete-picker bail (trusted) — unchanged
                 ctx_source = None
                 dedup_key = ""
                 source_tag = "bail_no_ctx"

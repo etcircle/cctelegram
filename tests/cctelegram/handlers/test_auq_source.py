@@ -1118,3 +1118,659 @@ class TestRenderIdentity:
             select_mode="multi",
         )
         assert auq_source.render_signature(base) != auq_source.render_signature(toggled)
+
+
+# ── partial-bail ctx recovery (v5 plan §6.2) ─────────────────────────────────
+
+
+def _write_side_file_aged(
+    cc_dir: Path,
+    session_id: str,
+    tool_input: dict,
+    *,
+    tool_use_id: str = "toolu_aged_recover",
+) -> dict:
+    """Write a side file aged past the 300s ``_PRETOOL_TTL_SECONDS`` read-TTL.
+
+    ``written_at = time.time() - 1000`` mirrors
+    ``test_aged_consistent_side_file_does_not_mint_trusted`` — the long-open
+    busy-card shape the recovery helper targets.
+    """
+    pending = cc_dir / "auq_pending"
+    pending.mkdir(mode=0o700, exist_ok=True)
+    (pending / f"{session_id}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": session_id,
+                "tool_use_id": tool_use_id,
+                "written_at": time.time() - 1000,
+                "tool_input": tool_input,
+            }
+        )
+    )
+    return tool_input
+
+
+def _single_q_input(labels: list[str], *, title: str) -> dict:
+    """A single-question tool_input with the given option labels + title."""
+    return {
+        "questions": [
+            {
+                "question": title,
+                "header": "Scope",
+                "multiSelect": False,
+                "options": [{"label": label, "description": ""} for label in labels],
+            }
+        ]
+    }
+
+
+def _partial_pane(
+    rows: list[tuple[int, str]],
+    *,
+    title: str | None = None,
+    cursor_number: int | None = None,
+    affordances: bool = True,
+) -> str:
+    """Build a partial single-tab picker pane (no governing ``←…→`` tab header).
+
+    Each ``(number, label)`` row renders a numbered option; ``cursor_number``
+    marks the live ``❯`` cursor. Without a tab header the parser leaves
+    ``current_question_title is None`` (the title goes to ``pane_walkback_title``,
+    forbidden for identity) — the titleless residual-(b) shape.
+    """
+    lines: list[str] = []
+    if title is not None:
+        lines.append(title)
+        lines.append("")
+    for number, label in rows:
+        prefix = "❯" if number == cursor_number else " "
+        lines.append(f"{prefix} {number}. {label}")
+        lines.append(f"     description for option {number}")
+    if affordances:
+        next_num = rows[-1][0] + 1
+        lines.append(f"  {next_num}. Type something.")
+        lines.append("─" * 40)
+        lines.append(f"  {next_num + 1}. Chat about this")
+    lines.append("")
+    lines.append("Enter to select · ↑/↓ to navigate · Esc to cancel")
+    return "\n".join(lines) + "\n"
+
+
+def _tab_header_partial_pane(
+    rows: list[tuple[int, str]], *, title: str, cursor_number: int | None = None
+) -> str:
+    """A partial pane WITH a governing ``←…→`` tab header so the parser
+    populates ``current_question_title`` (the Leg A title-corroboration shape).
+    """
+    lines = [f"← ☐ {title[:20]}  ✔ Submit →", title, ""]
+    for number, label in rows:
+        prefix = "❯" if number == cursor_number else " "
+        lines.append(f"{prefix} {number}. {label}")
+    lines.append("Enter to select · ↑/↓ to navigate · Esc to cancel")
+    return "\n".join(lines) + "\n"
+
+
+class TestRecoverConsistentSideFileForCtx:
+    """v5 plan §6.2 — the read-only ctx-recovery helper + its evidence floor.
+
+    The helper ``recover_consistent_side_file_for_ctx`` returns the side-file
+    payload ONLY on a consistent PARTIAL-pane bail that clears the
+    anti-coincidence floor (Leg A reliable ≥8-char title OR Leg B ≥2 distinct
+    numbered slot-matches). Read-only; never mutates ``_pretool_ask_records``.
+    """
+
+    _WID = "@auqsrc-ctxrec"
+    _SID = "4766fb07-7057-4981-9832-93e524ab943e"
+
+    # The DiCopilot positive: option 1 scrolled off, options 2,3 visible.
+    _DICO_LABELS = [
+        "A) Review the 66 proposals",
+        "B) Draft the synthesis doc",
+        "C) Defer to next session",
+    ]
+    _DICO_TITLE = "What should we do next with the proposals?"
+
+    def test_titleless_partial_one_coincidental_label_returns_none(self, _cc_dir):
+        """P1b micro-pin (STEPWISE/SCAFFOLD: RED vs a no-floor helper, NOT vs
+        bare main where it fails by missing-import). A STALE/different side file
+        shares ONE numbered label with a titleless partial pane; the resolver
+        ALONE would accept (``(True, "ok")``), but the floor (Leg A dead via
+        ``current_question_title=None``, Leg B needs ≥2) rejects → ``None``.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(
+                ["X) Stale option one", "Y) Stale option two", "Z) Stale option three"],
+                title="A totally different stale question",
+            )
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            # Titleless partial pane with ONE numbered option coincidentally
+            # equal to the side file's slot-2 label.
+            pane = _partial_pane(
+                [(2, "Y) Stale option two")], title=None, cursor_number=2
+            )
+            pane_form = resolve_ask_form(None, pane)
+            assert pane_form is not None
+            # Premise: the resolver ALONE accepts (proves the floor is what rejects).
+            assert pane_form.current_question_title is None
+            from cctelegram.handlers.auq_source import (
+                PreToolAskRecord,
+                _record_consistent_with_pane,
+            )
+
+            record = PreToolAskRecord(
+                session_id=self._SID,
+                tool_use_id="t",
+                tool_input=tool_input,
+                written_at=time.time(),
+                input_fingerprint="",
+            )
+            assert _record_consistent_with_pane(record, pane_form) == (True, "ok")
+            # The floor rejects the single-coincidence wrong-question case.
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_short_title_coincidence_floored_to_none(self, _cc_dir):
+        """Tautology micro-pin (STEPWISE/SCAFFOLD: RED vs a v2-style
+        ``min(8, len)`` Leg A, NOT vs bare main). A 3-char pane title ("OK?")
+        substring-matches the candidate title + ONE numbered match. The fixed-8
+        ``_CTX_TITLE_MIN_CHARS`` floor rejects (``min(8, len(shorter))`` would
+        clear the 3-char title).
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(
+                ["only option here"], title="OK? are we proceeding with this"
+            )
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            # Tab-header pane so current_question_title is populated ("OK?", 3
+            # chars) and substring-matches the candidate; only ONE numbered match.
+            pane = _tab_header_partial_pane(
+                [(1, "only option here")], title="OK?", cursor_number=1
+            )
+            pane_form = resolve_ask_form(None, pane)
+            assert pane_form is not None
+            assert pane_form.current_question_title == "OK?"
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_long_title_corroboration_recovers(self, _cc_dir):
+        """Over-tightening guard (GREEN): a candidate title ≥8 chars + a true
+        ≥8-char pane-title substring + ONE numbered match rides Leg A alone and
+        recovers the payload. Guards Leg A against becoming useless.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(
+                ["A) Review the 66 proposals"], title="Review the 66 proposals"
+            )
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            pane = _tab_header_partial_pane(
+                [(1, "A) Review the 66 proposals")],
+                title="Review the 66 proposals",
+                cursor_number=1,
+            )
+            recovered = auq_source.recover_consistent_side_file_for_ctx(self._WID, pane)
+            assert recovered is not None
+            assert recovered.payload == tool_input
+        finally:
+            _unbind_window(self._WID)
+
+    def test_dicopilot_partial_bail_two_plus_matches_recovers_payload(self, _cc_dir):
+        """The target-positive over-tightening guard. A 3-option side file; the
+        pane shows numbered slots 2,3 (title absent) → Leg B (2 ≥ 2) recovers the
+        payload, which carries option 1's label ("A) Review the 66 proposals").
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(self._DICO_LABELS, title=self._DICO_TITLE)
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            pane = _partial_pane(
+                [(2, self._DICO_LABELS[1]), (3, self._DICO_LABELS[2])],
+                title=None,
+                cursor_number=3,
+            )
+            recovered = auq_source.recover_consistent_side_file_for_ctx(self._WID, pane)
+            assert recovered is not None
+            assert recovered.payload == tool_input
+            labels = [o["label"] for o in recovered.payload["questions"][0]["options"]]
+            assert "A) Review the 66 proposals" in labels
+        finally:
+            _unbind_window(self._WID)
+
+    def test_two_option_partial_with_title_recovers(self, _cc_dir):
+        """A genuinely-2-option AUQ; only option 2 survives the scroll BUT
+        ``current_question_title`` is present and a ≥8-char match → recovers via
+        Leg A. Proves the title escape hatch + that fixed-8 doesn't kill a real
+        long title.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(
+                ["A) Keep the legacy path", "B) Migrate to the new pipeline"],
+                title="Choose the migration approach for this service",
+            )
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            pane = _tab_header_partial_pane(
+                [(2, "B) Migrate to the new pipeline")],
+                title="Choose the migration approach for this service",
+                cursor_number=2,
+            )
+            recovered = auq_source.recover_consistent_side_file_for_ctx(self._WID, pane)
+            assert recovered is not None
+            assert recovered.payload == tool_input
+        finally:
+            _unbind_window(self._WID)
+
+    def test_titleless_partial_two_matching_labels_recovers(self, _cc_dir):
+        """The DiCopilot 3-option positive at the unit level (N=2 load-bearing):
+        a titleless pane with slots 2,3 both matching by number → Leg B → payload.
+        Pins the exact threshold so the implementer can't make the floor
+        title-only.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(self._DICO_LABELS, title=self._DICO_TITLE)
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            pane = _partial_pane(
+                [(2, self._DICO_LABELS[1]), (3, self._DICO_LABELS[2])],
+                title=None,
+                cursor_number=2,
+            )
+            pane_form = resolve_ask_form(None, pane)
+            assert pane_form is not None
+            assert pane_form.current_question_title is None
+            recovered = auq_source.recover_consistent_side_file_for_ctx(self._WID, pane)
+            assert recovered is not None
+            assert recovered.payload == tool_input
+        finally:
+            _unbind_window(self._WID)
+
+    def test_one_real_option_plus_affordances_floored(self, _cc_dir):
+        """One real numbered option + ``Type something.`` + ``Chat about this``
+        → ONE real match (< 2) → ``None``. Affordances never inflate the count.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(self._DICO_LABELS, title=self._DICO_TITLE)
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            # Only slot 2 is a real option; the pane builder adds affordances.
+            pane = _partial_pane(
+                [(2, self._DICO_LABELS[1])],
+                title=None,
+                cursor_number=2,
+                affordances=True,
+            )
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_duplicate_label_does_not_inflate_count(self, _cc_dir):
+        """ARTIFICIAL micro-pin (round-4 Hermes P3) of the ``set``-keyed-on-
+        ``o.number`` invariant — NOT naturally parser-reachable, and does NOT
+        substitute for the §6.1 seam tests. A degenerate form duplicating one
+        label at two slots both mapping to the SAME candidate index must NOT reach
+        2 distinct slot-matches → the floor stays unsatisfied.
+
+        Drives ``_ctx_evidence_floor_ok`` directly with a hand-built form so the
+        duplicate-slot arithmetic is exercised in isolation.
+        """
+        from cctelegram.handlers.auq_source import (
+            PreToolAskRecord,
+            _ctx_evidence_floor_ok,
+        )
+        from cctelegram.terminal_parser import AskOption, AskUserQuestionForm
+
+        # Candidate has 3 distinct labels; the pane (degenerately) shows the SAME
+        # candidate-slot-2 label twice, numbered 2 and 2 is impossible, so we use
+        # two options whose numbers map to the SAME candidate index via an
+        # out-of-range duplicate. Build a form where two options both match slot 2.
+        tool_input = _single_q_input(self._DICO_LABELS, title=self._DICO_TITLE)
+        record = PreToolAskRecord(
+            session_id=self._SID,
+            tool_use_id="t",
+            tool_input=tool_input,
+            written_at=time.time(),
+            input_fingerprint="",
+        )
+        # Two pane options that BOTH carry number 2 (degenerate) → one distinct
+        # slot → < 2 even though two rows "match".
+        form = AskUserQuestionForm(
+            current_question_title=None,
+            options=(
+                AskOption(
+                    label=self._DICO_LABELS[1],
+                    recommended=False,
+                    cursor=True,
+                    number=2,
+                ),
+                AskOption(
+                    label=self._DICO_LABELS[1],
+                    recommended=False,
+                    cursor=False,
+                    number=2,
+                ),
+            ),
+            select_mode="single",
+        )
+        assert _ctx_evidence_floor_ok(record, form) is False
+
+    def test_complete_picker_trusted_bail_returns_none(self, _cc_dir):
+        """A complete DIFFERENT picker (``_BAIL_PANE``, ``dispatch_trusted=True``)
+        → helper ``None`` via the ``pane_form_is_complete_picker`` short-circuit.
+        Premise asserts the render decision is a TRUSTED bail.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            _write_affordance_side_file(_cc_dir, self._SID)
+            r = auq_source.resolve_auq_source_for_render(self._WID, _BAIL_PANE)
+            assert r.decision == "bail" and r.dispatch_trusted is True
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, _BAIL_PANE)
+                is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_inconsistent_partial_bail_returns_none(self, _cc_dir):
+        """An aged side file whose title genuinely differs from a title-bearing
+        partial pane → ``_record_consistent_with_pane`` ``title_mismatch`` →
+        helper ``None``.
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(
+                ["A) Keep the legacy path", "B) Migrate to the new pipeline"],
+                title="Choose the migration approach for this service",
+            )
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            # Tab-header pane whose title genuinely differs from the candidate.
+            pane = _tab_header_partial_pane(
+                [(2, "B) Migrate to the new pipeline")],
+                title="Pick the rollback strategy for the deploy",
+                cursor_number=2,
+            )
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_no_side_file_returns_none(self, _cc_dir):
+        """No side file → ``None`` (trivial guard)."""
+        _bind_window(self._WID, self._SID)
+        try:
+            pane = _partial_pane(
+                [(2, self._DICO_LABELS[1]), (3, self._DICO_LABELS[2])],
+                title=None,
+                cursor_number=2,
+            )
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_unparseable_pane_returns_none(self, _cc_dir):
+        """An unparseable pane (``pane_form is None``) → ``None`` (the rescue path
+        owns that case)."""
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = _single_q_input(self._DICO_LABELS, title=self._DICO_TITLE)
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            pane = "\n".join(f"  trace {i}: tool output churn" for i in range(40))
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_multiq_single_coincidence_floored_to_none(self, _cc_dir):
+        """A multi-question side file where one coincidental label across
+        questions matches a titleless partial pane → ``None`` (the multi-Q
+        fallthrough is looser than ``_strong_match``, so the floor must catch it).
+        """
+        _bind_window(self._WID, self._SID)
+        try:
+            tool_input = {
+                "questions": [
+                    {
+                        "question": "Which migration strategy?",
+                        "header": "Strategy",
+                        "options": [
+                            {"label": "P) Lift and shift", "description": ""},
+                            {"label": "Q) Rewrite incrementally", "description": ""},
+                        ],
+                    },
+                    {
+                        "question": "Which rollout cadence?",
+                        "header": "Cadence",
+                        "options": [
+                            {"label": "R) Big bang", "description": ""},
+                            {"label": "S) Canary", "description": ""},
+                        ],
+                    },
+                ]
+            }
+            _write_side_file_aged(_cc_dir, self._SID, tool_input)
+            # Titleless pane with ONE numbered option coincidentally equal to
+            # question-1 slot-2 ("Q) Rewrite incrementally").
+            pane = _partial_pane(
+                [(2, "Q) Rewrite incrementally")], title=None, cursor_number=2
+            )
+            assert (
+                auq_source.recover_consistent_side_file_for_ctx(self._WID, pane) is None
+            )
+        finally:
+            _unbind_window(self._WID)
+
+    def test_ctx_recovery_candidate_is_subset_of_record_consistent_with_pane(
+        self, _cc_dir
+    ):
+        """Round-3 P3 SUBSET-parity unit (REPLACES exact-equality).
+
+        PREMISE (round-4 Hermes P3): the subset guarantee
+        ``helper-accepts ⇒ resolver-accepts`` holds only in the INTENDED calling
+        context — AFTER ``_record_consistent_with_pane`` has accepted, or for
+        fixtures deliberately built to satisfy that premise. ``_ctx_recovery_
+        candidate`` is a standalone candidate-picker that can return a single-Q
+        candidate (``raw[0]``) BEFORE any consistency check, so this is a
+        statement about the PRODUCTION call path, NOT an unconditional property
+        of the isolated candidate-picker.
+
+        For each accepted fixture this loop now PROVES candidate selection: it
+        asserts the resolver-accepted premise (``_record_consistent_with_pane
+        (...)[0] is True``) AND that ``_ctx_recovery_candidate`` returns the
+        SPECIFIC intended question dict (the forward subset — helper-accepts ⇒
+        resolver-accepts, picking the INTENDED candidate, not merely a candidate
+        the resolver also accepts). The trailing mixed-label case documents the
+        fail-closed converse gap: a gappy/cross-question pane the resolver's
+        numbered-slot accept would allow but the helper's contiguous-subsequence
+        picker DECLINES (a bounded, safe false-negative that can only DROP a
+        card, never post a wrong one). It does NOT assert the converse.
+        """
+        from cctelegram.handlers.auq_source import (
+            PreToolAskRecord,
+            _ctx_recovery_candidate,
+            _record_consistent_with_pane,
+        )
+
+        def _rec(tool_input: dict) -> PreToolAskRecord:
+            return PreToolAskRecord(
+                session_id=self._SID,
+                tool_use_id="t",
+                tool_input=tool_input,
+                written_at=time.time(),
+                input_fingerprint="",
+            )
+
+        # (i) single-Q, resolver-accepted (titleless partial, ≥2 slot matches).
+        single = _single_q_input(self._DICO_LABELS, title=self._DICO_TITLE)
+        single_pane = resolve_ask_form(
+            None,
+            _partial_pane(
+                [(2, self._DICO_LABELS[1]), (3, self._DICO_LABELS[2])],
+                title=None,
+                cursor_number=2,
+            ),
+        )
+        assert single_pane is not None
+
+        # (ii) tab-inferred + title-match multi-Q.
+        multi = {
+            "questions": [
+                {
+                    "question": "Choose the migration approach for this service",
+                    "header": "Approach",
+                    "options": [
+                        {"label": "A) Keep the legacy path", "description": ""},
+                        {"label": "B) Migrate to the new pipeline", "description": ""},
+                    ],
+                },
+                {
+                    "question": "Pick the rollback strategy for the deploy",
+                    "header": "Rollback",
+                    "options": [
+                        {"label": "C) Manual rollback", "description": ""},
+                        {"label": "D) Automated rollback", "description": ""},
+                    ],
+                },
+            ]
+        }
+        multi_pane = resolve_ask_form(
+            None,
+            _tab_header_partial_pane(
+                [(2, "B) Migrate to the new pipeline")],
+                title="Choose the migration approach for this service",
+                cursor_number=2,
+            ),
+        )
+        assert multi_pane is not None
+
+        # (iii) subsequence-fallback multi-Q (titleless, contiguous subsequence).
+        multi_sub_pane = resolve_ask_form(
+            None,
+            _partial_pane(
+                [(1, "A) Keep the legacy path"), (2, "B) Migrate to the new pipeline")],
+                title=None,
+                cursor_number=1,
+            ),
+        )
+        assert multi_sub_pane is not None
+
+        # (tool_input, pane_form, expected_candidate) — the SPECIFIC question dict
+        # the helper must return: single-Q → q0; tab-inferred+title → the
+        # title-matching q0; subsequence fallback → the q whose labels A,B form
+        # the visible contiguous subsequence (q0).
+        for tool_input, pane_form, expected_candidate in (
+            (single, single_pane, single["questions"][0]),
+            (multi, multi_pane, multi["questions"][0]),
+            (multi, multi_sub_pane, multi["questions"][0]),
+        ):
+            record = _rec(tool_input)
+            # Premise: the resolver accepts these constructed inputs.
+            assert _record_consistent_with_pane(record, pane_form)[0] is True
+            # The helper selects the INTENDED candidate (forward subset: the SAME
+            # dict object out of record.tool_input["questions"]).
+            candidate = _ctx_recovery_candidate(record, pane_form)
+            assert candidate is expected_candidate
+
+        # Subset DIRECTION (the helper is a strict, fail-closed subset): a multi-Q
+        # pane whose visible labels are NOT a contiguous subsequence of ANY
+        # question (cross-question labels mixed) → the helper's subsequence picker
+        # DECLINES (returns None), never inventing a wrong candidate. The
+        # converse is NOT asserted: the resolver's numbered-slot final accept can
+        # be broader than the helper's contiguous-subsequence pick — a bounded,
+        # safe false-negative that can only DROP a card, never post a wrong one.
+        # "B) Migrate…" is in q1, "C) Manual rollback" is in q2 → no single
+        # question's labels are a contiguous subsequence of the pane → decline.
+        mixed_pane = resolve_ask_form(
+            None,
+            _partial_pane(
+                [(2, "B) Migrate to the new pipeline"), (3, "C) Manual rollback")],
+                title=None,
+                cursor_number=2,
+            ),
+        )
+        assert mixed_pane is not None
+        assert _ctx_recovery_candidate(_rec(multi), mixed_pane) is None
+
+    def test_kickstart_renumber_duplicate_is_bounded_to_one(self):
+        """MANDATORY (round-4 convergent P2) — residual §11(c).
+
+        BOUND PIN, NOT a main-RED repro: it asserts the kickstart-renumber
+        duplicate is BOUNDED (≤1 re-post per uninterrupted hydrate/render
+        cycle), not absent. PURE READ-PATH — it deliberately does NOT call
+        ``hydrate_interactive_state`` (v4/v5 makes ZERO hydrate change;
+        ``TestHydrateInteractiveState`` owns that seam byte-for-byte).
+
+        It seeds the post-prune end-state of an ``@old→@new`` renumber directly:
+        ``_auq_context_msgs["@new"]`` holds a recovered DICT ctx-msg record while
+        ``_auq_context_posted`` has NO ``"@new"`` marker (the divergence the
+        hydrate path produces — the msgs loop remaps, the marker loop prunes
+        because it has no ``window_remaps``). Then it exercises ONLY the existing
+        ``claim → commit`` once-only gate: the first claim is ALLOWED (the one
+        bounded re-post), and after commit installs the marker a second claim is
+        BLOCKED (the gate caps re-posts at one).
+        """
+        from cctelegram.handlers import interactive_ui
+
+        interactive_ui.reset_for_tests()
+        try:
+            wid = "@new"
+            sid = "4766fb07-7057-4981-9832-93e524ab943e"
+            dedup_key = "pretool:deadbeefdeadbeef"
+            # Seed the post-prune msgs record (source="dict") with NO marker.
+            rec = interactive_ui._ContextMsgRecord.from_dict(
+                {
+                    "message_ids": [4242],
+                    "source": "dict",
+                    "dedup_key": dedup_key,
+                    "tool_use_id": None,
+                    "render_sha1": "",
+                    "user_id": 12345,
+                    "chat_id": -100123,
+                    "thread_id": 42,
+                    "session_id": sid,
+                    "created_at": "",
+                }
+            )
+            assert rec is not None
+            interactive_ui._auq_context_msgs[wid] = rec
+            assert interactive_ui._auq_context_posted.get(wid) is None
+
+            # First render re-post is ALLOWED (the bounded duplicate).
+            token = interactive_ui.claim_auq_context_post_in_memory(wid, dedup_key)
+            assert token is not None
+
+            # Commit installs the marker.
+            wrote = interactive_ui.commit_auq_context_post(
+                wid,
+                token,
+                (4243,),
+                text="📋 AskUserQuestion — full details\n\nbody",
+                source={"questions": [{"question": "q", "options": []}]},
+                user_id=12345,
+                chat_id=-100123,
+                thread_id=42,
+                session_id=sid,
+            )
+            assert wrote is True
+            assert interactive_ui._auq_context_posted.get(wid) == dedup_key
+
+            # Subsequent renders are BLOCKED (bound = exactly one).
+            assert (
+                interactive_ui.claim_auq_context_post_in_memory(wid, dedup_key) is None
+            )
+        finally:
+            interactive_ui.reset_for_tests()
