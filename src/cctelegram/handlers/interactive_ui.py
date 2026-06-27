@@ -25,7 +25,7 @@ import logging
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -44,6 +44,7 @@ from ..terminal_parser import (
     REVIEW_SUBMIT_LABEL,
     AskUserQuestionForm,
     InteractiveUIContent,
+    build_form_from_tool_input,
     extract_epm_plan_file_path,
     extract_interactive_content,
     parse_ask_user_question,
@@ -3179,7 +3180,67 @@ async def handle_interactive_ui(
                     [o.number for o in form.options if o.cursor],
                     {o.number: o.selected for o in form.options},
                 )
-            structured = _render_ask_user_question(form)
+            # Selection-card completeness (DISPLAY-ONLY): on a single-question,
+            # single-select PARTIAL-pane bail the resolver ``form`` is the pane
+            # parse, which lost its top options to scroll ("Only options 2-3 are
+            # visible"; option 1 gone). Swap a COMPLETE side-file form into the
+            # BODY render so the selection card lists ALL options. This changes
+            # ONLY the rendered body + the notice text. DISPATCH is byte-identical:
+            # the ``if not render_source.dispatch_trusted`` / ``_build_pick_button_rows``
+            # paths below still use the resolver ``form``, and on a partial bail
+            # ``dispatch_trusted`` is False so NO pick buttons are minted anyway. The
+            # dedup hash is untouched (``peek_render_identity`` / ``_ui_render_hash``
+            # re-resolve the resolver pane form independently → no re-render churn).
+            # Gated HARD (pessimistic-review-mandated):
+            #   * single-QUESTION only — ``build_form_from_tool_input`` defaults to
+            #     ``questions[0]`` (terminal_parser.py), so a Q2 bail would else
+            #     render Q1's options;
+            #   * single-SELECT only — multi-select side-file options carry
+            #     ``selected=None`` → ``·``-everything, destroying the pane's real
+            #     ☑/☐ checkbox state;
+            #   * None-guard — ``_render_ask_user_question(None)`` accesses
+            #     ``.is_review_screen`` → AttributeError.
+            display_form = form
+            if not render_source.dispatch_trusted and p14_suppress_picks:
+                recovered = auq_source.recover_consistent_side_file_for_ctx(
+                    window_id, pane_text
+                )
+                if (
+                    recovered is not None
+                    and len(recovered.payload.get("questions", [])) == 1
+                ):
+                    candidate = build_form_from_tool_input(recovered.payload)
+                    if candidate is not None and candidate.select_mode == "single":
+                        # Hermes P2: the recovered form is built purely from the
+                        # side file, so every option is ``cursor=False`` — the
+                        # swapped body would lose the live ``❯`` the pane body
+                        # showed, making the manual ↑/↓/Tab nav this very notice
+                        # points at more blind. Overlay the pane's cursor by
+                        # option NUMBER (``build_form_from_tool_input`` numbers
+                        # options 1..N in payload order, aligned with the pane
+                        # slot numbers) so the highlighted option keeps its
+                        # ``❯``. Fail-safe: if the pane's own cursor option
+                        # scrolled off (no ``o.cursor``), no overlay → all
+                        # ``False``, identical to no overlay. DISPLAY-only — the
+                        # overlaid form still only feeds _render_ask_user_question,
+                        # never dispatch or the dedup hash.
+                        pane_cursor_number = next(
+                            (o.number for o in form.options if o.cursor), None
+                        )
+                        if pane_cursor_number is not None:
+                            candidate = replace(
+                                candidate,
+                                options=tuple(
+                                    replace(o, cursor=(o.number == pane_cursor_number))
+                                    for o in candidate.options
+                                ),
+                            )
+                        display_form = candidate
+                        partial_options_notice = (
+                            "Tap-to-select is off on a scrolled screen — "
+                            "use ↑/↓/Tab below or send your answer."
+                        )
+            structured = _render_ask_user_question(display_form)
             if structured:
                 text = structured
             if partial_options_notice:
