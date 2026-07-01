@@ -3011,23 +3011,37 @@ async def _maybe_post_live_prose(
             candidate.md_message_id[:8],
         )
         return
-    sent, _outcome = await topic_send(
-        bot,
-        op="content",
-        user_id=user_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        window_id=window_id,
-        text=candidate.text,
-        plain=False,
-        role="assistant",
-        content_type="text",
-        session_id=session_id,
-    )
-    if sent is None:
-        # Send failed — record NO marker so the JSONL copy still delivers the
-        # prose post-resolution (no silent loss).
-        return
+    # ``topic_send`` does NOT split at Telegram's 4096-char limit (only the
+    # normal content path does), so a long findings prose (>4096, common for
+    # di-copilot) would fail with "Message is too long" and this whole post is
+    # lost from the pre-card slot. Split into Telegram-safe chunks and send them
+    # IN ORDER, all still BEFORE the picker card. The marker's ``norm_hash`` is
+    # the FULL text's hash (UNCHANGED by splitting), so the dedup still suppresses
+    # the JSONL copy correctly.
+    from ..telegram_sender import split_message
+
+    chunks = split_message(candidate.text, max_length=4096)
+    for idx, chunk in enumerate(chunks, start=1):
+        sent, _outcome = await topic_send(
+            bot,
+            op="content",
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            window_id=window_id,
+            text=chunk,
+            plain=False,
+            role="assistant",
+            content_type="text",
+            session_id=session_id,
+            part_index=idx if len(chunks) > 1 else 0,
+        )
+        if sent is None:
+            # A chunk failed — record NO marker so the JSONL copy still delivers
+            # the FULL prose (split) post-resolution (no silent loss). Strictly
+            # no worse than before: a >4096 prose was fully lost from the pre-card
+            # slot anyway.
+            return
     md_capture.record_shown_live(
         session_id,
         md_message_id=candidate.md_message_id,
