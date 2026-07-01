@@ -109,7 +109,7 @@ async def test_live_prose_over_4096_is_split_before_card(harness, caplog):
 
     posts = harness["posts"]
     assert len(posts) >= 2, "long prose must be split into multiple sends"
-    # Every chunk is a content send, ≤4096, and reassembles to the full text.
+    # Every chunk is a content send, in order, each within Telegram's hard limit.
     for p in posts:
         assert p["op"] == "content"
         assert len(p["text"]) <= 4096
@@ -117,6 +117,36 @@ async def test_live_prose_over_4096_is_split_before_card(harness, caplog):
     assert len(harness["markers"]) == 1
     assert harness["markers"][0]["norm_hash"] == "n"
     assert any("posted before picker" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_live_prose_with_fenced_code_block_stays_under_4096(harness):
+    """A fenced code block straddling the split boundary must not push any chunk
+    over Telegram's 4096 hard limit — ``split_message`` can add a few chars when
+    it auto-closes the fence at the cut, so the conservative ``_LIVE_PROSE_CHUNK_MAX``
+    (< 4096) is what keeps every boundary chunk sendable (Hermes P3)."""
+    assert interactive_ui._LIVE_PROSE_CHUNK_MAX < 4096  # headroom is the guarantee
+    pre = "\n".join("intro paragraph line number %04d here" % i for i in range(120))
+    code = "\n".join("    step_%04d = compute(value_%04d)" % (i, i) for i in range(200))
+    long_text = pre + "\n\n```\n" + code + "\n```\n"
+    assert len(long_text) > 4096
+    harness["state"]["candidate"] = _record(long_text)
+
+    await interactive_ui._maybe_post_live_prose(
+        AsyncMock(),
+        user_id=1,
+        thread_id=100,
+        chat_id=42,
+        window_id="@0",
+        ui_name="AskUserQuestion",
+    )
+
+    posts = harness["posts"]
+    assert len(posts) >= 2
+    for p in posts:
+        assert p["op"] == "content"
+        assert len(p["text"]) <= 4096, f"chunk exceeded 4096: len={len(p['text'])}"
+    assert len(harness["markers"]) == 1
 
 
 @pytest.mark.asyncio

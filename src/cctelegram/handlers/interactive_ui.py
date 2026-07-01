@@ -2741,6 +2741,13 @@ _LIVE_PROSE_RETRY_STEP_S = 0.05
 # path contends on), so it is bounded.
 _LIVE_PROSE_STREAM_WAIT_BUDGET_S = 3.0
 
+# Conservative per-chunk cap for the pre-card live-prose split (< Telegram's 4096
+# hard limit). ``split_message`` can return a chunk a few chars OVER its
+# ``max_length`` when it auto-closes a fenced code block or wraps an expandable
+# quote at the boundary (observed ~4097 at 4096), which would trip "Message is
+# too long"; the headroom keeps every boundary chunk sendable.
+_LIVE_PROSE_CHUNK_MAX = 4000
+
 
 async def _read_epm_plan_file(footer_path: str | None) -> str | None:
     """Read the ExitPlanMode plan file referenced in the pane footer.
@@ -3017,10 +3024,13 @@ async def _maybe_post_live_prose(
     # lost from the pre-card slot. Split into Telegram-safe chunks and send them
     # IN ORDER, all still BEFORE the picker card. The marker's ``norm_hash`` is
     # the FULL text's hash (UNCHANGED by splitting), so the dedup still suppresses
-    # the JSONL copy correctly.
+    # the JSONL copy correctly. A CONSERVATIVE cap (< 4096) absorbs the few chars
+    # ``split_message`` can add when it auto-closes a fenced code block / wraps an
+    # expandable quote at the boundary (it can otherwise return a chunk ~4097),
+    # so no boundary chunk trips "Message is too long".
     from ..telegram_sender import split_message
 
-    chunks = split_message(candidate.text, max_length=4096)
+    chunks = split_message(candidate.text, max_length=_LIVE_PROSE_CHUNK_MAX)
     for idx, chunk in enumerate(chunks, start=1):
         sent, _outcome = await topic_send(
             bot,
