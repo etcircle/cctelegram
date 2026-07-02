@@ -37,6 +37,24 @@ def _row(
     return SEP.join([session_name, window_id, window_name, pane_active, cwd, pane_cmd])
 
 
+# Some tmux builds (e.g. tmux 3.4) emit the \x1f separator as its literal octal
+# escape "\037" rather than the control byte.
+ESC_SEP = "\\037"
+
+
+def _esc_row(
+    session_name: str,
+    window_id: str,
+    window_name: str,
+    pane_active: str,
+    cwd: str,
+    pane_cmd: str,
+) -> str:
+    return ESC_SEP.join(
+        [session_name, window_id, window_name, pane_active, cwd, pane_cmd]
+    )
+
+
 def _make_proc(
     stdout: bytes = b"",
     stderr: bytes = b"",
@@ -133,6 +151,30 @@ async def test_list_windows_direct_skips_malformed_lines(
 
     assert len(windows) == 1
     assert windows[0].window_id == "@2"
+
+
+@pytest.mark.asyncio
+async def test_list_windows_direct_parses_escaped_separator(
+    manager: TmuxManager,
+) -> None:
+    """Rows whose separator is the literal "\\037" escape (as tmux 3.4 emits)
+    are parsed via the escaped-form branch, not dropped as malformed."""
+    sess = config.tmux_session_name
+    lines = [
+        _esc_row(sess, "@0", config.tmux_main_window_name, "1", "/home", "bash"),
+        _esc_row(sess, "@1", "real", "1", "/home/r", "claude"),
+    ]
+    stdout = ("\n".join(lines) + "\n").encode("utf-8")
+
+    with patch(
+        "cctelegram.tmux_manager.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=_make_proc(stdout=stdout)),
+    ):
+        windows = await manager._list_windows_direct()
+
+    # main window filtered by name; the real window is parsed, not skipped
+    assert [w.window_id for w in windows] == ["@1"]
+    assert windows[0].window_name == "real"
 
 
 @pytest.mark.asyncio

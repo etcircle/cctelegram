@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import time
@@ -1316,7 +1317,26 @@ async def _create_and_bind_window(
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
         # a longer timeout to avoid silently dropping messages.
-        hook_timeout = 15.0 if resume_session_id else 5.0
+        # Configurable via CC_TELEGRAM_HOOK_TIMEOUT (seconds). The stock 5s can
+        # be too tight when Claude starts on a slow filesystem (e.g. WSL DrvFs
+        # under /mnt/c) or loads several MCP servers and only reaches
+        # SessionStart after ~15-20s; allow raising it without penalising fast
+        # setups. Resume keeps a larger default.
+        default_hook_timeout = 15.0 if resume_session_id else 5.0
+        raw_hook_timeout = os.getenv("CC_TELEGRAM_HOOK_TIMEOUT")
+        try:
+            hook_timeout = (
+                float(raw_hook_timeout) if raw_hook_timeout else default_hook_timeout
+            )
+            if not math.isfinite(hook_timeout) or hook_timeout <= 0:
+                raise ValueError("must be a positive, finite number of seconds")
+        except ValueError:
+            logger.warning(
+                "Invalid CC_TELEGRAM_HOOK_TIMEOUT=%r; using default %ss",
+                raw_hook_timeout,
+                default_hook_timeout,
+            )
+            hook_timeout = default_hook_timeout
         hook_ok = await session_mgr.wait_for_session_map_entry(
             created_wid, timeout=hook_timeout
         )
