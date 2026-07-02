@@ -16,7 +16,14 @@ from telegram import Bot
 from .. import md_capture, route_runtime
 from ..session import session_id_for_window, session_manager
 
-from . import attention, auq_source, notify_source, pane_signals, pick_intent
+from . import (
+    attention,
+    auq_source,
+    late_answer,
+    notify_source,
+    pane_signals,
+    pick_intent,
+)
 from .dashboard import clear_dashboards_in_thread
 from .inbound_aggregator import aggregator_clear_route
 from .interactive_ui import clear_interactive_msg
@@ -140,6 +147,11 @@ async def clear_topic_state(
     # the route_runtime teardown (same ownership rationale — pull-only
     # leaf state keyed by route must not survive the topic).
     pane_signals.clear_routes_for_topic(user_id, thread_id or 0)
+    # Wave A lifecycle seam (c): drop the topic's aql: late-answer cards
+    # beside the route_runtime teardown — topic-keyed, NOT via the queued-
+    # routes loop above, so a queue-less route's card dies with the topic
+    # too (the same _route_queues gap that gave route_runtime its own seam).
+    late_answer.invalidate_topic(user_id, thread_id or 0)
 
     # Pop the status poller's route-local caches for this topic (gate P3-1) —
     # a rebound topic reusing the same route key must not inherit a stale

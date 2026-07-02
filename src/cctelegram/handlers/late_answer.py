@@ -38,6 +38,8 @@ import secrets
 from dataclasses import dataclass
 from typing import Any
 
+from .callback_data import CB_ASK_LATE, checked_callback_data
+
 logger = logging.getLogger(__name__)
 
 # ── Detection (plan §A2) ──────────────────────────────────────────────────
@@ -199,13 +201,33 @@ def invalidate_window(window_id: str) -> None:
     """Drop every card minted for ``window_id``.
 
     Wired at (a) ``interactive_ui.forget_ask_tool_input`` (the next AUQ's
-    tool_result, /clear / session replacement, the generic surface clear),
+    tool_result, /clear / session replacement, the generic surface clear) and
     (b) ``remember_ask_tool_input``'s tool_use_id-rotation branch (a BACKSTOP
     only — the real protection against a late tap into a newer live prompt is
-    the executor's freshness guards), and (c)
-    ``handlers/cleanup.clear_topic_state`` (topic close).
+    the executor's freshness guards).
     """
     stale = [token for token, row in _cards.items() if row.window_id == window_id]
+    for token in stale:
+        del _cards[token]
+
+
+def invalidate_topic(owner_id: int, thread_id: int) -> None:
+    """Drop every card for ``(owner_id, thread_id)`` — lifecycle seam (c),
+    topic close via ``handlers/cleanup.clear_topic_state``.
+
+    Topic-keyed rather than window-keyed because ``clear_topic_state``'s
+    per-route loop only enumerates QUEUED routes (``routes_for_topic`` reads
+    ``message_queue._route_queues``) — a queue-less route's window would
+    never be visited, stranding its card (the same gap that gave
+    ``route_runtime`` its own ``clear_routes_for_topic`` seam; hermes
+    round-2 P2 precedent). The registry rows carry (owner, thread) so the
+    sweep is exact.
+    """
+    stale = [
+        token
+        for token, row in _cards.items()
+        if row.owner_id == owner_id and row.thread_id == thread_id
+    ]
     for token in stale:
         del _cards[token]
 
@@ -233,6 +255,26 @@ def card_text(question: str | None, *, with_keyboard: bool) -> str:
         lines.append(f"Question: {question}")
     lines.append(_TAP_PROMPT if with_keyboard else _TEXT_ONLY_PROMPT)
     return "\n".join(lines)
+
+
+def keyboard_rows(
+    window_id: str, labels: dict[int, str], token: str
+) -> list[tuple[str, str]]:
+    """Build (button_label, callback_data) rows for the ``aql:`` keyboard.
+
+    Returns plain tuples (one per row — plan §A4) so this leaf never imports
+    telegram; callers wrap them in ``InlineKeyboardButton``. Used by both the
+    conversion seam (first render) and the executor's failure branch
+    (re-attach the ORIGINAL keyboard for the retry tap).
+    ``checked_callback_data`` enforces Telegram's 64-byte cap.
+    """
+    return [
+        (
+            clip_label(label),
+            checked_callback_data(f"{CB_ASK_LATE}{window_id}:{n}:{token}"),
+        )
+        for n, label in sorted(labels.items())
+    ]
 
 
 def collapse_whitespace(text: str) -> str:

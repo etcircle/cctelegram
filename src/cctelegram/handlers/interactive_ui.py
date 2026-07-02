@@ -53,7 +53,7 @@ from ..terminal_parser import (
 from .. import md_capture
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json
-from . import attention, auq_source, pick_intent, pick_token
+from . import attention, auq_source, late_answer, pick_intent, pick_token
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -370,6 +370,14 @@ def remember_ask_tool_input(
                 # drop the stale context-post marker so the next claim
                 # succeeds for the new AUQ.
                 _auq_context_posted.pop(window_id, None)
+                # Wave A: a rotation also invalidates any aql: late-answer
+                # card for this window — a BACKSTOP only [R1 Hermes P3]: a
+                # new live picker is JSONL-buffered until resolution, so
+                # rotation fires late; the REAL protection against a late
+                # tap into a newer live prompt is the executor's
+                # has_interactive_surface + side_file_live_for_window
+                # freshness guards.
+                late_answer.invalidate_window(window_id)
                 # Wave 1: also drop any in-flight pending claim. A
                 # rotation under us means the claim_token in flight is
                 # for the prior AUQ; rolling forward it would commit
@@ -414,6 +422,12 @@ def forget_ask_tool_input(window_id: str) -> None:
     _last_completed_ask_tool_input.pop(window_id, None)
     _last_auq_tool_use_id.pop(window_id, None)
     auq_source.forget_for_window(window_id)
+    # Wave A: drop any aql: late-answer card for this window — the primary
+    # invalidation seam (covers the next AUQ's tool_result, /clear / session
+    # replacement via the monitor's old-window call, and the generic surface
+    # clear). Safe inside the AFK conversion itself: the converter calls
+    # forget_ask_tool_input BEFORE it mints the new card.
+    late_answer.invalidate_window(window_id)
     # D2 restart-recovery: tomb this window's durable pick mint-intents on AUQ/EPM
     # resolution (the primary teardown seam). Orphan-safety is also provided by
     # recovery-time form/source re-validation + the 24h GC, but tombing here keeps

@@ -17,6 +17,7 @@ from cctelegram.handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
     CB_ASK_ESC,
+    CB_ASK_LATE,
     CB_ASK_LEFT,
     CB_ASK_PICK,
     CB_ASK_REFRESH,
@@ -250,6 +251,14 @@ CALLBACK_REGISTRY: tuple[CallbackRegistryEntry, ...] = (
         "cctelegram.callback_dispatcher.interactive",
         "tests/scenarios/test_auq_multi_select.py",
         "execute_interactive_callback",
+    ),
+    CallbackRegistryEntry(
+        CB_ASK_LATE,
+        "LateAnswerCommand",
+        "cctelegram.handlers.late_answer",
+        "cctelegram.callback_dispatcher.late_answer",
+        "tests/scenarios/test_auq_late_answer.py",
+        "execute_late_answer_callback",
     ),
     CallbackRegistryEntry(
         CB_SESSION_SELECT,

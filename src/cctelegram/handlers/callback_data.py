@@ -50,6 +50,11 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 # the same keyed token shape but dispatch only a bare digit and do not ledger.
 CB_ASK_PICK = "aqp:"  # aqp:<route_hash>:<fp8>:<opt>:<token>
 CB_ASK_TOGGLE = "aqt:"  # aqt:<route_hash>:<fp8>:<opt>:<token>
+# Wave A late answer: after an AskUserQuestion ~60s AFK auto-resolve converts
+# the picker into the "⏰ Claude proceeded" card, its option buttons deliver
+# the choice as a NORMAL user text message (never a picker keystroke). One
+# token per CARD, resolved via the in-memory handlers/late_answer registry.
+CB_ASK_LATE = "aql:"  # aql:<window_id>:<opt>:<token>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
