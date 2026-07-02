@@ -1,0 +1,51 @@
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+ ▎ Fable 5 is back.
+ ▎ Until July 7, you can use up to 50% of your plan's weekly usage limit on Fable 5. If you hit your limit, you can continue on Fable 5 with usage credits.
+ ▎ Fable 5 draws down usage faster than Opus 4.8. Learn more
+
+❯ Use the AskUserQuestion tool to ask me exactly ONE single-select question with 4 options. The question text must be about 20 lines long (many sentences).
+  Each option label should be 8-10 words. Give each option a 4-sentence description. Do not answer for me.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Process
+
+We're at a decision point about how you'd like me to approach substantial work in this environment, and I want to settle it properly rather than guess at it
+session after session. This machine has an unusually rich toolkit layered on top of Claude Code: the gstack skill library gives us planning reviews, design
+consultations, QA harnesses, and ship workflows; Hermes and Codex are wired in as peer-review engines; hindsight provides cross-project long-term memory; and
+the Workflow tool can orchestrate fleets of subagents for exhaustive audits and migrations. Each of these carries a different cost profile in terms of tokens,
+wall-clock time, and how much of the process you have to supervise versus how much runs autonomously. The workflow model documented in your CLAUDE.md says
+Claude Code implements while Hermes and Codex review, but it doesn't say how heavyweight the default loop should be for ordinary, day-to-day tasks. A small bug
+fix probably doesn't deserve a plan review, dual peer review, and a QA pass, while a risky refactor across several modules probably does — but the line between
+those two is a judgment call, and right now I'd be making it ad hoc every time. Some people want their agent to run lean by default and only escalate ceremony
+when explicitly asked; others want every diff to pass through the full gauntlet because they'd rather burn tokens than ship a regression; still others want the
+agent to propose the process at the start of each task and let them approve it. There are also hybrid stances, like scaling ceremony automatically to the size
+of the diff or the blast radius of the files touched. Whatever you pick here becomes the standing default I apply without re-asking, though you can always
+override it per task with a word. So, thinking about how you actually like to work day to day — your tolerance for latency, your token budget, and how much you
+trust automated review to catch what matters — which default process weight should I adopt for typical tasks in this environment going forward?
+
+❯ 1. Run lean by default, escalate only when I ask
+     I implement directly, verify my own work with tests and a quick self-review, and skip Hermes, Codex, and gstack ceremony entirely unless you invoke them.
+     This is the fastest and cheapest mode, with turnaround measured in minutes rather than review cycles. The tradeoff is that nothing independent looks at the
+     diff, so subtle invariant violations rely on me catching them myself. It suits you if you review diffs personally anyway and treat the agent's output as a
+     draft.
+  2. Full gauntlet on every diff, no exceptions granted
+     Every change, however small, goes through plan review, implementation by a subagent, peer review from both Hermes and Codex, and a verification pass before
+     I present it. This maximizes the chance that regressions are caught before you ever see the code. It is also the slowest and most token-hungry option, and
+     trivial one-line fixes will feel absurdly over-processed. Choose this if you'd genuinely rather burn tokens than ever ship a defect.
+  3. Scale ceremony automatically to diff size and risk
+     I judge each task's blast radius — files touched, subsystems crossed, reversibility — and pick the process weight myself: lean for one-liners, single
+     reviewer for moderate changes, the full dual-review loop for risky refactors. You get proportionate cost without having to think about process at all. The
+     risk is that my risk assessment occasionally misfires and something that deserved review slips through lean. This matches the spirit of your existing
+     per-wave loop while keeping small tasks fast.
+  4. Propose a process per task, await my approval
+     At the start of each substantial task I state the process I intend to run — reviewers, QA, verification depth — and wait for your sign-off before starting
+     work. You retain full control over every token spent and every review cycle invoked. The cost is an extra round-trip on every task, which adds friction
+     when you're moving quickly through small items. It fits best if your tolerance for process varies unpredictably day to day and you want to decide in the
+     moment.
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
