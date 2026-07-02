@@ -209,6 +209,13 @@ class NewMessage:
     # (``block_origin``) so it never suppresses real prose.
     message_id: str | None = None
     block_origin: str | None = None
+    # Wave A (§A2): the ENTRY-level ``toolUseResult`` dict propagated from
+    # ``ParsedEntry.tool_result_meta`` (the ISSUE-6 PR-2 plumbing) at the
+    # PARENT emit site ONLY — the AFK auto-resolve detection's authoritative
+    # Factor 2 reads ``answers`` emptiness off the AUQ tool_result. The
+    # sidechain emit site deliberately stays None (conversion is
+    # parent-gated in bot.py anyway).
+    tool_result_meta: dict[str, Any] | None = None
 
 
 def filter_live_prose_duplicates(messages: list[NewMessage]) -> list[NewMessage]:
@@ -1475,6 +1482,7 @@ class SessionMonitor:
                             stop_reason=entry.stop_reason,
                             message_id=entry.message_id,
                             block_origin=entry.block_origin,
+                            tool_result_meta=entry.tool_result_meta,
                         )
                     )
                     logger.info(

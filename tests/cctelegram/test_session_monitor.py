@@ -1886,3 +1886,150 @@ class TestLoadCurrentSessionMapLegacyKeyFilter:
             result2 = await monitor._load_current_session_map()
         assert result2 == {"@0": "sid-at-zero", "@12": "sid-at-twelve"}
         assert not [r for r in caplog.records if "dropping legacy" in r.getMessage()]
+
+
+class TestToolResultMetaPlumbing:
+    """Wave A §A2 plumbing: ``NewMessage.tool_result_meta`` carries the
+    entry-level ``toolUseResult`` dict from the PARENT emit site only.
+
+    The AFK auto-resolve detection's authoritative Factor 2 reads
+    ``toolUseResult.answers`` off the tool_result ``NewMessage``; the
+    sidechain emit site deliberately stays None (conversion is
+    parent-gated anyway).
+    """
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    def _write_jsonl(self, path, lines: list[dict]) -> None:
+        path.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+    def _patch_scan(self, monitor, session_id: str, jsonl_file):
+        async def _scan():
+            return [SessionInfo(session_id=session_id, file_path=jsonl_file)]
+
+        monitor.scan_projects = _scan  # type: ignore[method-assign]
+
+    def test_new_message_default_is_none(self):
+        msg = NewMessage(session_id="sid", text="x")
+        assert msg.tool_result_meta is None
+
+    @pytest.mark.asyncio
+    async def test_parent_emit_carries_tool_result_meta(
+        self,
+        monitor,
+        tmp_path,
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """The parent ``check_for_updates`` emit populates ``tool_result_meta``
+        from ``ParsedEntry.tool_result_meta`` (the ISSUE-6 PR-2 entry-level
+        ``toolUseResult`` plumbing) on the tool_result ``NewMessage``."""
+        jsonl_file = tmp_path / "session.jsonl"
+        meta = {
+            "questions": [{"question": "Q?", "options": [], "multiSelect": False}],
+            "answers": {},
+            "annotations": {},
+            "afkTimeoutMs": 60000,
+        }
+        assistant_entry = make_jsonl_entry(
+            "assistant",
+            [make_tool_use_block("t-auq", "AskUserQuestion", {"questions": []})],
+            session_id="sid",
+        )
+        user_entry = make_jsonl_entry(
+            "user",
+            [
+                make_tool_result_block(
+                    "t-auq",
+                    "No response after 60s — the user may be away from keyboard.",
+                )
+            ],
+            session_id="sid",
+            tool_use_result=meta,
+        )
+        self._write_jsonl(jsonl_file, [assistant_entry, user_entry])
+        monitor.register_session("sid", jsonl_file, offset=0)
+        self._patch_scan(monitor, "sid", jsonl_file)
+
+        msgs = await monitor.check_for_updates({"sid"})
+
+        tool_results = [m for m in msgs if m.content_type == "tool_result"]
+        assert len(tool_results) == 1
+        assert tool_results[0].tool_result_meta == meta
+        # Non-tool_result messages keep the default.
+        for m in msgs:
+            if m.content_type != "tool_result":
+                assert m.tool_result_meta is None
+
+    @pytest.mark.asyncio
+    async def test_sidechain_emit_leaves_tool_result_meta_none(
+        self,
+        monitor,
+        tmp_path,
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        """The sidechain emit site deliberately does NOT plumb the meta —
+        a sub-agent's own AUQ tool_result never drives the parent's AFK
+        conversion (which is subagent-gated in bot.py anyway)."""
+        parent_sid = "parent-sid"
+        proj_dir = tmp_path / "projects" / "-tmp-fake"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        parent_jsonl = proj_dir / f"{parent_sid}.jsonl"
+        parent_jsonl.write_text("")
+        sub_dir = proj_dir / parent_sid / "subagents"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        monitor.state.update_session(
+            TrackedSession(
+                session_id=parent_sid,
+                file_path=str(parent_jsonl),
+                last_byte_offset=0,
+            )
+        )
+        self._patch_scan(monitor, parent_sid, parent_jsonl)
+
+        sc = sub_dir / "agent-afk1.jsonl"
+        sc.write_text("")
+        await monitor.check_sidechain_updates({parent_sid})  # register at EOF
+
+        with open(sc, "a") as f:
+            f.write(
+                json.dumps(
+                    make_jsonl_entry(
+                        "assistant",
+                        [
+                            make_tool_use_block(
+                                "t-sub", "AskUserQuestion", {"questions": []}
+                            )
+                        ],
+                    )
+                )
+                + "\n"
+            )
+            f.write(
+                json.dumps(
+                    make_jsonl_entry(
+                        "user",
+                        [make_tool_result_block("t-sub", "sub answered")],
+                        tool_use_result={"answers": {}, "questions": []},
+                    )
+                )
+                + "\n"
+            )
+
+        msgs = await monitor.check_sidechain_updates({parent_sid})
+        tool_results = [m for m in msgs if m.content_type == "tool_result"]
+        assert tool_results, "sidechain tool_result should be emitted for display"
+        for m in tool_results:
+            assert m.subagent_key is not None
+            assert m.tool_result_meta is None
