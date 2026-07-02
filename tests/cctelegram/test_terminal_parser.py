@@ -3622,3 +3622,42 @@ class TestExtractEpmPlanFilePath:
             "~/.claude/plans/REAL.md\n"
         )
         assert extract_epm_plan_file_path(pane) == "~/.claude/plans/REAL.md"
+
+
+# ── Wave B geometry parser pins (160x50 machine-surface default) ─────────
+
+
+class TestGeometry160x50FixturePins:
+    """Wave B parser pins: real Claude Code v2.1.198 captures taken at the
+    160x50 machine-surface window geometry (the B5 step-0 premise gate,
+    GO-160x50). Pin the parser's behavior at the shipped default so a parser
+    change that regresses >80-col / >24-row captures fails loudly here."""
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "auq_4option_160x50_v2.1.198.txt",
+            "auq_longlabel_160x50_v2.1.198.txt",
+        ],
+    )
+    def test_auq_picker_parses_at_160x50(self, fixture):
+        pane = _fixture(fixture)
+        form = resolve_ask_form(None, pane)
+        assert form is not None
+        assert form.options_complete is True
+        # All 4 real options parse (the free-text / chat affordances are
+        # excluded), with the real ❯ cursor on option 1 from frame 1 — the
+        # whole point of the tall geometry.
+        assert [o.number for o in form.options] == [1, 2, 3, 4]
+        assert [o.number for o in form.options if o.cursor] == [1]
+        # The 160-col width win: even 8-10-word labels keep their "N. " space
+        # (zero rows dropped by the N.Label no-space defect).
+        assert all(o.label for o in form.options)
+        # The detection gate that guards the whole interactive-UI path.
+        content = extract_interactive_content(pane)
+        assert content is not None
+        assert content.name == "AskUserQuestion"
+
+    def test_status_line_parses_at_160x50(self):
+        pane = _fixture("status_busy_160x50_v2.1.198.txt")
+        assert parse_status_line(pane) == "Actioning…"

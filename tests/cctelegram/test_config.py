@@ -93,6 +93,68 @@ class TestConfigClaudeProjectsPath:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestConfigWindowGeometry:
+    """Wave B machine-surface geometry: CC_TELEGRAM_WINDOW_GEOMETRY parsing."""
+
+    def test_window_geometry_default_160x50(self, monkeypatch):
+        monkeypatch.delenv("CC_TELEGRAM_WINDOW_GEOMETRY", raising=False)
+        cfg = Config()
+        assert cfg.window_width == 160
+        assert cfg.window_height == 50
+
+    def test_window_geometry_env_override(self, monkeypatch):
+        monkeypatch.setenv("CC_TELEGRAM_WINDOW_GEOMETRY", "200x60")
+        cfg = Config()
+        assert cfg.window_width == 200
+        assert cfg.window_height == 60
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "banana",  # not the WxH shape at all
+            "160x",  # missing height
+            "x50",  # missing width
+            "160X50",  # capital X — format is the lowercase ^(\d+)x(\d+)$
+            "160x50x10",  # trailing junk
+            "-160x50",  # sign is not \d
+            "19x50",  # width below sanity floor (20)
+            "501x50",  # width above sanity ceiling (500)
+            "160x4",  # height below sanity floor (5)
+            "160x301",  # height above sanity ceiling (300)
+            "",  # explicitly empty
+            f"{'9' * 5000}x50",  # digit run past int()'s conversion limit (hermes P2)
+        ],
+    )
+    def test_window_geometry_invalid_falls_back_with_warning(
+        self, monkeypatch, caplog, raw
+    ):
+        monkeypatch.setenv("CC_TELEGRAM_WINDOW_GEOMETRY", raw)
+        with caplog.at_level("WARNING", logger="cctelegram.config"):
+            cfg = Config()
+        assert cfg.window_width == 160
+        assert cfg.window_height == 50
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and "CC_TELEGRAM_WINDOW_GEOMETRY" in r.getMessage()
+        ]
+        assert len(warnings) == 1  # exactly one WARNING per bad value
+
+    def test_window_geometry_valid_emits_no_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv("CC_TELEGRAM_WINDOW_GEOMETRY", "80x50")
+        with caplog.at_level("WARNING", logger="cctelegram.config"):
+            cfg = Config()
+        assert (cfg.window_width, cfg.window_height) == (80, 50)
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and "CC_TELEGRAM_WINDOW_GEOMETRY" in r.getMessage()
+        ]
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestConfigOpenAI:
     def test_openai_defaults(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)

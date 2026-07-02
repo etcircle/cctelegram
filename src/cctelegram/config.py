@@ -10,6 +10,7 @@ Key class: Config (singleton instantiated as `config`).
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -120,6 +121,39 @@ class Config:
         self.show_hidden_dirs = (
             os.getenv("CC_TELEGRAM_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
+
+        # Bot-created tmux window geometry (Wave B machine-surface geometry).
+        # Terminal panes are a MACHINE surface — nobody attaches to them, so
+        # geometry serves the PARSER: 50 rows keep a tall AskUserQuestion
+        # picker fully on-screen (real ❯ cursor from the first frame — kills
+        # the off-screen-tap / degenerate-parse class at the root) and 160
+        # cols shrink the N.Label width-overflow class. Applied via the
+        # per-window `resize-window` at window creation and at the one-time
+        # startup reconcile (tmux_manager / bot.post_init). Format
+        # "<width>x<height>"; sanity bounds 20≤w≤500 / 5≤h≤300; ANY
+        # parse/bounds failure falls back to the default with one WARNING.
+        _geometry_default = (160, 50)
+        _geometry_raw = os.getenv("CC_TELEGRAM_WINDOW_GEOMETRY", "160x50")
+        # {1,4} bounds the digit runs so a pathological value can never make
+        # int() raise (Python's int-digit-limit); anything longer is already
+        # far out of the sanity bounds and falls to the WARNING branch.
+        _geometry_match = re.fullmatch(r"(\d{1,4})x(\d{1,4})", _geometry_raw)
+        if _geometry_match:
+            _width = int(_geometry_match.group(1))
+            _height = int(_geometry_match.group(2))
+        else:
+            _width, _height = -1, -1
+        if 20 <= _width <= 500 and 5 <= _height <= 300:
+            self.window_width, self.window_height = _width, _height
+        else:
+            logger.warning(
+                "Invalid CC_TELEGRAM_WINDOW_GEOMETRY %r "
+                "(expected <width>x<height>, 20<=w<=500, 5<=h<=300); "
+                "falling back to %dx%d",
+                _geometry_raw,
+                *_geometry_default,
+            )
+            self.window_width, self.window_height = _geometry_default
 
         # Interactive approval-gate cards (Permission / Workflow). Default OFF.
         # When ON, tool-permission prompts (bridged user-launched / resumed,

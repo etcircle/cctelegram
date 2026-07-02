@@ -1,0 +1,50 @@
+
+⏺ User declined to answer questions
+  ⎿  · We're at a decision point about how you'd like me to approach substantial work in this environment, and I want to settle it properly rather than guess at
+     it session after session. This machine has an unusually rich toolkit layered on top of Claude Code: the gstack skill library gives us planning reviews,
+     design consultations, QA harnesses, and ship workflows; Hermes and Codex are wired in as peer-review engines; hindsight provides cross-project long-term
+     memory; and the Workflow tool can orchestrate fleets of subagents for exhaustive audits and migrations. Each of these carries a different cost profile in
+     terms of tokens, wall-clock time, and how much of the process you have to supervise versus how much runs autonomously. The workflow model documented in
+     your CLAUDE.md says Claude Code implements while Hermes and Codex review, but it doesn't say how heavyweight the default loop should be for ordinary,
+     day-to-day tasks. A small bug fix probably doesn't deserve a plan review, dual peer review, and a QA pass, while a risky refactor across several modules
+     probably does — but the line between those two is a judgment call, and right now I'd be making it ad hoc every time. Some people want their agent to run
+     lean by default and only escalate ceremony when explicitly asked; others want every diff to pass through the full gauntlet because they'd rather burn
+     tokens than ship a regression; still others want the agent to propose the process at the start of each task and let them approve it. There are also hybrid
+     stances, like scaling ceremony automatically to the size of the diff or the blast radius of the files touched. Whatever you pick here becomes the standing
+     default I apply without re-asking, though you can always override it per task with a word. So, thinking about how you actually like to work day to day —
+     your tolerance for latency, your token budget, and how much you trust automated review to catch what matters — which default process weight should I adopt
+     for typical tasks in this environment going forward? (Run lean by default, escalate only when I ask / Full gauntlet on every diff, no exceptions granted /
+     Scale ceremony automatically to diff size and risk / Propose a process per task, await my approval)
+
+❯ Use the AskUserQuestion tool to ask me exactly ONE single-select question with 4 options. The question text must be about 10 lines long. Each option label
+  MUST be 12-15 words long (a full sentence). Give each option a 2-sentence description. Do not answer for me.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Process
+
+I want to settle the standing default for how much process weight I apply to ordinary tasks in this environment, since your setup offers everything from lean
+solo implementation to a full multi-engine review gauntlet. Your CLAUDE.md establishes that Claude Code implements while Hermes and Codex act as peer reviewers,
+but it leaves open how heavyweight the default loop should be for day-to-day work. A one-line bug fix probably doesn't warrant plan review plus dual peer
+review plus QA, while a refactor spanning several modules probably does, and right now that judgment call gets made ad hoc every single time. Each choice trades
+off differently across tokens, wall-clock latency, and your supervision burden. Some people want their agent lean by default and only escalate when asked;
+others want every diff through the full gauntlet because a regression costs more than tokens ever will. There are also middle positions, like scaling ceremony
+automatically to blast radius, or proposing a process per task for your approval. Whatever you pick becomes the default I apply without re-asking, though a
+single word can always override it per task. Thinking about your actual daily rhythm, token budget, and trust in automated review — which default should I
+adopt?
+
+❯ 1. Run lean by default and only add review ceremony when I explicitly ask for it
+     I implement directly, verify with tests and a quick self-review, and skip Hermes, Codex, and gstack ceremony unless you invoke them. Fastest and cheapest,
+     but nothing independent inspects the diff, so it suits you best if you personally review everything anyway.
+  2. Send every single diff through the full plan, implement, dual-review, and verify gauntlet
+     Every change, however trivial, gets plan review, subagent implementation, peer review from both Hermes and Codex, and a verification pass before you see
+     it. Maximum defect-catching at maximum token and latency cost, with one-line fixes feeling heavily over-processed.
+  3. Let me scale the process weight automatically to each task's diff size and risk
+     I judge blast radius myself — files touched, subsystems crossed, reversibility — and go lean on one-liners, single-reviewer on moderate changes, and full
+     dual review on risky refactors. Proportionate cost with zero process thinking from you, at the risk of my assessment occasionally misfiring.
+  4. Have me propose a process for each task and wait for your explicit approval
+     At the start of each substantial task I state the reviewers, QA, and verification depth I intend to run, then wait for sign-off before starting. You keep
+     full control over every token spent, at the cost of an extra round-trip on every task.
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -5,6 +5,9 @@ Wraps libtmux to provide async-friendly operations on a single tmux session:
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
+  - resize_window / creation-time resize: machine-surface geometry
+    (config.window_width x window_height, default 160x50) so tall AUQ
+    pickers render fully for the parser.
 
 All blocking libtmux calls are wrapped in asyncio.to_thread().
 
@@ -457,6 +460,63 @@ class TmuxManager:
             return False
         return True
 
+    @staticmethod
+    def _cmd_resize_window(window: libtmux.Window, width: int, height: int) -> bool:
+        """Resize a window via raw ``resize-window -x <w> -y <h>``, check stderr.
+
+        Wave B machine-surface geometry. Follows the ``_cmd_send_literal``
+        precedent: libtmux swallows tmux stderr, so a failed resize (e.g.
+        size out of tmux's bounds) would silently "succeed" — non-empty
+        stderr from the returned ``tmux_cmd`` is treated as failure. On a
+        detached window the resize implicitly flips ``window-size`` to
+        ``manual`` (rig-verified, tmux 3.6a). Returns bool; never raises —
+        geometry is an optimization, never a blocker for the caller.
+        """
+        try:
+            result = window.cmd("resize-window", "-x", str(width), "-y", str(height))
+        except Exception as e:
+            logger.warning(
+                "tmux resize-window failed for window %s: %s",
+                getattr(window, "window_id", "?"),
+                e,
+            )
+            return False
+        if result.stderr:
+            logger.warning(
+                "tmux resize-window failed for window %s: %s",
+                getattr(window, "window_id", "?"),
+                result.stderr,
+            )
+            return False
+        return True
+
+    async def resize_window(self, window_id: str, width: int, height: int) -> bool:
+        """Resize a tmux window by its ID to ``width`` x ``height``.
+
+        Resolves the REAL ``libtmux.Window`` INSIDE the worker thread —
+        never the lightweight ``TmuxWindow`` dataclass that
+        ``find_window_by_id`` returns (it has no ``.cmd``). Idempotent:
+        resize-to-same-size is a tmux no-op. Returns False when the session
+        or window is gone; never raises.
+        """
+
+        def _sync_resize() -> bool:
+            session = self.get_session()
+            if not session:
+                logger.warning("resize_window: no tmux session found")
+                return False
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    logger.warning("resize_window: window %s not found", window_id)
+                    return False
+                return self._cmd_resize_window(window, width, height)
+            except Exception as e:
+                logger.warning("Failed to resize window %s: %s", window_id, e)
+                return False
+
+        return await asyncio.to_thread(_sync_resize)
+
     def window_send_lock(self, window_id: str) -> asyncio.Lock:
         """Return the per-window send lock for ``window_id``, creating on demand.
 
@@ -705,6 +765,15 @@ class TmuxManager:
 
                 # Prevent Claude Code from overriding window name
                 window.set_window_option("allow-rename", "off")
+
+                # Wave B machine-surface geometry: resize BEFORE the claude
+                # launch so Claude Code starts at final geometry and never
+                # repaints mid-startup. A False return is logged (inside the
+                # helper) and the window still launches — geometry is an
+                # optimization, never a launch blocker.
+                self._cmd_resize_window(
+                    window, config.window_width, config.window_height
+                )
 
                 # Start Claude Code if requested
                 if start_claude:
