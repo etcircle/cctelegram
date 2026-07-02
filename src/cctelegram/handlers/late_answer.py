@@ -81,28 +81,39 @@ def _strip_sentinels_and_lead(text: str) -> str:
 def is_afk_auto_resolve(text: str, tool_result_meta: dict[str, Any] | None) -> bool:
     """True iff an AskUserQuestion tool_result is the ~60s AFK auto-resolve.
 
-    Two-factor (plan §A2, review-converged):
+    Two-factor (plan §A2, review-converged; round-1 fold — falling OPEN to
+    the bare unanchored regex on a malformed present ``answers`` is REJECTED,
+    Codex + Hermes converged P2):
 
     - **Factor 2 (authoritative):** a dict ``tool_result_meta`` whose
       ``answers`` is a NON-EMPTY dict → False regardless of the regex (a
       genuine free-text answer may ECHO the AFK phrase).
-    - **Meta present, answers empty/absent:** the unanchored Factor-1 regex
-      decides — the observed AFK shape is exactly ``answers: {}`` + the
-      phrase.
-    - **Meta absent (None — older/drifted JSONL, or a non-dict entry-level
-      ``toolUseResult``):** the regex must NOT decide alone. Hardened rule:
-      (a) strip the expandable-quote sentinels + leading whitespace; (b)
-      negative wrappers reject FIRST; (c) require the stripped content to
-      BEGIN with the AFK phrase. Best-effort by design ([R2 Hermes P3]): the
-      monitor's pending-tool ``**AskUserQuestion**(…)`` summary prefix makes
-      the anchored match false-NEGATIVE — the safe direction (today's
-      teardown); the meta-PRESENT path is the real detection path.
+    - **Meta present, ``answers`` exactly the observed EMPTY dict:** the
+      unanchored Factor-1 regex decides — the observed AFK shape is exactly
+      ``answers: {}`` + the phrase.
+    - **Everything else — meta absent (None — older/drifted JSONL, or a
+      non-dict entry-level ``toolUseResult``) OR a present meta whose
+      ``answers`` is NOT a dict (missing / None / list / str / …):** the
+      regex must NOT decide alone. Hardened rule: (a) strip the
+      expandable-quote sentinels + leading whitespace; (b) negative wrappers
+      reject FIRST; (c) require the stripped content to BEGIN with the AFK
+      phrase. Best-effort by design ([R2 Hermes P3]): the monitor's
+      pending-tool ``**AskUserQuestion**(…)`` summary prefix makes the
+      anchored match false-NEGATIVE — the safe direction (today's teardown);
+      the meta-PRESENT ``answers: {}`` path is the real detection path.
     """
     if isinstance(tool_result_meta, dict):
         answers = tool_result_meta.get("answers")
-        if isinstance(answers, dict) and answers:
-            return False  # genuine answer — authoritative, regardless of regex
-        return bool(_AFK_AUTO_RESOLVE_RE.search(text))
+        if isinstance(answers, dict):
+            if answers:
+                # Genuine answer — authoritative, regardless of the regex.
+                return False
+            # Exactly the observed AFK shape (answers == {}): the unanchored
+            # regex decides.
+            return bool(_AFK_AUTO_RESOLVE_RE.search(text))
+        # Malformed / missing answers (non-dict): NOT the observed shape —
+        # fall through to the SAME hardened rule as meta-absent (never the
+        # bare unanchored regex).
     stripped = _strip_sentinels_and_lead(text)
     for wrapper in _NEGATIVE_WRAPPERS:
         if wrapper in stripped:

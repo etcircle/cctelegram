@@ -209,6 +209,52 @@ def test_meta_present_empty_answers_unanchored_regex_decides() -> None:
     )
 
 
+def test_meta_present_malformed_answers_routes_through_hardened_rule() -> None:
+    """[Codex P2 + Hermes P2, converged — D5 REJECTED] a PRESENT meta dict
+    whose ``answers`` is NOT a dict (None / missing / list / str / …) must
+    NOT fall open to the unanchored regex — it routes through the SAME
+    hardened meta-absent rule (sentinel-strip → negative wrappers reject
+    first → anchored-start match). Only the observed exact shapes decide via
+    the unanchored regex (non-empty dict → False; empty dict → regex)."""
+    genuine_echo = (
+        'Your questions have been answered: "What happened?"="No response '
+        'after 60s — I was away". You can now continue with these answers '
+        "in mind."
+    )
+    true_afk = (
+        "No response after 60s — the user may be away from keyboard. Proceed "
+        "using your best judgment based on the context so far."
+    )
+    mid_echo = (
+        "I decided to proceed on my own. Note that the earlier prompt said "
+        "No response after 60s — the user may be away from keyboard."
+    )
+    # answers=["x"] + a genuine wrapper echoing the AFK phrase → False (the
+    # unanchored regex would have said True — the D5 fall-open hole).
+    assert (
+        late_answer.is_afk_auto_resolve(_monitor_text(genuine_echo), {"answers": ["x"]})
+        is False
+    )
+    # answers="garbage" + true AFK content (anchored start) → True.
+    assert (
+        late_answer.is_afk_auto_resolve(_monitor_text(true_afk), {"answers": "garbage"})
+        is True
+    )
+    # answers=None + true AFK content → True.
+    assert (
+        late_answer.is_afk_auto_resolve(_monitor_text(true_afk), {"answers": None})
+        is True
+    )
+    # answers=None + a MID-content AFK echo → False (anchored start required).
+    assert (
+        late_answer.is_afk_auto_resolve(_monitor_text(mid_echo), {"answers": None})
+        is False
+    )
+    # answers key missing entirely → same hardened routing.
+    assert late_answer.is_afk_auto_resolve(_monitor_text(true_afk), {}) is True
+    assert late_answer.is_afk_auto_resolve(_monitor_text(mid_echo), {}) is False
+
+
 def test_sentinel_constants_match_transcript_parser() -> None:
     """Drift guard: the sentinels duplicated into the leaf must stay byte-
     identical to ``TranscriptParser``'s (late_answer must not import the
