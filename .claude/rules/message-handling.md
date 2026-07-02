@@ -841,6 +841,114 @@ escape if a future variant defeats the auto-dispatch. **Scoped to single-select
 bare digit — a filed fast-follow (AUQ is NOT globally fixed).** Validated against
 Claude Code v2.1.168 terminal behavior.
 
+## AFK auto-resolve conversion + late answer (aql:) — Wave A
+
+On Claude Code ≥2.1.198 an unanswered AskUserQuestion **self-resolves at ~60s**
+(undocumented, no knob — GH #30740 closed not-planned) with a synthetic
+tool_result ("No response after 60s — the user may be away from keyboard. …")
+whose entry-level ``toolUseResult`` carries the full ``questions`` array and
+``answers: {}`` (empty; an ``afkTimeoutMs`` field is also observed — preserved
+in the fixture as a candidate future discriminator, NOT part of the detection
+contract). Pre-Wave-A that tool_result tore the picker card down exactly like
+a genuine answer, leaving the bridged owner a topic with no card and no way to
+answer. The bridge ADAPTS (owner-approved; the CLI default is never defeated):
+
+**Detection (two-factor, ``handlers/late_answer.is_afk_auto_resolve``).**
+Factor 1: an unanchored, drift-tolerant regex (`No response after \d+
+\s*(s|secs?|seconds?|m|mins?|minutes?)\b`, case-insensitive) over ``msg.text``
+(the raw content wrapped in ``EXPANDABLE_QUOTE`` sentinels — hence unanchored).
+Factor 2 (authoritative): ``tool_result_meta.answers`` a NON-EMPTY dict →
+False regardless of the regex (a genuine free-text answer may ECHO the AFK
+phrase). ``tool_result_meta`` is the entry-level ``toolUseResult`` plumbed
+onto ``NewMessage`` at the PARENT emit site only (sidechain emits stay None).
+Meta ABSENT (None / non-dict — the Esc-rejection's ``toolUseResult`` is a
+plain string) → the HARDENED rule: sentinel-strip → the negative wrappers
+("Your questions have been answered:" / "The user doesn't want to proceed")
+reject FIRST → then the stripped content must BEGIN with the AFK phrase
+(anchored). Best-effort by design: the monitor's pending-tool
+``**AskUserQuestion**(…)`` summary prefix makes the anchored match
+false-NEGATIVE — the safe direction (today's teardown); the meta-PRESENT path
+is the real detection path. False negative = today's silent teardown; the
+Esc-rejection never matches (correct — the user acted in the terminal).
+
+**Conversion (bot.py's explicit AUQ tool_result branch — the ONLY caller).**
+Non-AFK: today's teardown byte-identical (``forget_ask_tool_input`` +
+``auq_ledger_release_window`` at their exact prior positions). AFK: ONE call —
+``interactive_ui.convert_interactive_msg_to_late_answer`` — owning the ENTIRE
+teardown+conversion inside a single ``_get_route_lock`` critical section with
+NO await between steps: (1) **snapshot** under the id-parity trust rule
+(window cache via ``peek_ask_tool_use_id`` == the tool_result's id OR either
+unknown; fallback ``auq_source.read_side_file_for_recovery`` vs
+``peek_side_file_tool_use_id`` under the same rule — the side file's captured
+id "may be ''", treated as unknown; both mistrusted → snap=None); (2) the
+exact ``clear_interactive_msg`` **Phase-1 mirror** — ``_clear_interactive_msg``
++ ``_interactive_mode.pop`` + ``pick_token.prune_for_route`` on the POPPED
+window ONLY (never the caller's wid blindly; WARNING on mismatch);
+(3) ``forget_ask_tool_input`` (side-file unlink still before ANY awaited
+Telegram I/O — the orphan-safety ordering; ``late_answer.invalidate_window``
+fires inside it, safe — the mint happens later); (4)
+``auq_ledger.release_window`` (AFK is genuine resolution — the tombstone is
+correct). Post-lock, ``_fire_clear(cleared_window_id)`` + the Phase-2 edit run
+best-effort **SHIELDED** once Phase 1 commits (the W1 delete-protocol
+precedent) so a caller cancellation cannot strand a visibly-tappable dead
+picker; a poller tick that tombstoned the card first degrades to the disclosed
+no-surface skip (never a re-post, never a surviving pick-token row).
+
+**Card (Phase 2, EDIT-only v1).** ``topic_edit(op="interactive", plain=True)``
+edits the picker message into "⏰ Claude proceeded after ~60s (no response)."
++ ``Question: <q>`` (``_clip_card_title``, omitted when snap=None) + an
+``aql:`` keyboard ONLY for single-question single-select (labels ≤64, one per
+row — full descriptions stay in the still-standing 📋 details message);
+multi-Q / multi-select / snap=None → text-only "Reply in text to send a
+correction." No surface → log ``AFK_CONVERT no_surface`` and return; edit
+failure → log, NO delete-fallback (the tombstone rule). **The converted card
+is NOT a live interactive surface** — ``has_interactive_surface`` goes False,
+the generic teardown later in the loop skips, run-state clears via the
+transcript path exactly as today (NO route_runtime change). One token per
+CARD in the in-memory ``late_answer`` registry (``live → in_flight →
+consumed``); NOT persisted, NOT a route_runtime field, no observers (c313657).
+
+**aql: executor (``callback_dispatcher/late_answer.py``).** Parse
+``aql:<window_id>:<opt>:<token>`` → registry lookup (None → graceful
+"expired — reply in text instead" modal + best-effort keyboard-clear
+preserving ``query.message.text``) → owner check (``WRONG_USER_PICK_TEXT``) →
+stale window (payload/registry parity + the lease + ``find_window_by_id``
+None) → freshness guards (``has_interactive_surface`` OR
+``side_file_live_for_window`` → "A newer prompt is live in this topic —
+answer that instead."; the PreToolUse hook writes the side file BEFORE a new
+picker renders, closing the JSONL-buffered-tool_use gap) → ``begin_send``
+single-use → sending-state edit with the keyboard REMOVED → the **effort.py
+route-ordering delivery subsequence ONLY** (aggregator flush → PRE-SEND
+``set_route_user_turn_at`` — the late answer is a genuine user turn, so
+live-prose turn-boundary + dashboard 🔔 semantics match a typed message →
+``send_to_window`` with the ``(bool, str)`` return honored →
+``mark_inbound_sent``). Success: "✅ Late answer sent: <label>"; failure:
+single-use reset to live + the ORIGINAL keyboard re-attached for the retry
+tap (the reason effort.py is NOT copied line-for-line — it clears the
+keyboard pre-delivery). Delivery text (single line, ALL whitespace runs
+collapsed — an embedded newline would submit early): ``Re your earlier
+question "<question≤200>" (it auto-resolved after 60s while I was away): my
+answer is "<label>". Please course-correct based on this.``
+
+**Lifecycle / invalidation.** ``late_answer.invalidate_window`` at (a)
+``forget_ask_tool_input`` (the primary seam — next AUQ's tool_result, /clear /
+session replacement, the generic surface clear) and (b)
+``remember_ask_tool_input``'s tool_use_id-rotation branch (a BACKSTOP only —
+rotation fires late because a new live picker is JSONL-buffered; the real
+protection is the executor's freshness guards); (c) topic close via the
+topic-keyed ``late_answer.invalidate_topic`` beside
+``route_runtime.clear_routes_for_topic`` in ``clear_topic_state`` (NOT inside
+the queued-routes loop, whose ``_route_queues`` enumeration would strand a
+queue-less route's card — the same gap that gave route_runtime its own seam).
+
+**Residuals (disclosed, plan A10).** Restart wipes the in-memory registry
+(the tap answers the graceful expired modal and clears the dead keyboard);
+no-surface AFK skips (EDIT-only v1); the send-into-new-picker race is closed
+to a sub-second hook-write window; multi-Q/multi-select late answers are
+text-only; EPM 60s behavior is unobserved → ExitPlanMode is OUT of scope;
+labels are clipped to 64 chars on buttons AND in the correction message.
+Pull-only throughout; no observer (c313657 stays forbidden).
+
 ## MessageDisplay live-prose capture (Bug 2)
 
 Assistant free-text prose written in the same turn as an `AskUserQuestion` /
