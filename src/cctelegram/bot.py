@@ -1150,6 +1150,51 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
+async def _reconcile_window_geometry() -> None:
+    """One-time startup pass: resize every bot-session window to the
+    configured machine-surface geometry (Wave B).
+
+    Windows created before this deploy (or resized externally) still hold
+    tmux defaults, so tall AUQ pickers render with option 1 off-screen.
+    Runs after ``resolve_stale_ids()`` (window ids re-mapped) and before the
+    monitor/poller start. Resizes EVERY listed window unconditionally —
+    idempotent, resize-to-same-size is a tmux no-op; ``list_windows()`` is
+    scoped to the bot's own tmux session by construction. Per-window
+    failures are logged and skipped; the whole pass is guarded so it can
+    never break startup.
+    """
+    try:
+        windows = await tmux_manager.list_windows()
+        resized = 0
+        for window in windows:
+            try:
+                ok = await tmux_manager.resize_window(
+                    window.window_id, config.window_width, config.window_height
+                )
+                if ok:
+                    resized += 1
+                else:
+                    logger.warning(
+                        "Startup geometry reconcile: resize failed for window %s",
+                        window.window_id,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Startup geometry reconcile: window %s raised: %s",
+                    window.window_id,
+                    e,
+                )
+        logger.info(
+            "Startup geometry reconcile: %d/%d window(s) at %dx%d",
+            resized,
+            len(windows),
+            config.window_width,
+            config.window_height,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Startup geometry reconcile failed: %s", e)
+
+
 async def post_init(application: Application) -> None:
     global \
         session_monitor, \
@@ -1251,6 +1296,11 @@ async def post_init(application: Application) -> None:
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
+
+    # Wave B machine-surface geometry: one-time resize of every bot-session
+    # window to config.window_width x window_height. AFTER resolve_stale_ids
+    # (window ids re-mapped), BEFORE the monitor/poller start.
+    await _reconcile_window_geometry()
 
     # Wave A (Bug A — duplicate picker on restart) requires the
     # SessionManager.window_states[wid].session_id field to be populated

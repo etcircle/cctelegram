@@ -135,7 +135,8 @@ class TestConfigWindowGeometry:
         warnings = [
             r
             for r in caplog.records
-            if r.levelname == "WARNING" and "CC_TELEGRAM_WINDOW_GEOMETRY" in r.getMessage()
+            if r.levelname == "WARNING"
+            and "CC_TELEGRAM_WINDOW_GEOMETRY" in r.getMessage()
         ]
         assert len(warnings) == 1  # exactly one WARNING per bad value
 
@@ -147,7 +148,8 @@ class TestConfigWindowGeometry:
         assert not [
             r
             for r in caplog.records
-            if r.levelname == "WARNING" and "CC_TELEGRAM_WINDOW_GEOMETRY" in r.getMessage()
+            if r.levelname == "WARNING"
+            and "CC_TELEGRAM_WINDOW_GEOMETRY" in r.getMessage()
         ]
 
 
